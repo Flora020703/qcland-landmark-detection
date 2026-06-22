@@ -23,6 +23,8 @@ class EoMT(nn.Module):
         num_q,
         num_blocks=4,
         masked_attn_enabled=True,
+        freeze_backbone: bool = True,     # MODIFIED: freeze pretrained DINOv2 backbone weights
+        upsample_bilinear: bool = False,  # MODIFIED: bilinear resize+conv instead of ConvTranspose2d
     ):
         super().__init__()
         self.encoder = encoder
@@ -49,8 +51,27 @@ class EoMT(nn.Module):
         num_upscale = max(1, int(math.log2(max_patch_size)) - 2)
 
         self.upscale = nn.Sequential(
-            *[ScaleBlock(self.encoder.backbone.embed_dim) for _ in range(num_upscale)],
+            *[ScaleBlock(self.encoder.backbone.embed_dim, use_bilinear=upsample_bilinear)
+              for _ in range(num_upscale)],
         )
+
+        # MODIFIED: partial freeze — lock first 75% of transformer blocks (early generic features),
+        # keep last 25% + norm trainable so high-level features can adapt to landmark task.
+        if freeze_backbone:
+            backbone = self.encoder.backbone
+            n_blocks = len(backbone.blocks)
+            freeze_until = int(n_blocks * 0.75)   # e.g. 9 of 12 for ViT-S
+
+            for p in backbone.parameters():        # freeze everything first
+                p.requires_grad = False
+
+            for i in range(freeze_until, n_blocks):  # unfreeze last 25% blocks
+                for p in backbone.blocks[i].parameters():
+                    p.requires_grad = True
+
+            if hasattr(backbone, "norm"):           # unfreeze final norm
+                for p in backbone.norm.parameters():
+                    p.requires_grad = True
 
     def _predict(self, x: torch.Tensor):
         q = x[:, : self.num_q, :]

@@ -60,26 +60,26 @@ class ADE20KSemantic(LightningDataModule):
 
     def setup(self, stage: Union[str, None] = None) -> LightningDataModule:
         dataset_kwargs = {
-            "img_suffix": ".jpg",
+            "img_suffix": ".jpg",  # MODIFIED: ADE20K_mini (original ADE20K images are .jpg)
             "target_suffix": ".png",
-            "zip_path": Path(self.path, "ADEChallengeData2016.zip"),
-            "target_zip_path": Path(self.path, "ADEChallengeData2016.zip"),
+            # MODIFIED: zip→folder — replaced zip_path/target_zip_path with data_path/target_data_path
+            # MODIFIED: ADE20K_mini — point to unified mini dataset folder
+            "data_path": Path(self.path, "ADE20K_mini"),
+            "target_data_path": Path(self.path, "ADE20K_mini"),
             "target_parser": self.target_parser,
             "check_empty_targets": self.check_empty_targets,
         }
         self.train_dataset = Dataset(
-            img_folder_path_in_zip=Path("./ADEChallengeData2016/images/training"),
-            target_folder_path_in_zip=Path(
-                "./ADEChallengeData2016/annotations/training"
-            ),
+            # MODIFIED: zip→folder — replaced img_folder_path_in_zip/target_folder_path_in_zip
+            img_folder_path=Path("train/images"),
+            target_folder_path=Path("train/masks"),
             transforms=self.transforms,
             **dataset_kwargs,
         )
         self.val_dataset = Dataset(
-            img_folder_path_in_zip=Path("./ADEChallengeData2016/images/validation"),
-            target_folder_path_in_zip=Path(
-                "./ADEChallengeData2016/annotations/validation"
-            ),
+            # MODIFIED: zip→folder — replaced img_folder_path_in_zip/target_folder_path_in_zip
+            img_folder_path=Path("val/images"),
+            target_folder_path=Path("val/masks"),
             **dataset_kwargs,
         )
 

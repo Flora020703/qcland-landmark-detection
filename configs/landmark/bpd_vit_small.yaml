@@ -1,0 +1,85 @@
+# ---------------------------------------------------------------
+# MODIFIED: new config — BPD landmark detection with DINOv2-ViT-S
+#
+# Usage (AutoDL):
+#   python main_landmark.py fit -c configs/landmark/bpd_vit_small.yaml \
+#       --data.init_args.images_dir /path/to/images/UCL/Head \
+#       --data.init_args.ann_train_csv /path/to/annotations/UCL/Head_Train.csv \
+#       --data.init_args.ann_test_csv /path/to/annotations/UCL/Head_Test.csv
+#
+# Linked automatically (do NOT duplicate in data AND model sections):
+#   data.img_size      → model.img_size, model.network.encoder.img_size
+#   data.heatmap_size  → model.heatmap_size, model.network.heatmap_size
+# ---------------------------------------------------------------
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1        # only 6 steps/epoch, default 50 causes warning
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 3
+        filename: "epoch{epoch:02d}-nme{metrics/val_nme:.4f}"
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20           # 20 val checks × 5 epochs = 100 epochs patience
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.CSVLogger
+    init_args:
+      save_dir: logs
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    # img_size and heatmap_size are linked from data — do not set here
+    num_landmarks: 2
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 2.0e-5
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            # img_size linked from data
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    # ---- paths: override on command line or edit below for AutoDL ----
+    images_dir: /root/autodl-tmp/UCL/Head
+    ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
+    # ------------------------------------------------------------------
+    task: bpd
+    img_size: [512, 512]        # source of truth — linked to model + encoder
+    heatmap_size: [64, 64]      # source of truth — linked to model + EoMT
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4

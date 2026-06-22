@@ -144,8 +144,10 @@ class LightningModule(lightning.LightningModule):
                     {"params": [param], "lr": lr, "name": name}
                 )
             else:
+                # MODIFIED: apply lr_mult to head params (q, mask_head, upscale, class_head)
+                # so head LR = lr * lr_mult (e.g. 1e-4 * 10 = 1e-3 for fast head convergence)
                 other_param_groups.append(
-                    {"params": [param], "lr": self.lr, "name": name}
+                    {"params": [param], "lr": self.lr * self.lr_mult, "name": name}
                 )
 
         param_groups = backbone_param_groups + other_param_groups
@@ -595,7 +597,8 @@ class LightningModule(lightning.LightningModule):
 
         block_postfix = self.block_postfix(block_idx)
         name = f"{log_prefix}_pred_{batch_idx}{block_postfix}"
-        self.trainer.logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
+        if hasattr(self.trainer.logger.experiment, "log"):
+            self.trainer.logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
 
     @torch.compiler.disable
     def scale_img_size_semantic(self, size: tuple[int, int]):

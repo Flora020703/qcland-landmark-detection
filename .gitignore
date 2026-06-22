@@ -178,3 +178,10 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Data & model weights (landmark detection)
+images/
+annotations/
+*.csv
+*.pth
+data/
