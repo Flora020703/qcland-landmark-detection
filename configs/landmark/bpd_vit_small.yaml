@@ -12,8 +12,10 @@
 #   data.heatmap_size  → model.heatmap_size, model.network.heatmap_size
 # ---------------------------------------------------------------
 
+seed_everything: 42   # seeds torch / numpy / python-random + DataLoader shuffle + weight init
+
 trainer:
-  max_epochs: 200
+  max_epochs: 400
   check_val_every_n_epoch: 5
   log_every_n_steps: 1        # only 6 steps/epoch, default 50 causes warning
   callbacks:
@@ -33,19 +35,30 @@ trainer:
       init_args:
         logging_interval: step
   logger:
-    class_path: lightning.pytorch.loggers.CSVLogger
+    class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
+      project: eomt-landmark
+      name: bpd-run20a-hybrid-awing-lambda1  # override per run: --trainer.logger.init_args.name <name>
       save_dir: logs
+      log_model: false
 
 model:
   class_path: training.landmark_detection.LandmarkDetection
   init_args:
     # img_size and heatmap_size are linked from data — do not set here
     num_landmarks: 2
+    loss_type: hybrid_awing
+    alpha: 5.0             # foreground weight for weighted_mse branch of hybrid
+    temperature: 10.0      # soft-argmax temperature (higher = sharper)
+    lambda_coord: 1.0      # coord loss weight (total = L_hm + 1.0 * L_coord)
+    awing_omega: 14.0      # unused for hybrid, kept for ablation reference
+    awing_theta: 0.5
+    awing_alpha: 2.1
+    awing_epsilon: 1.0
     attn_mask_annealing_enabled: false
     attn_mask_annealing_start_steps: null
     attn_mask_annealing_end_steps: null
-    lr: 2.0e-5
+    lr: 1.0e-4
     llrd: 0.8
     llrd_l2_enabled: true
     lr_mult: 1.0
@@ -61,6 +74,7 @@ model:
         masked_attn_enabled: true
         freeze_backbone: false
         upsample_bilinear: false
+        use_refinement_head: false
         encoder:
           class_path: models.vit.ViT
           init_args:

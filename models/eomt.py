@@ -15,6 +15,31 @@ import math
 from models.scale_block import ScaleBlock
 
 
+class RefinementHead(nn.Module):
+    """
+    Lightweight per-heatmap sharpening network (shared weights across all landmarks).
+    Input/output: (B, Q, H, W). Internally reshapes to (B*Q, 1, H, W) so a single
+    forward pass handles all queries with identical weights, then adds a residual.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 1, 1),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, Q, H, W = x.shape
+        flat = x.reshape(B * Q, 1, H, W)
+        return (self.net(flat) + flat).reshape(B, Q, H, W)
+
+
 class EoMT(nn.Module):
     def __init__(
         self,
@@ -23,8 +48,9 @@ class EoMT(nn.Module):
         num_q,
         num_blocks=4,
         masked_attn_enabled=True,
-        freeze_backbone: bool = True,     # MODIFIED: freeze pretrained DINOv2 backbone weights
-        upsample_bilinear: bool = False,  # MODIFIED: bilinear resize+conv instead of ConvTranspose2d
+        freeze_backbone: bool = True,       # MODIFIED: freeze pretrained DINOv2 backbone weights
+        upsample_bilinear: bool = False,    # MODIFIED: bilinear resize+conv instead of ConvTranspose2d
+        use_refinement_head: bool = False,  # MODIFIED: lightweight Conv refinement after einsum
     ):
         super().__init__()
         self.encoder = encoder
@@ -54,6 +80,8 @@ class EoMT(nn.Module):
             *[ScaleBlock(self.encoder.backbone.embed_dim, use_bilinear=upsample_bilinear)
               for _ in range(num_upscale)],
         )
+
+        self.refinement_head = RefinementHead() if use_refinement_head else None
 
         # MODIFIED: partial freeze — lock first 75% of transformer blocks (early generic features),
         # keep last 25% + norm trainable so high-level features can adapt to landmark task.
@@ -86,6 +114,9 @@ class EoMT(nn.Module):
         mask_logits = torch.einsum(
             "bqc, bchw -> bqhw", self.mask_head(q), self.upscale(x)
         )
+
+        if self.refinement_head is not None:
+            mask_logits = self.refinement_head(mask_logits)
 
         return mask_logits, class_logits
 

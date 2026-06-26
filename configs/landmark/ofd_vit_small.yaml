@@ -24,9 +24,12 @@ trainer:
       init_args:
         logging_interval: step
   logger:
-    class_path: lightning.pytorch.loggers.CSVLogger
+    class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
+      project: eomt-landmark
+      name: ofd-run01          # override per run: --trainer.logger.init_args.name <name>
       save_dir: logs
+      log_model: false
 
 model:
   class_path: training.landmark_detection.LandmarkDetection
@@ -35,7 +38,7 @@ model:
     attn_mask_annealing_enabled: false
     attn_mask_annealing_start_steps: null
     attn_mask_annealing_end_steps: null
-    lr: 2.0e-5
+    lr: 1.0e-4
     llrd: 0.8
     llrd_l2_enabled: true
     lr_mult: 1.0

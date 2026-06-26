@@ -63,6 +63,8 @@ class LandmarkCLI(cli.LightningCLI):
     def __init__(self, *args, **kwargs):
         logging.getLogger().setLevel(logging.INFO)
         torch.set_float32_matmul_precision("medium")
+        torch.backends.cudnn.deterministic = True   # deterministic ConvTranspose2d / cuDNN kernels
+        torch.backends.cudnn.benchmark = False      # disable auto-tuner (picks different kernels per run)
         torch._dynamo.config.capture_scalar_outputs = True
         torch._dynamo.config.suppress_errors = True
         warnings.filterwarnings(
