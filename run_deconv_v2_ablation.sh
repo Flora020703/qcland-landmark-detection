@@ -104,7 +104,7 @@ checks = [
     ('freeze_backbone',      n['freeze_backbone'],           False),
     ('num_blocks',           n['num_blocks'],                3),
     ('masked_attn_enabled',  n['masked_attn_enabled'],       True),
-    ('backbone_name',        n['backbone_name'],             'vit_small_patch14_reg4_dinov2'),
+    ('backbone_name', n.get('encoder', {}).get('init_args', {}).get('backbone_name', n.get('backbone_name')), 'vit_small_patch14_reg4_dinov2'),
     ('heatmap_size',         data['heatmap_size'],           [64, 64]),
     ('sigma',                data['sigma'],                  4.0),
     ('val_split_seed',       data['val_split_seed'],         42),
