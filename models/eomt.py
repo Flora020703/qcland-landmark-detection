@@ -206,10 +206,12 @@ class EoMT(nn.Module):
         # Used when heatmap_head=="coord_direct".  Intermediate layers still use
         # einsum+loss to train the backbone; only the final prediction uses this head.
         self.coord_direct_head = (
-            nn.Linear(self.encoder.backbone.embed_dim, num_q * 2)
+            nn.Linear(self.encoder.backbone.embed_dim, 2)
             if heatmap_head == "coord_direct"
             else None
         )
+        # Why 2 (not num_q*2): applied to q_final (B,Q,C), nn.Linear acts on last dim
+        # → output (B,Q,2); each query independently regresses its own (x,y).
 
         # MODIFIED: partial freeze — lock first 75% of transformer blocks (early generic features),
         # keep last 25% + norm trainable so high-level features can adapt to landmark task.
