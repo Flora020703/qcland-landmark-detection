@@ -233,10 +233,11 @@ class LandmarkDetection(LightningModule):
         attn_mask_annealing_start_steps: Optional[List[int]] = None,
         attn_mask_annealing_end_steps: Optional[List[int]] = None,
         # Loss
-        loss_type: str = "mse",      # "mse" | "weighted_mse" | "adaptive_wing" | "hybrid" | "hybrid_awing"
+        loss_type: str = "mse",      # "mse" | "weighted_mse" | "adaptive_wing" | "hybrid" | "hybrid_awing" | "triple"
         alpha: float = 5.0,          # foreground weight multiplier for weighted_mse / hybrid
         temperature: float = 10.0,   # soft-argmax temperature for hybrid coord loss
-        lambda_coord: float = 0.1,   # coord loss weight for hybrid (total = L_hm + λ·L_coord)
+        lambda_coord: float = 0.1,   # coord loss weight for hybrid/triple
+        lambda_awing: float = 0.01,  # AWing supplement weight for triple (WMSE + λ_a·AWing + λ_c·L1)
         # AdaptiveWingLoss hyper-params (only used when loss_type="adaptive_wing")
         awing_omega:   float = 14.0,
         awing_theta:   float = 0.5,
@@ -279,6 +280,7 @@ class LandmarkDetection(LightningModule):
         self.alpha       = alpha
         self.temperature = temperature
         self.lambda_coord = lambda_coord
+        self.lambda_awing = lambda_awing
         self._awing = AdaptiveWingLoss(awing_omega, awing_theta, awing_alpha, awing_epsilon)
 
         # per-epoch NME accumulators (single-GPU; lists reset on epoch end)
@@ -334,6 +336,16 @@ class LandmarkDetection(LightningModule):
                 layer_loss     = L_hm + self.lambda_coord * L_coord
                 total_L_hm    = total_L_hm    + L_hm.detach()
                 total_L_coord = total_L_coord + L_coord.detach()
+            elif self.loss_type == "triple":
+                # WMSE (主导) + λ_awing·AWing (补充) + λ_coord·L1(coord)
+                L_hm, L_coord = hybrid_loss(
+                    pred, gt_heatmaps, gt_coords,
+                    alpha=self.alpha, temperature=self.temperature,
+                )
+                L_awing = self._awing(pred, gt_heatmaps)
+                layer_loss     = L_hm + self.lambda_awing * L_awing + self.lambda_coord * L_coord
+                total_L_hm    = total_L_hm    + L_hm.detach()
+                total_L_coord = total_L_coord + L_coord.detach()
             else:
                 layer_loss = F.mse_loss(pred, gt_heatmaps)
 
@@ -344,7 +356,7 @@ class LandmarkDetection(LightningModule):
         total_loss = total_loss / n_layers
         self.log("train/loss", total_loss, on_step=True, on_epoch=False, prog_bar=True)
 
-        if self.loss_type in ("hybrid", "hybrid_awing"):
+        if self.loss_type in ("hybrid", "hybrid_awing", "triple"):
             self.log("train/loss_hm",    total_L_hm    / n_layers, on_step=True, on_epoch=False)
             self.log("train/loss_coord", total_L_coord / n_layers, on_step=True, on_epoch=False)
 

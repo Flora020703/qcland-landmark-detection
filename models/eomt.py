@@ -40,6 +40,95 @@ class RefinementHead(nn.Module):
         return (self.net(flat) + flat).reshape(B, Q, H, W)
 
 
+class QueryConditionedDeconvHead(nn.Module):
+    """
+    V2 heatmap head: FiLM-conditioned patch features → per-landmark heatmaps.
+
+    Replaces the einsum dot-product similarity map with learned, query-specific
+    spatial processing.  Patch features carry spatial structure; query tokens
+    select which landmark to localise via FiLM modulation.
+
+    Input:
+      query_tokens  : (B, Q, C) — raw last-block query tokens (NOT mask_head output)
+      patch_features: (B, C, H_f, W_f) — post-upscale patch features from self.upscale
+                      e.g. (B, 384, 72, 72) for 512×512 input with patch_size=14
+
+    Output: (B, Q, hm_H, hm_W) — same interface as the einsum path.
+
+    Design notes:
+      • GroupNorm on patch features prevents large-magnitude channels from
+        overwhelming FiLM modulation (ViT + ScaleBlock outputs are unbounded).
+      • All Q queries are processed in a single Conv pass via (B*Q, C, H, W)
+        reshape — no per-query loop.
+      • Final F.interpolate handles the 72→64 (or any non-power-of-2) resize.
+    """
+
+    def __init__(
+        self,
+        embed_dim: int = 384,
+        num_queries: int = 2,
+        heatmap_size: tuple = (64, 64),
+        hidden_ch: int = 128,
+    ):
+        super().__init__()
+        self.heatmap_size = heatmap_size
+
+        # FiLM generator: query → (γ, β) for channel-wise modulation of patch features
+        self.film_generator = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dim, embed_dim * 2),   # γ and β concatenated
+        )
+
+        # Normalise patch features before FiLM to stabilise modulation scale
+        self.norm = nn.GroupNorm(32, embed_dim)
+
+        # Shared spatial processing — same weights applied to every query's modulated features
+        self.conv1 = nn.Conv2d(embed_dim, hidden_ch, kernel_size=3, padding=1)
+        self.relu  = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(hidden_ch, 1, kernel_size=3, padding=1)
+
+        self._init_weights()
+
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.ones_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(
+        self,
+        query_tokens: torch.Tensor,    # (B, Q, C)
+        patch_features: torch.Tensor,  # (B, C, H_f, W_f)
+    ) -> torch.Tensor:
+        B, Q, C = query_tokens.shape
+        H, W = patch_features.shape[-2:]
+
+        # FiLM params: (B, Q, 2C) → γ and β each (B, Q, C, 1, 1)
+        film   = self.film_generator(query_tokens)
+        gamma  = film[..., :C].unsqueeze(-1).unsqueeze(-1)
+        beta   = film[..., C:].unsqueeze(-1).unsqueeze(-1)
+
+        # GroupNorm then broadcast to Q queries: (B, 1, C, H, W) × (B, Q, C, 1, 1)
+        normed    = self.norm(patch_features).unsqueeze(1)   # (B, 1, C, H, W)
+        modulated = (gamma * normed + beta).reshape(B * Q, C, H, W)
+
+        # Single Conv pass over all queries: (B*Q, 1, H, W)
+        out = self.conv2(self.relu(self.conv1(modulated)))
+
+        # Resize to target heatmap resolution (handles non-integer scale factors)
+        out = F.interpolate(out, self.heatmap_size, mode="bilinear", align_corners=False)
+
+        return out.reshape(B, Q, *self.heatmap_size)
+
+
 class EoMT(nn.Module):
     def __init__(
         self,
@@ -51,6 +140,8 @@ class EoMT(nn.Module):
         freeze_backbone: bool = True,       # MODIFIED: freeze pretrained DINOv2 backbone weights
         upsample_bilinear: bool = False,    # MODIFIED: bilinear resize+conv instead of ConvTranspose2d
         use_refinement_head: bool = False,  # MODIFIED: lightweight Conv refinement after einsum
+        heatmap_head: str = "einsum",       # MODIFIED: "einsum" | "deconv_v2"
+        heatmap_size: tuple = (64, 64),     # MODIFIED: target heatmap size for deconv heads
     ):
         super().__init__()
         self.encoder = encoder
@@ -83,6 +174,18 @@ class EoMT(nn.Module):
 
         self.refinement_head = RefinementHead() if use_refinement_head else None
 
+        # MODIFIED: learnable deconv heatmap head (replaces einsum when heatmap_head != "einsum")
+        self.heatmap_head = heatmap_head
+        self.deconv_head = (
+            QueryConditionedDeconvHead(
+                embed_dim=self.encoder.backbone.embed_dim,
+                num_queries=num_q,
+                heatmap_size=heatmap_size,
+            )
+            if heatmap_head == "deconv_v2"
+            else None
+        )
+
         # MODIFIED: partial freeze — lock first 75% of transformer blocks (early generic features),
         # keep last 25% + norm trainable so high-level features can adapt to landmark task.
         if freeze_backbone:
@@ -102,21 +205,24 @@ class EoMT(nn.Module):
                     p.requires_grad = True
 
     def _predict(self, x: torch.Tensor):
-        q = x[:, : self.num_q, :]
+        q = x[:, : self.num_q, :]   # (B, Q, C) — raw query tokens
 
         class_logits = self.class_head(q)
 
-        x = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
-        x = x.transpose(1, 2).reshape(
-            x.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
-        )
+        # Reshape patch tokens to spatial grid then upscale
+        patch_tokens = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
+        patch_features = patch_tokens.transpose(1, 2).reshape(
+            patch_tokens.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
+        )                                          # (B, C, grid_h, grid_w)
+        upscaled = self.upscale(patch_features)    # (B, C, grid_h*2, grid_w*2)
 
-        mask_logits = torch.einsum(
-            "bqc, bchw -> bqhw", self.mask_head(q), self.upscale(x)
-        )
-
-        if self.refinement_head is not None:
-            mask_logits = self.refinement_head(mask_logits)
+        if self.heatmap_head == "deconv_v2":
+            # DeconvHead takes raw q (not mask_head output) — FiLM generator has its own MLP
+            mask_logits = self.deconv_head(q, upscaled)
+        else:  # "einsum" — original path
+            mask_logits = torch.einsum("bqc, bchw -> bqhw", self.mask_head(q), upscaled)
+            if self.refinement_head is not None:
+                mask_logits = self.refinement_head(mask_logits)
 
         return mask_logits, class_logits
 

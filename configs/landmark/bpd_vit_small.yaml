@@ -12,10 +12,10 @@
 #   data.heatmap_size  → model.heatmap_size, model.network.heatmap_size
 # ---------------------------------------------------------------
 
-seed_everything: 42   # seeds torch / numpy / python-random + DataLoader shuffle + weight init
+seed_everything: 2024   # seeds torch / numpy / python-random + DataLoader shuffle + weight init
 
 trainer:
-  max_epochs: 400
+  max_epochs: 200
   check_val_every_n_epoch: 5
   log_every_n_steps: 1        # only 6 steps/epoch, default 50 causes warning
   callbacks:
@@ -23,8 +23,10 @@ trainer:
       init_args:
         monitor: metrics/val_nme
         mode: min
-        save_top_k: 3
-        filename: "epoch{epoch:02d}-nme{metrics/val_nme:.4f}"
+        save_top_k: 1
+        save_last: true        # needed for seed{N}_final.pth in ablation
+        dirpath: checkpoints/deconv_v2
+        filename: deconv_v2_best
     - class_path: lightning.pytorch.callbacks.EarlyStopping
       init_args:
         monitor: metrics/val_nme
@@ -38,7 +40,7 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: eomt-landmark
-      name: bpd-run20a-hybrid-awing-lambda1  # override per run: --trainer.logger.init_args.name <name>
+      name: deconv_v2
       save_dir: logs
       log_model: false
 
@@ -47,14 +49,10 @@ model:
   init_args:
     # img_size and heatmap_size are linked from data — do not set here
     num_landmarks: 2
-    loss_type: hybrid_awing
-    alpha: 5.0             # foreground weight for weighted_mse branch of hybrid
+    loss_type: hybrid          # WMSE + λ_coord·L1(coord) — same as Run 18 best
+    alpha: 5.0             # foreground weight for WMSE branch
     temperature: 10.0      # soft-argmax temperature (higher = sharper)
-    lambda_coord: 1.0      # coord loss weight (total = L_hm + 1.0 * L_coord)
-    awing_omega: 14.0      # unused for hybrid, kept for ablation reference
-    awing_theta: 0.5
-    awing_alpha: 2.1
-    awing_epsilon: 1.0
+    lambda_coord: 0.1      # coord loss weight
     attn_mask_annealing_enabled: false
     attn_mask_annealing_start_steps: null
     attn_mask_annealing_end_steps: null
@@ -75,6 +73,8 @@ model:
         freeze_backbone: false
         upsample_bilinear: false
         use_refinement_head: false
+        heatmap_head: deconv_v2     # "einsum" | "deconv_v2"
+        heatmap_size: [64, 64]      # must match data.heatmap_size
         encoder:
           class_path: models.vit.ViT
           init_args:
@@ -85,7 +85,7 @@ data:
   class_path: datasets.landmark_dataset.HeadLandmarkDataModule
   init_args:
     # ---- paths: override on command line or edit below for AutoDL ----
-    images_dir: /root/autodl-tmp/UCL/Head
+    images_dir: /root/autodl-tmp/images/UCL/Head
     ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
     ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
     # ------------------------------------------------------------------
