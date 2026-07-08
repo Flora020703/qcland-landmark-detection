@@ -201,6 +201,16 @@ class EoMT(nn.Module):
             else None
         )
 
+        # MODIFIED: direct coord regression head (diagnostic — bypasses heatmap entirely).
+        # query_tokens (B,Q,C) → Linear → (B,Q,2) in heatmap pixel space.
+        # Used when heatmap_head=="coord_direct".  Intermediate layers still use
+        # einsum+loss to train the backbone; only the final prediction uses this head.
+        self.coord_direct_head = (
+            nn.Linear(self.encoder.backbone.embed_dim, num_q * 2)
+            if heatmap_head == "coord_direct"
+            else None
+        )
+
         # MODIFIED: partial freeze — lock first 75% of transformer blocks (early generic features),
         # keep last 25% + norm trainable so high-level features can adapt to landmark task.
         if freeze_backbone:
@@ -398,11 +408,22 @@ class EoMT(nn.Module):
             elif hasattr(block, "layer_scale2"):
                 x = x + block.layer_scale2(mlp_out)
 
-        mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+        x_normed = self.encoder.backbone.norm(x)
+        mask_logits, class_logits = self._predict(x_normed)
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
+
+        # MODIFIED: direct coord regression from final query tokens.
+        # Avoids double norm call by reusing x_normed computed above.
+        final_coord_pred = None
+        if self.coord_direct_head is not None:
+            q_final = x_normed[:, : self.num_q, :]
+            final_coord_pred = self.coord_direct_head(q_final).reshape(
+                x.shape[0], self.num_q, 2
+            )
 
         return (
             mask_logits_per_layer,
             class_logits_per_layer,
+            final_coord_pred,   # None unless heatmap_head == "coord_direct"
         )

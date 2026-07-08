@@ -304,7 +304,8 @@ class LandmarkDetection(LightningModule):
     def training_step(self, batch, batch_idx):
         imgs, gt_heatmaps, gt_coords = batch   # gt_coords: (B, N, 2) [x,y] in heatmap space
 
-        mask_logits_per_layer, _ = self(imgs)
+        mask_logits_per_layer, _, coord_pred = self(imgs)
+        # coord_pred: (B, N, 2) when heatmap_head=="coord_direct", else None
 
         total_loss    = torch.tensor(0.0, device=self.device)
         total_L_hm    = torch.tensor(0.0, device=self.device)
@@ -312,42 +313,53 @@ class LandmarkDetection(LightningModule):
         n_layers = len(mask_logits_per_layer)
 
         for i, mask_logits in enumerate(mask_logits_per_layer):
-            pred = F.interpolate(
-                mask_logits, self.heatmap_size,
-                mode="bilinear", align_corners=False,
-            )                              # (B, N, hm_H, hm_W)
+            is_final_coord_direct = (
+                coord_pred is not None and i == n_layers - 1
+            )
 
-            if self.loss_type == "weighted_mse":
-                layer_loss = weighted_mse_loss(pred, gt_heatmaps, self.alpha)
-            elif self.loss_type == "adaptive_wing":
-                layer_loss = self._awing(pred, gt_heatmaps)
-            elif self.loss_type == "hybrid":
-                L_hm, L_coord = hybrid_loss(
-                    pred, gt_heatmaps, gt_coords,
-                    alpha=self.alpha, temperature=self.temperature,
-                )
-                layer_loss     = L_hm + self.lambda_coord * L_coord
-                total_L_hm    = total_L_hm    + L_hm.detach()
-                total_L_coord = total_L_coord + L_coord.detach()
-            elif self.loss_type == "hybrid_awing":
-                L_hm   = self._awing(pred, gt_heatmaps)
-                pred_coords = spatial_softmax(pred, temperature=self.temperature)
-                L_coord = F.l1_loss(pred_coords, gt_coords)
-                layer_loss     = L_hm + self.lambda_coord * L_coord
-                total_L_hm    = total_L_hm    + L_hm.detach()
-                total_L_coord = total_L_coord + L_coord.detach()
-            elif self.loss_type == "triple":
-                # WMSE (主导) + λ_awing·AWing (补充) + λ_coord·L1(coord)
-                L_hm, L_coord = hybrid_loss(
-                    pred, gt_heatmaps, gt_coords,
-                    alpha=self.alpha, temperature=self.temperature,
-                )
-                L_awing = self._awing(pred, gt_heatmaps)
-                layer_loss     = L_hm + self.lambda_awing * L_awing + self.lambda_coord * L_coord
-                total_L_hm    = total_L_hm    + L_hm.detach()
+            if is_final_coord_direct:
+                # coord_direct final layer: pure L1 on direct regression output (no heatmap loss)
+                L_coord    = F.l1_loss(coord_pred, gt_coords)
+                layer_loss = L_coord
                 total_L_coord = total_L_coord + L_coord.detach()
             else:
-                layer_loss = F.mse_loss(pred, gt_heatmaps)
+                pred = F.interpolate(
+                    mask_logits, self.heatmap_size,
+                    mode="bilinear", align_corners=False,
+                )                              # (B, N, hm_H, hm_W)
+
+                if self.loss_type == "weighted_mse":
+                    layer_loss = weighted_mse_loss(pred, gt_heatmaps, self.alpha)
+                elif self.loss_type == "adaptive_wing":
+                    layer_loss = self._awing(pred, gt_heatmaps)
+                elif self.loss_type in ("hybrid", "coord_direct"):
+                    # "coord_direct" reuses hybrid for intermediate layers
+                    L_hm, L_coord = hybrid_loss(
+                        pred, gt_heatmaps, gt_coords,
+                        alpha=self.alpha, temperature=self.temperature,
+                    )
+                    layer_loss     = L_hm + self.lambda_coord * L_coord
+                    total_L_hm    = total_L_hm    + L_hm.detach()
+                    total_L_coord = total_L_coord + L_coord.detach()
+                elif self.loss_type == "hybrid_awing":
+                    L_hm   = self._awing(pred, gt_heatmaps)
+                    pred_coords = spatial_softmax(pred, temperature=self.temperature)
+                    L_coord = F.l1_loss(pred_coords, gt_coords)
+                    layer_loss     = L_hm + self.lambda_coord * L_coord
+                    total_L_hm    = total_L_hm    + L_hm.detach()
+                    total_L_coord = total_L_coord + L_coord.detach()
+                elif self.loss_type == "triple":
+                    # WMSE (主导) + λ_awing·AWing (补充) + λ_coord·L1(coord)
+                    L_hm, L_coord = hybrid_loss(
+                        pred, gt_heatmaps, gt_coords,
+                        alpha=self.alpha, temperature=self.temperature,
+                    )
+                    L_awing = self._awing(pred, gt_heatmaps)
+                    layer_loss     = L_hm + self.lambda_awing * L_awing + self.lambda_coord * L_coord
+                    total_L_hm    = total_L_hm    + L_hm.detach()
+                    total_L_coord = total_L_coord + L_coord.detach()
+                else:
+                    layer_loss = F.mse_loss(pred, gt_heatmaps)
 
             postfix = f"_l{i}" if n_layers > 1 else ""
             self.log(f"train/layer_loss{postfix}", layer_loss, on_step=True, on_epoch=False)
@@ -356,7 +368,7 @@ class LandmarkDetection(LightningModule):
         total_loss = total_loss / n_layers
         self.log("train/loss", total_loss, on_step=True, on_epoch=False, prog_bar=True)
 
-        if self.loss_type in ("hybrid", "hybrid_awing", "triple"):
+        if self.loss_type in ("hybrid", "hybrid_awing", "triple", "coord_direct"):
             self.log("train/loss_hm",    total_L_hm    / n_layers, on_step=True, on_epoch=False)
             self.log("train/loss_coord", total_L_coord / n_layers, on_step=True, on_epoch=False)
 
@@ -372,18 +384,23 @@ class LandmarkDetection(LightningModule):
     def eval_step(self, batch, batch_idx, log_prefix):
         imgs, gt_heatmaps, gt_coords = batch   # gt_coords: (B, N, 2) float in heatmap space
 
-        mask_logits_per_layer, _ = self(imgs)
+        mask_logits_per_layer, _, coord_pred = self(imgs)
 
-        # use only the final layer prediction for evaluation metrics
-        pred = F.interpolate(
-            mask_logits_per_layer[-1], self.heatmap_size,
-            mode="bilinear", align_corners=False,
-        )
-        val_loss = F.mse_loss(pred, gt_heatmaps)
-        self.log(f"{log_prefix}/mse", val_loss, on_step=False, on_epoch=True)
-
-        # NME: pred decoded from heatmap, GT taken directly from dataset (no quantisation error)
-        pred_coords = heatmap_to_coords(pred.detach())          # (B, N, 2)
+        if coord_pred is not None:
+            # coord_direct mode: use direct regression output for NME
+            pred_coords = coord_pred.detach()          # (B, N, 2) already in heatmap space
+            val_loss = F.l1_loss(pred_coords, gt_coords)
+            self.log(f"{log_prefix}/mse", val_loss, on_step=False, on_epoch=True)
+        else:
+            # use only the final layer heatmap for evaluation metrics
+            pred = F.interpolate(
+                mask_logits_per_layer[-1], self.heatmap_size,
+                mode="bilinear", align_corners=False,
+            )
+            val_loss = F.mse_loss(pred, gt_heatmaps)
+            self.log(f"{log_prefix}/mse", val_loss, on_step=False, on_epoch=True)
+            # NME: pred decoded from heatmap, GT taken directly from dataset (no quantisation)
+            pred_coords = heatmap_to_coords(pred.detach())   # (B, N, 2)
 
         nme_per_sample = compute_nme(
             pred_coords, gt_coords, self.heatmap_size, self.img_size
