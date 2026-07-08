@@ -103,6 +103,21 @@ class QueryConditionedDeconvHead(nn.Module):
                 nn.init.ones_(m.weight)
                 nn.init.zeros_(m.bias)
 
+        # Override conv2 to produce a small positive constant at init.
+        #
+        # Why not zero? _attn_mask() uses (interpolated > 0) to build the attention mask.
+        # Zero-init → all-False mask → queries can't attend to ANY patch → learning blocked.
+        #
+        # Why not kaiming? kaiming on conv2 gives output std ≈ 22 (see chain: GroupNorm →
+        # FiLM → conv1 → ReLU → conv2). WMSE on pred≈22 vs target∈[0,1] → loss≈266,
+        # which distorts the entire gradient trajectory for hundreds of epochs.
+        #
+        # Small positive constant (0.01): loss starts at ~0.0001 per pixel (vs 266),
+        # attention mask sees 0.01 > 0 everywhere → fully open, and gradients from
+        # WMSE + coord loss naturally push the head toward correct peaks.
+        nn.init.zeros_(self.conv2.weight)
+        nn.init.constant_(self.conv2.bias, 0.01)
+
     def forward(
         self,
         query_tokens: torch.Tensor,    # (B, Q, C)
@@ -204,7 +219,35 @@ class EoMT(nn.Module):
                 for p in backbone.norm.parameters():
                     p.requires_grad = True
 
+    def _predict_einsum(self, x: torch.Tensor):
+        """
+        Einsum-based prediction, always used for intermediate decoder layers.
+
+        Regardless of self.heatmap_head, intermediate predictions use the einsum
+        dot-product path because:
+          (a) Attention masks: intermediate outputs feed `_attn_mask()` via `> 0`.
+              As training progresses the DeconvHead pushes background pixels toward
+              zero / negative; this can make the mask intermittently block all
+              query→patch attention, collapsing intermediate block learning.
+          (b) Query quality: block-9 queries are freshly injected (self.q.weight,
+              input-independent) — the einsum's mask_head MLP provides better
+              calibration than FiLM conditioned on raw embeddings.
+          (c) Backbone signal: 3 einsum losses fully train the backbone, so the
+              final DeconvHead inherits high-quality spatial features.
+        """
+        q = x[:, : self.num_q, :]
+        class_logits = self.class_head(q)
+        patch_tokens = x[:, self.num_q + self.encoder.backbone.num_prefix_tokens :, :]
+        patch_features = patch_tokens.transpose(1, 2).reshape(
+            patch_tokens.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
+        )
+        mask_logits = torch.einsum(
+            "bqc, bchw -> bqhw", self.mask_head(q), self.upscale(patch_features)
+        )
+        return mask_logits, class_logits
+
     def _predict(self, x: torch.Tensor):
+        """Final-layer prediction using the configured heatmap head."""
         q = x[:, : self.num_q, :]   # (B, Q, C) — raw query tokens
 
         class_logits = self.class_head(q)
@@ -330,7 +373,10 @@ class EoMT(nn.Module):
                 self.masked_attn_enabled
                 and i >= len(self.encoder.backbone.blocks) - self.num_blocks
             ):
-                mask_logits, class_logits = self._predict(self.encoder.backbone.norm(x))
+                # Always use einsum for intermediate predictions:
+                #   - attention masks must be stable (no risk of all-False from uninitialised heads)
+                #   - 3 einsum losses fully train backbone + mask_head + queries
+                mask_logits, class_logits = self._predict_einsum(self.encoder.backbone.norm(x))
                 mask_logits_per_layer.append(mask_logits)
                 class_logits_per_layer.append(class_logits)
 
