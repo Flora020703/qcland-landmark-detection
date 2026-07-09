@@ -92,7 +92,7 @@ model:
 data:
   class_path: datasets.landmark_dataset.HeadLandmarkDataModule
   init_args:
-    images_dir: /root/autodl-tmp/images/HC18
+    images_dir: /root/autodl-tmp/images/HC18/Head
     ann_train_csv: /root/autodl-tmp/annotations/HC18/Head_Train.csv
     ann_test_csv: /root/autodl-tmp/annotations/HC18/Head_Test.csv
     task: bpd
