@@ -147,6 +147,44 @@ class QueryConditionedDeconvHead(nn.Module):
         return out.reshape(B, Q, *self.heatmap_size)
 
 
+class FeaturePyramidFusion(nn.Module):
+    """
+    MODIFIED: fuses patch-grid features from multiple backbone depths (e.g.
+    blocks 4/8/12) before the final heatmap head, so the deconv_v2 head sees
+    shallow edge/texture features alongside the last block's semantics —
+    DINOv2's last-layer-only output loses this spatial detail.
+
+    Unlike a CNN FPN, all ViT blocks share one spatial resolution throughout
+    (no downsampling across depth), so fusion needs no top-down resizing:
+    per-level GroupNorm (raw residual-stream magnitude grows with depth,
+    same reasoning as QueryConditionedDeconvHead's patch-feature norm) ->
+    concat on channel dim -> 1x1 conv back to embed_dim.
+
+    Initialised as an identity pass-through of the last (deepest) level only
+    (zero weight on earlier levels), so enabling FPN does not perturb the
+    proven single-layer behaviour at step 0 — the model learns to blend in
+    shallower levels rather than starting from a cold, unproven fusion.
+    """
+
+    def __init__(self, embed_dim: int, num_levels: int):
+        super().__init__()
+        self.norms = nn.ModuleList(
+            nn.GroupNorm(32, embed_dim) for _ in range(num_levels)
+        )
+        self.proj = nn.Conv2d(embed_dim * num_levels, embed_dim, kernel_size=1)
+
+        with torch.no_grad():
+            self.proj.weight.zero_()
+            last_offset = embed_dim * (num_levels - 1)
+            for c in range(embed_dim):
+                self.proj.weight[c, last_offset + c, 0, 0] = 1.0
+            self.proj.bias.zero_()
+
+    def forward(self, feats: list) -> torch.Tensor:
+        normed = [norm(f) for norm, f in zip(self.norms, feats)]
+        return self.proj(torch.cat(normed, dim=1))
+
+
 class EoMT(nn.Module):
     def __init__(
         self,
@@ -160,12 +198,46 @@ class EoMT(nn.Module):
         use_refinement_head: bool = False,  # MODIFIED: lightweight Conv refinement after einsum
         heatmap_head: str = "einsum",       # MODIFIED: "einsum" | "deconv_v2"
         heatmap_size: tuple = (64, 64),     # MODIFIED: target heatmap size for deconv heads
+        use_fpn: bool = False,              # MODIFIED: fuse multi-depth backbone features before the final head
+        fpn_layers: Optional[list] = None,  # MODIFIED: 1-indexed block numbers to fuse, e.g. [4, 8, 12]; last entry must equal total block count
+        use_lora: bool = False,             # MODIFIED: wrap backbone attention qkv with LoRA adapters (peft)
+        lora_rank: int = 8,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.1,
     ):
         super().__init__()
         self.encoder = encoder
         self.num_q = num_q
         self.num_blocks = num_blocks
         self.masked_attn_enabled = masked_attn_enabled
+
+        assert not (use_lora and freeze_backbone), (
+            "use_lora and freeze_backbone both decide which backbone weights train; "
+            "combining them is ambiguous. get_peft_model() already freezes all base "
+            "backbone weights and trains only the LoRA adapters, so leave "
+            "freeze_backbone=false when use_lora=true."
+        )
+
+        # MODIFIED: LoRA adapters on backbone attention Q/K/V projection (peft).
+        # Freezes all base backbone weights, trains only the LoRA A/B matrices
+        # (~0.3M params). Meant to be layered on top of use_fpn, not run standalone
+        # — LoRA alone doesn't address the feature-utilisation gap FPN targets.
+        self.use_lora = use_lora
+        if use_lora:
+            from peft import LoraConfig, get_peft_model  # lazy import: peft only needed here
+
+            lora_config = LoraConfig(
+                r=lora_rank,
+                lora_alpha=lora_alpha,
+                target_modules=["qkv"],
+                lora_dropout=lora_dropout,
+            )
+            # NOTE: target_modules=["qkv"] assumes timm's ViT Attention module
+            # exposes `self.qkv` (true for standard timm vision_transformer.py).
+            # Verify on first run: print(encoder.backbone) or check that
+            # trainable-param count includes "lora_" — if 0 LoRA params show up,
+            # the target module name doesn't match and needs adjusting.
+            encoder.backbone = get_peft_model(encoder.backbone, lora_config)
 
         self.register_buffer("attn_mask_probs", torch.ones(num_blocks))
 
@@ -216,6 +288,32 @@ class EoMT(nn.Module):
         # Why 2 (not num_q*2): applied to q_final (B,Q,C), nn.Linear acts on last dim
         # → output (B,Q,2); each query independently regresses its own (x,y).
 
+        # MODIFIED: multi-depth feature fusion (FPN-style) before the final head.
+        # fpn_layers are 1-indexed block numbers (e.g. [4, 8, 12] on a 12-block ViT-S).
+        # The last entry must equal the total block count: it's the same final
+        # x_normed that _predict() already computes, not a separately captured layer.
+        self.use_fpn = use_fpn
+        self.fpn_layers = list(fpn_layers) if fpn_layers is not None else []
+        if use_fpn:
+            n_blocks_total = len(self.encoder.backbone.blocks)
+            assert self.fpn_layers == sorted(self.fpn_layers), (
+                f"fpn_layers must be ascending, got {self.fpn_layers}"
+            )
+            assert self.fpn_layers[-1] == n_blocks_total, (
+                f"fpn_layers must end with the total block count ({n_blocks_total}); "
+                f"got {self.fpn_layers}"
+            )
+            # 0-indexed block numbers to capture mid-forward (all but the last entry,
+            # which _predict() derives from x_normed instead of a captured tensor).
+            self._fpn_capture_blocks = [layer - 1 for layer in self.fpn_layers[:-1]]
+            self.fpn = FeaturePyramidFusion(
+                embed_dim=self.encoder.backbone.embed_dim,
+                num_levels=len(self.fpn_layers),
+            )
+        else:
+            self._fpn_capture_blocks = []
+            self.fpn = None
+
         # MODIFIED: partial freeze — lock first 75% of transformer blocks (early generic features),
         # keep last 25% + norm trainable so high-level features can adapt to landmark task.
         if freeze_backbone:
@@ -261,7 +359,22 @@ class EoMT(nn.Module):
         )
         return mask_logits, class_logits
 
-    def _predict(self, x: torch.Tensor):
+    def _patch_grid(self, x: torch.Tensor, has_query_tokens: bool) -> torch.Tensor:
+        """
+        MODIFIED: reshape patch tokens to spatial grid (B, C, grid_h, grid_w),
+        used to capture intermediate backbone features for FPN fusion. Query
+        tokens are only prepended to x from block (n_blocks - num_blocks)
+        onward, so the offset must skip them only once they're present.
+        """
+        offset = self.encoder.backbone.num_prefix_tokens
+        if has_query_tokens:
+            offset += self.num_q
+        patch_tokens = x[:, offset:, :]
+        return patch_tokens.transpose(1, 2).reshape(
+            patch_tokens.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
+        )
+
+    def _predict(self, x: torch.Tensor, fpn_feats: Optional[list] = None):
         """Final-layer prediction using the configured heatmap head."""
         q = x[:, : self.num_q, :]   # (B, Q, C) — raw query tokens
 
@@ -272,6 +385,13 @@ class EoMT(nn.Module):
         patch_features = patch_tokens.transpose(1, 2).reshape(
             patch_tokens.shape[0], -1, *self.encoder.backbone.patch_embed.grid_size
         )                                          # (B, C, grid_h, grid_w)
+
+        if self.use_fpn:
+            # fpn_feats holds the shallower captured levels in ascending depth
+            # order; the current (deepest) level is appended last to match
+            # self.fpn_layers order, e.g. [layer4, layer8, layer12].
+            patch_features = self.fpn(fpn_feats + [patch_features])
+
         upscaled = self.upscale(patch_features)    # (B, C, grid_h*2, grid_w*2)
 
         if self.heatmap_head == "deconv_v2":
@@ -377,6 +497,7 @@ class EoMT(nn.Module):
 
         attn_mask = None
         mask_logits_per_layer, class_logits_per_layer = [], []
+        fpn_feats = []
 
         for i, block in enumerate(self.encoder.backbone.blocks):
             if i == len(self.encoder.backbone.blocks) - self.num_blocks:
@@ -413,8 +534,16 @@ class EoMT(nn.Module):
             elif hasattr(block, "layer_scale2"):
                 x = x + block.layer_scale2(mlp_out)
 
+            # MODIFIED: capture shallower-layer patch features for FPN fusion
+            # (see self.fpn_layers / self._fpn_capture_blocks in __init__).
+            if self.use_fpn and i in self._fpn_capture_blocks:
+                has_q = i >= len(self.encoder.backbone.blocks) - self.num_blocks
+                fpn_feats.append(self._patch_grid(x, has_query_tokens=has_q))
+
         x_normed = self.encoder.backbone.norm(x)
-        mask_logits, class_logits = self._predict(x_normed)
+        mask_logits, class_logits = self._predict(
+            x_normed, fpn_feats=fpn_feats if self.use_fpn else None
+        )
         mask_logits_per_layer.append(mask_logits)
         class_logits_per_layer.append(class_logits)
 
