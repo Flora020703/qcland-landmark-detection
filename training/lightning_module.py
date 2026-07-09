@@ -146,9 +146,16 @@ class LightningModule(lightning.LightningModule):
             else:
                 # MODIFIED: apply lr_mult to head params (q, mask_head, upscale, class_head)
                 # so head LR = lr * lr_mult (e.g. 1e-4 * 10 = 1e-3 for fast head convergence)
-                other_param_groups.append(
-                    {"params": [param], "lr": self.lr * self.lr_mult, "name": name}
-                )
+                group = {"params": [param], "lr": self.lr * self.lr_mult, "name": name}
+
+                # MODIFIED: stronger weight_decay on deconv_v2's FiLM generator only —
+                # it overfits faster than the rest of the head (5-seed ablation showed
+                # higher variance than einsum). Harmless for all other tasks/heads since
+                # "film_generator" never appears in their param names.
+                if "film_generator" in name:
+                    group["weight_decay"] = 0.1
+
+                other_param_groups.append(group)
 
         param_groups = backbone_param_groups + other_param_groups
         optimizer = AdamW(param_groups, weight_decay=self.weight_decay)

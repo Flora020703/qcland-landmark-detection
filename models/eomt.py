@@ -74,9 +74,12 @@ class QueryConditionedDeconvHead(nn.Module):
         self.heatmap_size = heatmap_size
 
         # FiLM generator: query → (γ, β) for channel-wise modulation of patch features
+        # MODIFIED: dropout between the two Linears to reduce overfitting (deconv_v2
+        # val NME improved on avg but variance rose across seeds — see 5-seed ablation)
         self.film_generator = nn.Sequential(
             nn.Linear(embed_dim, embed_dim),
             nn.ReLU(inplace=True),
+            nn.Dropout(0.2),
             nn.Linear(embed_dim, embed_dim * 2),   # γ and β concatenated
         )
 

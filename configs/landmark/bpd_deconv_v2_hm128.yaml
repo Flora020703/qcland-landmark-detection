@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------
+# MODIFIED: Experiment 3 — heatmap resolution 64→128 (deconv_v2).
+#
+# Goal: 64x64 heatmap = 8x8 px/cell on 512x512 input, limiting coordinate
+# precision. 128x128 doubles the resolution. sigma scaled 4.0->8.0 to keep
+# the same relative peak width (128/64 = 2x).
+#
+# Verified before creating this config (no code changes needed):
+#   - QueryConditionedDeconvHead.forward() F.interpolate reads target size
+#     from self.heatmap_size (models/eomt.py), not hardcoded -> reads config.
+#   - soft-argmax coordinate grid (training/landmark_detection.py) is built
+#     from the heatmap tensor's actual H,W via torch.arange, so it adapts
+#     automatically to 128x128.
+#
+# Only differences from bpd_deconv_v2.yaml: heatmap_size [64,64]->[128,128]
+# (both network.init_args and data.init_args) and sigma 4.0->8.0.
+# ---------------------------------------------------------------
+
+seed_everything: 2024
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/deconv-v2-hm128
+        filename: deconv-v2-hm128_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: deconv-v2-hm128
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size: [128, 128]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/UCL/Head
+    ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
+    task: bpd
+    img_size: [512, 512]
+    heatmap_size: [128, 128]
+    sigma: 8.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
