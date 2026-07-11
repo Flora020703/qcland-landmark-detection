@@ -169,8 +169,13 @@ PYEOF
             --ckpt_path "${BEST_CKPT}" 2>&1 \
             | tee "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
             | grep -E "test_nme|Test NME"
-        grep -oE "[0-9]+\.[0-9]+" "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
-            | head -1 > "${RUN_DIR}/seed${SEED}_best_test_nme.txt" || true
+        # NOTE: must grep for the "Test NME:" line FIRST, then extract the float
+        # from just that line (taking the LAST match). Extracting from the raw
+        # log directly picks up the tqdm progress bar's it/s number (e.g.
+        # "7.89it/s") which precedes "Test NME:" on the same line — that bug
+        # silently produced "0.28%" (from an unrelated float) in an earlier run.
+        grep "Test NME:" "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
+            | grep -oE "[0-9]+\.[0-9]+" | tail -1 > "${RUN_DIR}/seed${SEED}_best_test_nme.txt" || true
     else
         echo "[WARN] Best checkpoint not found — skipping test"
     fi
@@ -184,8 +189,8 @@ PYEOF
             --ckpt_path "${FINAL_CKPT}" 2>&1 \
             | tee "${RUN_DIR}/seed${SEED}_final_test_log.txt" \
             | grep -E "test_nme|Test NME"
-        grep -oE "[0-9]+\.[0-9]+" "${RUN_DIR}/seed${SEED}_final_test_log.txt" \
-            | head -1 > "${RUN_DIR}/seed${SEED}_final_test_nme.txt" || true
+        grep "Test NME:" "${RUN_DIR}/seed${SEED}_final_test_log.txt" \
+            | grep -oE "[0-9]+\.[0-9]+" | tail -1 > "${RUN_DIR}/seed${SEED}_final_test_nme.txt" || true
     else
         echo "[WARN] Final checkpoint not found — skipping test"
     fi
