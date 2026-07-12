@@ -1,21 +1,15 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_fpn_ablation.sh — FPN multi-depth fusion (deconv_v2, 64x64) 5-seed ablation
+# run_deconv_v2_ablation.sh — DeconvHead V2 5-seed ablation
 #
-# Why 5-seed from the start (not a single spot-check like the original plan):
-# deconv_v2 has demonstrated high seed variance (64x64: std 3.00%; hm128: std
-# 1.12%/3.01%), AND the hm128 ablation showed the SAME seed (2024) giving
-# noticeably different results between a standalone run (12.02%/13.02%) and
-# the ablation script's regenerated-config run (15.30%/15.21%) — meaning even
-# "same seed" isn't fully reproducible here (DataLoader has no explicit
-# generator/worker_init_fn, so exact RNG consumption before dataloader
-# creation can drift). A single FPN run could easily be a lucky/unlucky draw
-# and mislead the FPN-vs-baseline conclusion — run all 5 before deciding.
-#
-# Seeds: 42, 0, 123, 2024, 3407 (same set as the other two ablations).
+# Seeds: 42, 0, 123, 2024, 3407  (same as einsum seed ablation for fair comparison)
+# For each seed, saves checkpoints and tests BOTH:
+#   (a) val-best checkpoint  — monitors val_nme, unreliable on 10-image val set
+#   (b) last checkpoint      — full 200-epoch trained model
+# Both NMEs are printed so caller can compare vs einsum mean 17.48%±1.95%
 #
 # Checkpoint layout:
-#   checkpoints/fpn-ablation/seed{N}/
+#   checkpoints/deconv-v2-ablation/seed{N}/
 #     seed{N}_best.ckpt   — saved by ModelCheckpoint
 #     seed{N}_final.ckpt  — copy of last.ckpt
 #     seed{N}_best_test_nme.txt   — test NME from val-best checkpoint
@@ -23,12 +17,12 @@
 #
 # Usage (on AutoDL server):
 #   cd /root/eomt
-#   bash run_fpn_ablation.sh
+#   bash ablation/scripts/run_deconv_v2_ablation.sh
 # =============================================================================
 
 set -euo pipefail
 
-BASE_CONFIG="configs/landmark/bpd_deconv_v2_fpn.yaml"
+BASE_CONFIG="configs/landmark/bpd_deconv_v2.yaml"
 SEEDS=(42 0 123 2024 3407)
 
 # ---------------------------------------------------------------------------
@@ -43,16 +37,16 @@ python3 -c "import yaml; yaml.safe_load(open('${BASE_CONFIG}'))" \
     && echo "[OK] Base config valid: ${BASE_CONFIG}" \
     || { echo "[ERROR] Invalid YAML — aborting"; exit 1; }
 
-mkdir -p checkpoints/fpn-ablation
+mkdir -p checkpoints/deconv-v2-ablation
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 for SEED in "${SEEDS[@]}"; do
 
-    RUN_NAME="fpn-ablation-seed${SEED}"
-    RUN_DIR="checkpoints/fpn-ablation/seed${SEED}"
-    TMP_CFG="/tmp/fpn_seed${SEED}.yaml"
+    RUN_NAME="deconv-v2-ablation-seed${SEED}"
+    RUN_DIR="checkpoints/deconv-v2-ablation/seed${SEED}"
+    TMP_CFG="/tmp/deconv_v2_seed${SEED}.yaml"
 
     echo ""
     echo "============================================================"
@@ -66,8 +60,8 @@ import yaml, sys
 seed     = int(sys.argv[1])
 base_cfg = sys.argv[2]
 out_cfg  = sys.argv[3]
-run_name = f'fpn-ablation-seed{seed}'
-run_dir  = f'checkpoints/fpn-ablation/seed{seed}'
+run_name = f'deconv-v2-ablation-seed{seed}'
+run_dir  = f'checkpoints/deconv-v2-ablation/seed{seed}'
 
 with open(base_cfg) as f:
     cfg = yaml.safe_load(f)
@@ -110,15 +104,10 @@ checks = [
     ('freeze_backbone',      n['freeze_backbone'],           False),
     ('num_blocks',           n['num_blocks'],                3),
     ('masked_attn_enabled',  n['masked_attn_enabled'],       True),
-    ('use_fpn',              n.get('use_fpn', False),        True),
-    ('fpn_layers',           n.get('fpn_layers'),            [4, 8, 12]),
-    ('use_lora',             n.get('use_lora', False),       False),
     ('backbone_name', n.get('encoder', {}).get('init_args', {}).get('backbone_name', n.get('backbone_name')), 'vit_small_patch14_reg4_dinov2'),
-    ('heatmap_size (net)',   n['heatmap_size'],              [64, 64]),
-    ('heatmap_size (data)',  data['heatmap_size'],           [64, 64]),
+    ('heatmap_size',         data['heatmap_size'],           [64, 64]),
     ('sigma',                data['sigma'],                  4.0),
     ('val_split_seed',       data['val_split_seed'],         42),
-    ('images_dir',           data['images_dir'],             '/root/autodl-tmp/images/UCL/Head'),
     ('save_last',            ckpt.get('save_last'),          True),
 ]
 
@@ -169,13 +158,8 @@ PYEOF
             --ckpt_path "${BEST_CKPT}" 2>&1 \
             | tee "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
             | grep -E "test_nme|Test NME"
-        # NOTE: must grep for the "Test NME:" line FIRST, then extract the float
-        # from just that line (taking the LAST match). Extracting from the raw
-        # log directly picks up the tqdm progress bar's it/s number (e.g.
-        # "7.89it/s") which precedes "Test NME:" on the same line — that bug
-        # silently produced "0.28%" (from an unrelated float) in an earlier run.
-        grep "Test NME:" "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
-            | grep -oE "[0-9]+\.[0-9]+" | tail -1 > "${RUN_DIR}/seed${SEED}_best_test_nme.txt" || true
+        grep -oE "[0-9]+\.[0-9]+" "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
+            | head -1 > "${RUN_DIR}/seed${SEED}_best_test_nme.txt" || true
     else
         echo "[WARN] Best checkpoint not found — skipping test"
     fi
@@ -189,8 +173,8 @@ PYEOF
             --ckpt_path "${FINAL_CKPT}" 2>&1 \
             | tee "${RUN_DIR}/seed${SEED}_final_test_log.txt" \
             | grep -E "test_nme|Test NME"
-        grep "Test NME:" "${RUN_DIR}/seed${SEED}_final_test_log.txt" \
-            | grep -oE "[0-9]+\.[0-9]+" | tail -1 > "${RUN_DIR}/seed${SEED}_final_test_nme.txt" || true
+        grep -oE "[0-9]+\.[0-9]+" "${RUN_DIR}/seed${SEED}_final_test_log.txt" \
+            | head -1 > "${RUN_DIR}/seed${SEED}_final_test_nme.txt" || true
     else
         echo "[WARN] Final checkpoint not found — skipping test"
     fi
@@ -205,24 +189,23 @@ done
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================================"
-echo "  FPN (blocks 4/8/12, 64x64, deconv_v2) — 5-seed ablation complete"
+echo "  DeconvHead V2 — 5-seed ablation complete"
 echo "============================================================"
 echo ""
 printf "  %-8s  %-20s  %-20s\n" "seed" "test NME (val-best)" "test NME (last)"
 printf "  %-8s  %-20s  %-20s\n" "--------" "--------------------" "--------------------"
 
+BEST_SUM=0; FINAL_SUM=0; N=0
+
 for SEED in "${SEEDS[@]}"; do
-    RUN_DIR="checkpoints/fpn-ablation/seed${SEED}"
+    RUN_DIR="checkpoints/deconv-v2-ablation/seed${SEED}"
     BEST_NME=$(cat "${RUN_DIR}/seed${SEED}_best_test_nme.txt"  2>/dev/null || echo "N/A")
     FINAL_NME=$(cat "${RUN_DIR}/seed${SEED}_final_test_nme.txt" 2>/dev/null || echo "N/A")
     printf "  %-8s  %-20s  %-20s\n" "$SEED" "${BEST_NME}%" "${FINAL_NME}%"
 done
 
 echo ""
-echo "For comparison:"
-echo "  einsum baseline (5-seed):        mean 17.48% ± 1.95% (last)"
-echo "  deconv_v2 64x64 (5-seed):        mean 15.18% ± 3.00% (last)"
-echo "  hm128 (5-seed):                  mean 15.16% ± 1.12% (val-best) / 15.48% ± 3.01% (last)"
-echo "  HRNet reference:                 8%"
+echo "einsum baseline (5-seed): mean 17.48% ± 1.95%"
+echo "einsum best single seed:  15.10% (seed=2024)"
 echo ""
 echo "W&B: https://wandb.ai/ucabnx1-ucl/eomt-landmark"

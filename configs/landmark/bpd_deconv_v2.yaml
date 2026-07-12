@@ -2,14 +2,14 @@
 # MODIFIED: deconv_v2 base config for 5-seed ablation.
 #
 # Fixed naming: config name = wandb name = checkpoint dirpath suffix.
-# The ablation script (run_deconv_v2_ablation.sh) overrides seed,
+# The ablation script (ablation/scripts/run_deconv_v2_ablation.sh) overrides seed,
 # wandb name, and dirpath per run — this file is the base template.
 #
 # Key difference from Run 18: heatmap_head = deconv_v2
 # Everything else identical to Run 18 for fair comparison.
 #
 # Usage (via script):
-#   bash run_deconv_v2_ablation.sh
+#   bash ablation/scripts/run_deconv_v2_ablation.sh
 # ---------------------------------------------------------------
 
 seed_everything: 2024

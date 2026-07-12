@@ -3,7 +3,7 @@
 # run_fpn_ema_ablation.sh — Experiment 6 (fallback): deconv_v2 + FPN + EMA,
 # skips LoRA, 5-seed ablation.
 #
-# Use this instead of run_fpn_lora_ema_ablation.sh if Experiment 5 (FPN+LoRA)
+# Use this instead of ablation/scripts/run_fpn_lora_ema_ablation.sh if Experiment 5 (FPN+LoRA)
 # showed no benefit or hurt — same FPN+EMA combination, LoRA left out. No
 # logic differs from the primary script other than the base config and
 # checkpoint/run naming.
@@ -25,7 +25,7 @@
 #
 # Usage (on AutoDL server):
 #   cd /root/eomt
-#   bash run_fpn_ema_ablation.sh
+#   bash ablation/scripts/run_fpn_ema_ablation.sh
 # =============================================================================
 
 set -euo pipefail
@@ -172,7 +172,7 @@ PYEOF
     if [ -f "${FINAL_CKPT}" ]; then
         echo ""
         echo "--- Materializing EMA checkpoint: ${EMA_CKPT} ---"
-        python3 apply_ema.py "${FINAL_CKPT}" "${EMA_CKPT}"
+        python3 ablation/apply_ema.py "${FINAL_CKPT}" "${EMA_CKPT}"
     else
         echo "[WARN] Final checkpoint not found — skipping EMA materialization"
     fi

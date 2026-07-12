@@ -4,7 +4,7 @@
 # LoRA + EMA, 5-seed ablation.
 #
 # Run only after Experiment 5 (FPN+LoRA) results are in. If LoRA showed no
-# benefit or hurt, use run_fpn_ema_ablation.sh instead (same FPN+EMA, skips
+# benefit or hurt, use ablation/scripts/run_fpn_ema_ablation.sh instead (same FPN+EMA, skips
 # LoRA) — do NOT edit this script for that, the fallback config already
 # exists as bpd_deconv_v2_fpn_ema.yaml.
 #
@@ -26,7 +26,7 @@
 # Usage (on AutoDL server):
 #   cd /root/eomt
 #   pip install peft --break-system-packages   # if not already installed
-#   bash run_fpn_lora_ema_ablation.sh
+#   bash ablation/scripts/run_fpn_lora_ema_ablation.sh
 # =============================================================================
 
 set -euo pipefail
@@ -180,7 +180,7 @@ PYEOF
     if [ -f "${FINAL_CKPT}" ]; then
         echo ""
         echo "--- Materializing EMA checkpoint: ${EMA_CKPT} ---"
-        python3 apply_ema.py "${FINAL_CKPT}" "${EMA_CKPT}"
+        python3 ablation/apply_ema.py "${FINAL_CKPT}" "${EMA_CKPT}"
     else
         echo "[WARN] Final checkpoint not found — skipping EMA materialization"
     fi

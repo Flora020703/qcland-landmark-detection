@@ -2,14 +2,14 @@
 Smoke-tests for both data pipelines.
 
 Run from the eomt/ directory:
-    python test_dataload.py           # both tests
-    python test_dataload.py ade20k    # segmentation only
-    python test_dataload.py landmark  # landmark only
+    python scripts/test_dataload.py           # both tests
+    python scripts/test_dataload.py ade20k    # segmentation only
+    python scripts/test_dataload.py landmark  # landmark only
 """
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import torch
 from torch.utils.data import DataLoader
@@ -17,7 +17,7 @@ from torch.utils.data import DataLoader
 from datasets.dataset import Dataset
 from datasets.ade20k_semantic import ADE20KSemantic
 
-DATA_ROOT = Path(__file__).parent.parent / "data" / "ADEChallengeData2016" / "ADE20K_mini"
+DATA_ROOT = Path(__file__).resolve().parent.parent.parent / "data" / "ADEChallengeData2016" / "ADE20K_mini"
 BATCH_SIZE = 2
 
 

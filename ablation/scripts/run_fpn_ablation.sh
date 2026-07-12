@@ -1,20 +1,21 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_fpn_lora_ablation.sh — LoRA + FPN (deconv_v2, 64x64) 5-seed ablation
+# run_fpn_ablation.sh — FPN multi-depth fusion (deconv_v2, 64x64) 5-seed ablation
 #
-# Run only after run_fpn_ablation.sh (Experiment 4) results are in — LoRA is
-# meant to layer on top of FPN, not stand alone. FPN's 5-seed result: val-best
-# mean 14.49% ± 2.01% vs no-FPN 15.18% ± 3.00% (both mean and variance improved,
-# though the ~0.7pt mean gap is within noise at n=5). This adds LoRA on the
-# same FPN backbone to see if backbone adaptation compounds with it.
+# Why 5-seed from the start (not a single spot-check like the original plan):
+# deconv_v2 has demonstrated high seed variance (64x64: std 3.00%; hm128: std
+# 1.12%/3.01%), AND the hm128 ablation showed the SAME seed (2024) giving
+# noticeably different results between a standalone run (12.02%/13.02%) and
+# the ablation script's regenerated-config run (15.30%/15.21%) — meaning even
+# "same seed" isn't fully reproducible here (DataLoader has no explicit
+# generator/worker_init_fn, so exact RNG consumption before dataloader
+# creation can drift). A single FPN run could easily be a lucky/unlucky draw
+# and mislead the FPN-vs-baseline conclusion — run all 5 before deciding.
 #
-# Requires (run once before this script):
-#   pip install peft --break-system-packages
-#
-# Seeds: 42, 0, 123, 2024, 3407 (same set as the other three ablations).
+# Seeds: 42, 0, 123, 2024, 3407 (same set as the other two ablations).
 #
 # Checkpoint layout:
-#   checkpoints/fpn-lora-ablation/seed{N}/
+#   checkpoints/fpn-ablation/seed{N}/
 #     seed{N}_best.ckpt   — saved by ModelCheckpoint
 #     seed{N}_final.ckpt  — copy of last.ckpt
 #     seed{N}_best_test_nme.txt   — test NME from val-best checkpoint
@@ -22,13 +23,12 @@
 #
 # Usage (on AutoDL server):
 #   cd /root/eomt
-#   pip install peft --break-system-packages
-#   bash run_fpn_lora_ablation.sh
+#   bash ablation/scripts/run_fpn_ablation.sh
 # =============================================================================
 
 set -euo pipefail
 
-BASE_CONFIG="configs/landmark/bpd_deconv_v2_fpn_lora.yaml"
+BASE_CONFIG="configs/landmark/bpd_deconv_v2_fpn.yaml"
 SEEDS=(42 0 123 2024 3407)
 
 # ---------------------------------------------------------------------------
@@ -39,76 +39,20 @@ if [ ! -f "${BASE_CONFIG}" ]; then
     exit 1
 fi
 
-python3 -c "import peft" 2>/dev/null \
-    && echo "[OK] peft installed" \
-    || { echo "[ERROR] peft not installed — run: pip install peft --break-system-packages"; exit 1; }
-
 python3 -c "import yaml; yaml.safe_load(open('${BASE_CONFIG}'))" \
     && echo "[OK] Base config valid: ${BASE_CONFIG}" \
     || { echo "[ERROR] Invalid YAML — aborting"; exit 1; }
 
-mkdir -p checkpoints/fpn-lora-ablation
-
-# ---------------------------------------------------------------------------
-# One-time sanity check: confirm LoRA params actually show up as trainable
-# (target_modules=["qkv"] assumes timm's Attention exposes `self.qkv` — see
-# the NOTE in models/eomt.py EoMT.__init__). If this prints 0 lora params,
-# stop and fix target_modules before burning 5 training runs on it.
-# ---------------------------------------------------------------------------
-echo ""
-echo "--- Sanity check: LoRA params actually trainable? ---"
-python3 - "$BASE_CONFIG" <<'PYEOF'
-import sys
-import yaml
-
-# Minimal manual instantiation (avoids running the full CLI/trainer)
-sys.path.insert(0, ".")
-from models.eomt import EoMT
-from models.vit import ViT
-
-with open(sys.argv[1]) as f:
-    cfg = yaml.safe_load(f)
-
-n = cfg["model"]["init_args"]["network"]["init_args"]
-enc_args = n["encoder"]["init_args"]
-
-encoder = ViT(img_size=cfg["data"]["init_args"]["img_size"], **enc_args)
-net = EoMT(
-    encoder=encoder,
-    num_classes=1,
-    num_q=n["num_q"],
-    num_blocks=n["num_blocks"],
-    masked_attn_enabled=n["masked_attn_enabled"],
-    freeze_backbone=n["freeze_backbone"],
-    heatmap_head=n["heatmap_head"],
-    heatmap_size=tuple(n["heatmap_size"]),
-    use_fpn=n["use_fpn"],
-    fpn_layers=n["fpn_layers"],
-    use_lora=n["use_lora"],
-    lora_rank=n["lora_rank"],
-    lora_alpha=n["lora_alpha"],
-    lora_dropout=n["lora_dropout"],
-)
-
-lora_params = sum(p.numel() for name, p in net.named_parameters() if "lora_" in name and p.requires_grad)
-total_trainable = sum(p.numel() for p in net.parameters() if p.requires_grad)
-print(f"LoRA trainable params: {lora_params:,}")
-print(f"Total trainable params: {total_trainable:,}")
-if lora_params == 0:
-    print("[ERROR] 0 LoRA params found — target_modules=['qkv'] didn't match anything.")
-    print("        Run: print(net.encoder.backbone) to find the real attention Linear name.")
-    sys.exit(1)
-print("[OK] LoRA adapters are wired up correctly")
-PYEOF
+mkdir -p checkpoints/fpn-ablation
 
 # ---------------------------------------------------------------------------
 # Main loop
 # ---------------------------------------------------------------------------
 for SEED in "${SEEDS[@]}"; do
 
-    RUN_NAME="fpn-lora-ablation-seed${SEED}"
-    RUN_DIR="checkpoints/fpn-lora-ablation/seed${SEED}"
-    TMP_CFG="/tmp/fpn_lora_seed${SEED}.yaml"
+    RUN_NAME="fpn-ablation-seed${SEED}"
+    RUN_DIR="checkpoints/fpn-ablation/seed${SEED}"
+    TMP_CFG="/tmp/fpn_seed${SEED}.yaml"
 
     echo ""
     echo "============================================================"
@@ -122,8 +66,8 @@ import yaml, sys
 seed     = int(sys.argv[1])
 base_cfg = sys.argv[2]
 out_cfg  = sys.argv[3]
-run_name = f'fpn-lora-ablation-seed{seed}'
-run_dir  = f'checkpoints/fpn-lora-ablation/seed{seed}'
+run_name = f'fpn-ablation-seed{seed}'
+run_dir  = f'checkpoints/fpn-ablation/seed{seed}'
 
 with open(base_cfg) as f:
     cfg = yaml.safe_load(f)
@@ -168,10 +112,7 @@ checks = [
     ('masked_attn_enabled',  n['masked_attn_enabled'],       True),
     ('use_fpn',              n.get('use_fpn', False),        True),
     ('fpn_layers',           n.get('fpn_layers'),            [4, 8, 12]),
-    ('use_lora',             n.get('use_lora', False),       True),
-    ('lora_rank',            n.get('lora_rank'),             8),
-    ('lora_alpha',           n.get('lora_alpha'),             16),
-    ('lora_dropout',         n.get('lora_dropout'),          0.1),
+    ('use_lora',             n.get('use_lora', False),       False),
     ('backbone_name', n.get('encoder', {}).get('init_args', {}).get('backbone_name', n.get('backbone_name')), 'vit_small_patch14_reg4_dinov2'),
     ('heatmap_size (net)',   n['heatmap_size'],              [64, 64]),
     ('heatmap_size (data)',  data['heatmap_size'],           [64, 64]),
@@ -228,6 +169,11 @@ PYEOF
             --ckpt_path "${BEST_CKPT}" 2>&1 \
             | tee "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
             | grep -E "test_nme|Test NME"
+        # NOTE: must grep for the "Test NME:" line FIRST, then extract the float
+        # from just that line (taking the LAST match). Extracting from the raw
+        # log directly picks up the tqdm progress bar's it/s number (e.g.
+        # "7.89it/s") which precedes "Test NME:" on the same line — that bug
+        # silently produced "0.28%" (from an unrelated float) in an earlier run.
         grep "Test NME:" "${RUN_DIR}/seed${SEED}_best_test_log.txt" \
             | grep -oE "[0-9]+\.[0-9]+" | tail -1 > "${RUN_DIR}/seed${SEED}_best_test_nme.txt" || true
     else
@@ -259,14 +205,14 @@ done
 # ---------------------------------------------------------------------------
 echo ""
 echo "============================================================"
-echo "  LoRA + FPN (deconv_v2, 64x64) — 5-seed ablation complete"
+echo "  FPN (blocks 4/8/12, 64x64, deconv_v2) — 5-seed ablation complete"
 echo "============================================================"
 echo ""
 printf "  %-8s  %-20s  %-20s\n" "seed" "test NME (val-best)" "test NME (last)"
 printf "  %-8s  %-20s  %-20s\n" "--------" "--------------------" "--------------------"
 
 for SEED in "${SEEDS[@]}"; do
-    RUN_DIR="checkpoints/fpn-lora-ablation/seed${SEED}"
+    RUN_DIR="checkpoints/fpn-ablation/seed${SEED}"
     BEST_NME=$(cat "${RUN_DIR}/seed${SEED}_best_test_nme.txt"  2>/dev/null || echo "N/A")
     FINAL_NME=$(cat "${RUN_DIR}/seed${SEED}_final_test_nme.txt" 2>/dev/null || echo "N/A")
     printf "  %-8s  %-20s  %-20s\n" "$SEED" "${BEST_NME}%" "${FINAL_NME}%"
@@ -277,7 +223,6 @@ echo "For comparison:"
 echo "  einsum baseline (5-seed):        mean 17.48% ± 1.95% (last)"
 echo "  deconv_v2 64x64 (5-seed):        mean 15.18% ± 3.00% (last)"
 echo "  hm128 (5-seed):                  mean 15.16% ± 1.12% (val-best) / 15.48% ± 3.01% (last)"
-echo "  FPN 64x64 (5-seed):              mean 14.49% ± 2.01% (val-best) / 14.91% ± 2.94% (last)"
 echo "  HRNet reference:                 8%"
 echo ""
 echo "W&B: https://wandb.ai/ucabnx1-ucl/eomt-landmark"

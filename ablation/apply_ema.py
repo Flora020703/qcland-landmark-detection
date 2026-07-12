@@ -9,7 +9,8 @@
 # the matching state_dict entries with the EMA shadow values, and writes a
 # new .ckpt that can be tested exactly like any other checkpoint:
 #
-#   python3 apply_ema.py checkpoints/.../seed42_final.ckpt checkpoints/.../seed42_ema.ckpt
+# Usage (from repo root):
+#   python3 ablation/apply_ema.py checkpoints/.../seed42_final.ckpt checkpoints/.../seed42_ema.ckpt
 #   python3 main_landmark.py test --config ... --ckpt_path checkpoints/.../seed42_ema.ckpt
 # ---------------------------------------------------------------
 
@@ -20,7 +21,7 @@ import torch
 
 def main() -> None:
     if len(sys.argv) != 3:
-        print("Usage: python3 apply_ema.py <in_ckpt> <out_ckpt>")
+        print("Usage: python3 ablation/apply_ema.py <in_ckpt> <out_ckpt>")
         sys.exit(1)
 
     in_path, out_path = sys.argv[1], sys.argv[2]

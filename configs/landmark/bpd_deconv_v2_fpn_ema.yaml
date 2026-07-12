@@ -8,10 +8,10 @@
 # See bpd_deconv_v2_fpn_lora_ema.yaml for the EMA decay/design rationale
 # (decay=0.99, shadow not swapped in during training — see training/ema.py).
 # After training, materialize a testable EMA checkpoint with:
-#   python3 apply_ema.py checkpoints/deconv-v2-fpn-ema/seedN_final.ckpt \
+#   python3 ablation/apply_ema.py checkpoints/deconv-v2-fpn-ema/seedN_final.ckpt \
 #                        checkpoints/deconv-v2-fpn-ema/seedN_ema.ckpt
 #   python3 main_landmark.py test --config <this file> --ckpt_path checkpoints/deconv-v2-fpn-ema/seedN_ema.ckpt
-# (run_fpn_ema_ablation.sh does this automatically per seed.)
+# (ablation/scripts/run_fpn_ema_ablation.sh does this automatically per seed.)
 #
 # Everything else identical to bpd_deconv_v2_fpn.yaml (seed=2024, FPN layers
 # [4,8,12], 64x64 heatmap, no LoRA).

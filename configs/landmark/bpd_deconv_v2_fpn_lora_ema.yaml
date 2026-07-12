@@ -19,10 +19,10 @@
 # the val_nme used for checkpoint selection stays based on raw weights,
 # same as every other experiment (see training/ema.py docstring for why).
 # After training, materialize a testable EMA checkpoint with:
-#   python3 apply_ema.py checkpoints/deconv-v2-fpn-lora-ema/seedN_final.ckpt \
+#   python3 ablation/apply_ema.py checkpoints/deconv-v2-fpn-lora-ema/seedN_final.ckpt \
 #                        checkpoints/deconv-v2-fpn-lora-ema/seedN_ema.ckpt
 #   python3 main_landmark.py test --config <this file> --ckpt_path checkpoints/deconv-v2-fpn-lora-ema/seedN_ema.ckpt
-# (run_fpn_lora_ema_ablation.sh does this automatically per seed.)
+# (ablation/scripts/run_fpn_lora_ema_ablation.sh does this automatically per seed.)
 #
 # Fallback: if Experiment 5 (LoRA) shows no benefit or hurts, use
 # bpd_deconv_v2_fpn_ema.yaml instead (same FPN+EMA, skips LoRA) — no other

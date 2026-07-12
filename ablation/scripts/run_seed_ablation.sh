@@ -10,7 +10,7 @@
 #
 # Usage (on AutoDL server):
 #   cd /root/eomt
-#   bash run_seed_ablation.sh
+#   bash ablation/scripts/run_seed_ablation.sh
 #
 # Notes:
 #   - val_split_seed stays fixed at 42 for all runs (same val set, reproducible comparison)
