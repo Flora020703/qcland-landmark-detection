@@ -1,0 +1,112 @@
+# ---------------------------------------------------------------
+# MODIFIED: Experiment 9 — cross-dataset validation of the current best
+# configuration (FPN + UDP coordinate fix + EMA) on HC18.
+#
+# Goal: everything so far (FPN, UDP, EMA) was validated on UCL Head data
+# (110ish train images). This checks whether the same architecture/pipeline
+# improvements generalize to a different, larger dataset (HC18: 737 train /
+# 262 test) rather than being UCL-specific overfitting artifacts — a much
+# more valuable data point for the thesis story than re-confirming EMA's
+# exact marginal contribution on UCL.
+#
+# Only the `data` section differs from bpd_deconv_v2_fpn_udp_ema.yaml (HC18
+# paths instead of UCL — confirmed identical CSV column format, see
+# bpd_deconv_v2_hc18.yaml). Same architecture, same UDP fix (pixel_center_align
+# is dataset-agnostic — every image gets its own naive-vs-aligned offset
+# based on its own resolution either way), same EMA settings.
+#
+# NOTE: HC18 train set is ~7x larger than UCL -> far more gradient steps per
+# epoch at batch_size=16 (see bpd_deconv_v2_hc18.yaml note). max_epochs/
+# patience left unchanged; watch wall-clock time and shorten if it converges
+# well before epoch 200.
+# ---------------------------------------------------------------
+
+seed_everything: 2024
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/deconv-v2-fpn-udp-ema-hc18
+        filename: deconv-v2-fpn-udp-ema-hc18_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+    - class_path: training.ema.EMACallback
+      init_args:
+        decay: 0.99
+        use_warmup: true
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: deconv-v2-fpn-udp-ema-hc18
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size: [64, 64]
+        use_fpn: true
+        fpn_layers: [4, 8, 12]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/HC18/Head
+    ann_train_csv: /root/autodl-tmp/annotations/HC18/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/HC18/Head_Test.csv
+    task: bpd
+    img_size: [512, 512]
+    heatmap_size: [64, 64]
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
+    pixel_center_align: true
+    loader_seed: 2024

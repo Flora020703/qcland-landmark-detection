@@ -5,9 +5,10 @@
 
 import csv
 import math
+import random
 import re
 from pathlib import Path
-from typing import Union
+from typing import Optional, Union
 
 import numpy as np
 import torch
@@ -15,6 +16,20 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import DataLoader
 import lightning
+
+
+def seed_worker(worker_id: int) -> None:
+    """
+    MODIFIED: standard PyTorch reproducibility recipe. Without this,
+    `torch.initial_seed()` inside a worker is still deterministic given an
+    explicit `generator=` on the DataLoader, but numpy/python `random` (not
+    used by LandmarkDataset today, but easy to reach for when adding
+    augmentations later) are NOT auto-seeded per worker and would silently
+    reintroduce non-determinism.
+    """
+    worker_seed = torch.initial_seed() % 2**32
+    np.random.seed(worker_seed)
+    random.seed(worker_seed)
 
 
 # CSV column pairs for each task (x_col, y_col) per landmark
@@ -85,6 +100,19 @@ class LandmarkDataset(torch.utils.data.Dataset):
     img_size  : (H, W) — model input resolution; images are resized to this.
     heatmap_size: (H, W) — heatmap output resolution, typically (64, 64).
     augment   : if True, applies random hflip + conservative colour jitter (train only).
+    pixel_center_align: if True, coordinate rescaling uses the pixel-center
+                convention `(x + 0.5) * scale - 0.5` instead of naive
+                `x * scale`. PIL's resize (and PyTorch's default
+                align_corners=False upsampling used elsewhere in the model)
+                already sample under the pixel-center convention; naive
+                proportional scaling of the landmark coordinates doesn't
+                match it, introducing a small systematic (non-random) offset
+                between where the resized image visually shows the landmark
+                and where the GT coordinate says it is. This is the class of
+                bug UDP (Huang et al., CVPR 2020, "The Devil Is in the
+                Details: Delving into Unbiased Data Processing") documents.
+                Default False to keep exact reproducibility with all
+                existing experiments; set True to A/B test the fix.
     """
 
     def __init__(
@@ -94,12 +122,14 @@ class LandmarkDataset(torch.utils.data.Dataset):
         heatmap_size: tuple[int, int] = (64, 64),
         sigma: float = 1.0,
         augment: bool = False,
+        pixel_center_align: bool = False,  # MODIFIED: UDP-style coordinate scaling (see docstring)
     ):
         self.records = records
         self.img_size = img_size
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.augment = augment
+        self.pixel_center_align = pixel_center_align
 
     def __len__(self) -> int:
         return len(self.records)
@@ -117,8 +147,12 @@ class LandmarkDataset(torch.utils.data.Dataset):
 
         # 3. scale landmarks to img_size pixel space
         lms = rec["landmarks"].copy()  # (N, 2) float32: col 0 = x, col 1 = y
-        lms[:, 0] *= iw / orig_w
-        lms[:, 1] *= ih / orig_h
+        if self.pixel_center_align:
+            lms[:, 0] = (lms[:, 0] + 0.5) * (iw / orig_w) - 0.5
+            lms[:, 1] = (lms[:, 1] + 0.5) * (ih / orig_h) - 0.5
+        else:
+            lms[:, 0] *= iw / orig_w
+            lms[:, 1] *= ih / orig_h
 
         # 4. random horizontal flip (train only)
         if self.augment and torch.rand(()) < 0.5:
@@ -133,8 +167,12 @@ class LandmarkDataset(torch.utils.data.Dataset):
         # 6. map landmarks to heatmap coordinate space
         hm_h, hm_w = self.heatmap_size
         lms_hm = lms.copy()
-        lms_hm[:, 0] *= hm_w / iw
-        lms_hm[:, 1] *= hm_h / ih
+        if self.pixel_center_align:
+            lms_hm[:, 0] = (lms_hm[:, 0] + 0.5) * (hm_w / iw) - 0.5
+            lms_hm[:, 1] = (lms_hm[:, 1] + 0.5) * (hm_h / ih) - 0.5
+        else:
+            lms_hm[:, 0] *= hm_w / iw
+            lms_hm[:, 1] *= hm_h / ih
 
         # 7. generate heatmaps
         heatmaps = np.stack([
@@ -186,6 +224,24 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         batch_size    : dataloader batch size
         num_workers   : dataloader workers (0 for CPU-only / debug)
         pin_memory    : passed to DataLoader
+        pixel_center_align: see LandmarkDataset docstring — UDP-style
+                fix for the coordinate-scaling/image-resize convention
+                mismatch. Default False for exact reproducibility with
+                existing experiments.
+        loader_seed   : if set, DataLoaders get an explicit `generator`
+                seeded from this value (+ a small per-split offset) plus
+                `worker_init_fn=seed_worker`. Without this, shuffle order
+                and multi-worker RNG seeding derive from whatever the
+                ambient global torch RNG state happens to be when the
+                DataLoader is constructed — which drifts depending on how
+                many other random draws (model init, dropout, etc.)
+                happened earlier in the process, so "same seed_everything"
+                does NOT guarantee the same data order/augmentation
+                sequence across two runs (confirmed: identical configs gave
+                different results in a standalone run vs. an ablation
+                script run — see hm128/FPN+EMA ablation notes). Default
+                None preserves old (non-fully-deterministic) behaviour for
+                exact backward compatibility with existing experiments.
     """
 
     def __init__(
@@ -202,6 +258,8 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         batch_size: int = 16,
         num_workers: int = 4,
         pin_memory: bool = True,
+        pixel_center_align: bool = False,  # MODIFIED: UDP-style coordinate scaling
+        loader_seed: Optional[int] = None,  # MODIFIED: deterministic DataLoader shuffle/worker seeding
     ):
         super().__init__()
         assert task in TASK_COLS, f"task must be one of {list(TASK_COLS)}, got {task!r}"
@@ -215,6 +273,8 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         self.sigma         = sigma
         self.val_fraction  = val_fraction
         self.val_split_seed = val_split_seed
+        self.pixel_center_align = pixel_center_align
+        self.loader_seed = loader_seed
         self.dataloader_kwargs = {
             "batch_size":        batch_size,
             "num_workers":       num_workers,
@@ -297,6 +357,7 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
             img_size=self.img_size,
             heatmap_size=self.heatmap_size,
             sigma=self.sigma,
+            pixel_center_align=self.pixel_center_align,
         )
         self.train_dataset = LandmarkDataset(train_recs, augment=True,  **ds_kw)
         self.val_dataset   = LandmarkDataset(val_recs,   augment=False, **ds_kw)
@@ -309,6 +370,19 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         imgs, heatmaps, coords = zip(*batch)
         return torch.stack(imgs), torch.stack(heatmaps), torch.stack(coords)
 
+    def _loader_extra_kwargs(self, offset: int) -> dict:
+        """
+        MODIFIED: explicit generator (+ worker_init_fn) for deterministic
+        shuffle order and worker RNG seeding — see loader_seed docstring.
+        offset keeps train/val/test on independent (but still deterministic)
+        RNG streams instead of all three replaying the same sequence.
+        """
+        if self.loader_seed is None:
+            return {}
+        generator = torch.Generator()
+        generator.manual_seed(self.loader_seed + offset)
+        return {"generator": generator, "worker_init_fn": seed_worker}
+
     def train_dataloader(self) -> DataLoader:
         return DataLoader(
             self.train_dataset,
@@ -316,6 +390,7 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
             drop_last=True,
             collate_fn=self.collate,
             **self.dataloader_kwargs,
+            **self._loader_extra_kwargs(offset=0),
         )
 
     def val_dataloader(self) -> DataLoader:
@@ -325,6 +400,7 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
             drop_last=False,
             collate_fn=self.collate,
             **self.dataloader_kwargs,
+            **self._loader_extra_kwargs(offset=1),
         )
 
     def test_dataloader(self) -> DataLoader:
@@ -334,4 +410,5 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
             drop_last=False,
             collate_fn=self.collate,
             **self.dataloader_kwargs,
+            **self._loader_extra_kwargs(offset=2),
         )
