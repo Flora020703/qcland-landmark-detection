@@ -172,16 +172,28 @@ def compute_nme(
     gt_coords: torch.Tensor,
     heatmap_size: tuple[int, int],
     img_size: tuple[int, int],
+    norm_pair: tuple[int, int] = (0, 1),
 ) -> torch.Tensor:
     """
-    Normalised Mean Error (NME) per sample, normalised by the inter-landmark
-    distance (i.e. the diameter length in image pixels).
+    Normalised Mean Error (NME) per sample, normalised by the Euclidean
+    distance between two fixed GT landmark indices in image pixel space.
+
+    For BPD/OFD (N=2) the default norm_pair=(0,1) normalises by the
+    inter-landmark distance (i.e. the diameter length itself). For 300W
+    (N=68) pass norm_pair=(36, 45) — the standard inter-ocular distance
+    between the two outer eye corners (Sagonas et al.; see
+    HRNet-Facial-Landmark-Detection lib/core/evaluation.py, which computes
+    exactly `norm(pts_gt[36] - pts_gt[45])`, NOT an eye-centre average —
+    using eye-centre distance would make NME numbers incomparable to
+    published 300W baselines.
 
     Args:
         pred_coords: (B, N, 2) in heatmap pixel space
         gt_coords:   (B, N, 2) in heatmap pixel space
         heatmap_size: (H, W) of the heatmap
         img_size:     (H, W) of the model input image
+        norm_pair:    indices of the two GT landmarks whose distance is
+                      used as the normaliser.
 
     Returns:
         nme: (B,) NME per sample
@@ -194,9 +206,9 @@ def compute_nme(
     pred_img = pred_coords * scale    # (B, N, 2)
     gt_img   = gt_coords   * scale   # (B, N, 2)
 
-    # normaliser: Euclidean distance between landmark 0 and landmark 1
-    # (= diameter length in image pixels)
-    norm = (gt_img[:, 0] - gt_img[:, 1]).norm(dim=-1).clamp(min=1.0)  # (B,)
+    # normaliser: Euclidean distance between the two configured GT landmarks
+    i0, i1 = norm_pair
+    norm = (gt_img[:, i0] - gt_img[:, i1]).norm(dim=-1).clamp(min=1.0)  # (B,)
 
     # Euclidean error per landmark, averaged across N landmarks
     errors = (pred_img - gt_img).norm(dim=-1)   # (B, N)
@@ -228,6 +240,7 @@ class LandmarkDetection(LightningModule):
         img_size: tuple[int, int] = (512, 512),
         num_landmarks: int = 2,
         heatmap_size: tuple[int, int] = (64, 64),
+        nme_norm_pair: tuple[int, int] = (0, 1),  # MODIFIED: (36, 45) for 300W inter-ocular NME
         # Attention mask annealing — disabled initially; add as ablation later
         attn_mask_annealing_enabled: bool = False,
         attn_mask_annealing_start_steps: Optional[List[int]] = None,
@@ -276,6 +289,7 @@ class LandmarkDetection(LightningModule):
 
         self.heatmap_size = heatmap_size
         self.num_landmarks = num_landmarks
+        self.nme_norm_pair = tuple(nme_norm_pair)
         self.loss_type   = loss_type
         self.alpha       = alpha
         self.temperature = temperature
@@ -403,7 +417,8 @@ class LandmarkDetection(LightningModule):
             pred_coords = heatmap_to_coords(pred.detach())   # (B, N, 2)
 
         nme_per_sample = compute_nme(
-            pred_coords, gt_coords, self.heatmap_size, self.img_size
+            pred_coords, gt_coords, self.heatmap_size, self.img_size,
+            norm_pair=self.nme_norm_pair,
         )                                  # (B,)
         acc = self._test_nme if log_prefix == "test" else self._val_nme
         acc.extend(nme_per_sample.tolist())

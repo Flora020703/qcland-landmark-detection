@@ -233,6 +233,164 @@ def test_training_utils():
     print("\nTraining utils OK")
 
 
+def test_face300w():
+    """
+    Smoke-test Face300WDataModule + Face300WDataset: split sizes, shapes,
+    NME norm pair, FLIP_PAIRS_68 completeness, and a visual landmark-overlay
+    check saved to disk (can't eyeball correctness from asserts alone).
+    """
+    import numpy as np
+    from datasets.face300w_dataset import (
+        Face300WDataModule, FLIP_PAIRS_68, INTER_OCULAR_PAIR, _load_pts,
+    )
+
+    _win = Path("D:/download/Project coding/msc/300w")
+    _wsl = Path("/mnt/d/download/Project coding/msc/300w")
+    DATA_ROOT = _win if _win.exists() else _wsl
+
+    print("\n" + "=" * 60)
+    print("300W SMOKE-TEST")
+    print("=" * 60)
+    print(f"Data root: {DATA_ROOT}")
+    assert DATA_ROOT.exists(), f"Not found: {DATA_ROOT}"
+
+    # --- FLIP_PAIRS_68 completeness: every one of the 68 indices must be
+    #     either paired exactly once, or be one of the 10 known midline
+    #     points (chin=8, nose bridge=27-30, nose tip=33, lip mids=51/57,
+    #     inner-lip mids=62/66). Anything else uncovered = a real bug. ---
+    paired = set()
+    for a, b in FLIP_PAIRS_68:
+        assert a not in paired and b not in paired, f"index reused: {a},{b}"
+        paired.add(a); paired.add(b)
+    expected_midline = {8, 27, 28, 29, 30, 33, 51, 57, 62, 66}
+    unpaired = set(range(68)) - paired
+    assert unpaired == expected_midline, (
+        f"FLIP_PAIRS_68 coverage wrong — unpaired={sorted(unpaired)} "
+        f"expected_midline={sorted(expected_midline)}"
+    )
+    assert len(paired) == 58 and len(FLIP_PAIRS_68) == 29
+    print(f"[FLIP_PAIRS_68] OK — {len(FLIP_PAIRS_68)} pairs, "
+          f"{len(unpaired)} midline points, all 68 indices covered exactly once")
+
+    # --- .pts 1-indexed -> 0-indexed sanity: no coordinate should be
+    #     negative after the -1 shift for a real annotation file ---
+    sample_pts = next((DATA_ROOT / "afw").glob("*.pts"))
+    pts = _load_pts(sample_pts)
+    assert pts.shape == (68, 2)
+    assert pts.min() >= -1.0, f"suspiciously negative coords after -1 shift: {pts.min()}"
+    print(f"[_load_pts] OK — sample {sample_pts.name}: range "
+          f"x[{pts[:,0].min():.1f},{pts[:,0].max():.1f}] "
+          f"y[{pts[:,1].min():.1f},{pts[:,1].max():.1f}]")
+
+    for test_subset, expected_test_n in [("common", 554), ("challenging", 135), ("full", 689)]:
+        dm = Face300WDataModule(
+            data_root=DATA_ROOT,
+            img_size=(256, 256),
+            heatmap_size=(64, 64),
+            sigma=1.5,
+            val_fraction=0.1,
+            val_split_seed=42,
+            test_subset=test_subset,
+            batch_size=4,
+            num_workers=0,
+            pin_memory=False,
+            augment=False,
+        )
+        dm.setup()
+        n_train, n_val, n_test = len(dm.train_dataset), len(dm.val_dataset), len(dm.test_dataset)
+        print(f"\n[test_subset={test_subset}] train={n_train} val={n_val} test={n_test}")
+        assert n_test == expected_test_n, f"expected {expected_test_n} test images, got {n_test}"
+        if test_subset == "full":
+            assert n_train + n_val == 3148, f"train pool should be 3148, got {n_train + n_val}"
+            # same val_split_seed must give the same split regardless of test_subset
+            base_train, base_val = n_train, n_val
+
+    # single item shape + heatmap sanity
+    img, heatmaps, coords = dm.train_dataset[0]
+    assert img.shape == (3, 256, 256), f"img shape wrong: {img.shape}"
+    assert heatmaps.shape == (68, 64, 64), f"heatmap shape wrong: {heatmaps.shape}"
+    assert coords.shape == (68, 2), f"coords shape wrong: {coords.shape}"
+    assert heatmaps.max() <= 1.0 + 1e-5 and heatmaps.max() > 0.0
+    print(f"\n[single item] img={tuple(img.shape)} heatmaps={tuple(heatmaps.shape)} "
+          f"coords={tuple(coords.shape)} hm_max={heatmaps.max():.4f}")
+
+    # batched loaders
+    imgs_b, hms_b, coords_b = next(iter(dm.train_dataloader()))
+    assert imgs_b.shape == (4, 3, 256, 256) and hms_b.shape == (4, 68, 64, 64) and coords_b.shape == (4, 68, 2)
+    print(f"[train batch] imgs={tuple(imgs_b.shape)} heatmaps={tuple(hms_b.shape)} coords={tuple(coords_b.shape)}")
+    imgs_v, hms_v, coords_v = next(iter(dm.val_dataloader()))
+    print(f"[val batch]   imgs={tuple(imgs_v.shape)} heatmaps={tuple(hms_v.shape)} coords={tuple(coords_v.shape)}")
+    imgs_t, hms_t, coords_t = next(iter(dm.test_dataloader()))
+    print(f"[test batch]  imgs={tuple(imgs_t.shape)} heatmaps={tuple(hms_t.shape)} coords={tuple(coords_t.shape)}")
+
+    # --- NME norm pair sanity: inter-ocular distance on a real sample should
+    #     be a plausible fraction of the 256px crop (not ~0, not > crop size) ---
+    from training.landmark_detection import compute_nme
+    i0, i1 = INTER_OCULAR_PAIR
+    img_coords = coords.clone()
+    img_coords[:, 0] *= 256 / 64
+    img_coords[:, 1] *= 256 / 64
+    d = (img_coords[i0] - img_coords[i1]).norm().item()
+    print(f"\n[inter-ocular] landmarks[{i0}]-landmarks[{i1}] distance in 256px crop = {d:.1f}px")
+    assert 20 < d < 200, f"inter-ocular distance implausible for a 256px face crop: {d:.1f}px"
+
+    nme = compute_nme(coords.unsqueeze(0), coords.unsqueeze(0), (64, 64), (256, 256), norm_pair=INTER_OCULAR_PAIR)
+    assert nme.item() < 1e-5, f"NME for identical pred/gt should be ~0, got {nme.item()}"
+    print(f"[compute_nme]  identical pred/gt -> NME={nme.item():.6f} OK")
+
+    # --- flip augmentation: force a flip, check known-pair identities swap ---
+    dm_flip = Face300WDataModule(
+        data_root=DATA_ROOT, img_size=(256, 256), heatmap_size=(64, 64),
+        sigma=1.5, batch_size=1, num_workers=0, augment=True,
+    )
+    dm_flip.setup()
+    ds = dm_flip.train_dataset
+    ds.flip_prob = 1.0  # force flip for this check
+    torch.manual_seed(0)
+    _, _, coords_flip = ds[0]
+    torch.manual_seed(0)
+    ds.augment = False
+    _, _, coords_noflip = ds[0]
+    ds.augment = True
+    # after flip: landmark 36 (one outer eye corner) should land near where
+    # 45 (the other outer eye corner) was pre-flip, mirrored in x
+    x36_pre_mirrored = 64 - 1.0 - coords_noflip[36, 0]
+    assert abs(coords_flip[45, 0].item() - x36_pre_mirrored.item()) < 2.0, (
+        "flip pair (36,45) identity not preserved correctly"
+    )
+    print("[flip augment] OK — (36,45) eye-corner identity preserved across hflip")
+
+    # --- visual check: overlay landmarks on the actual crop, save to disk ---
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        out_dir = Path(__file__).resolve().parent.parent / "docs" / "static"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "face300w_dataload_check.png"
+
+        fig, axes = plt.subplots(1, 4, figsize=(16, 4))
+        for ax, i in zip(axes, [0, 1, 2, 3]):
+            img_i, _, coords_i = dm.train_dataset[i]
+            im = img_i.permute(1, 2, 0).numpy()
+            ax.imshow(im)
+            xs = coords_i[:, 0].numpy() * (256 / 64)
+            ys = coords_i[:, 1].numpy() * (256 / 64)
+            ax.scatter(xs, ys, s=8, c="lime", edgecolors="black", linewidths=0.3)
+            ax.scatter(xs[[36, 45]], ys[[36, 45]], s=20, c="red")  # inter-ocular pair highlighted
+            ax.set_title(f"train[{i}]")
+            ax.axis("off")
+        fig.tight_layout()
+        fig.savefig(out_path, dpi=110)
+        plt.close(fig)
+        print(f"\n[visual check] saved landmark overlay to {out_path}")
+    except ImportError:
+        print("\n[visual check] matplotlib not available — skipped (shapes/asserts above already passed)")
+
+    print("\n300W data loading OK")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     if mode in ("all", "ade20k"):
@@ -241,3 +399,5 @@ if __name__ == "__main__":
         test_landmark()
     if mode in ("all", "training"):
         test_training_utils()
+    if mode in ("all", "face300w"):
+        test_face300w()
