@@ -9,8 +9,11 @@ Supervisors: Dr. Zhehua Mao, Dr. Sophia Bano (SRV group).
 - Modified datasets/dataset.py and datasets/ade20k_semantic.py: zip→folder reading
 - Successfully ran EOMT segmentation pipeline on ADE20K_mini (50 train/10 val)
   with DINOv2-ViT-S, loss decreasing over 5 epochs, pipeline verified working
-- Previously reproduced HRNet baseline on UCL fetal biometry data:
-  BPD NME=0.0649, OFD NME=0.0441 (these are the numbers to beat)
+- Early HRNet "reproduction" numbers (BPD=0.0649, OFD=0.0441) were only a
+  quick pipeline-sanity run on ~10-20 images, NOT a real full-training-set
+  reproduction — do not cite or compare against these. The only valid HRNet
+  baseline is the published one (Di Vece et al.): BPD 8% (0.08±0.18),
+  OFD 5% (0.05±0.11), UCL→UCL.
 
 ## Current phase
 Phase 2: Convert EOMT from segmentation to landmark detection.

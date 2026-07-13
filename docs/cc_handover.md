@@ -10,8 +10,8 @@
 **导师**：Dr. Zhehua Mao, Dr. Sophia Bano（SRV group）
 
 **要超过的 baseline（HRNet）**：
-- BPD NME = 6.49%
-- OFD NME = 4.41%
+- Di Vece et al. 发表数字：BPD 8% (0.08±0.18)，OFD 5% (0.05±0.11)
+- [2026-07-14 更正] 下面曾写的 "BPD 6.49% / OFD 4.41%" 是早期只用 10-20 张图跑通 pipeline 的产物，不是完整复现，不可信、不要引用对比。
 
 **关键路径**：UCL Head 超声图像 → 2 个关键点（直径两端点） → Gaussian heatmap 监督 → 预测 heatmap → argmax 解码坐标 → NME 评估
 
@@ -412,8 +412,8 @@ warmup_steps: [15, 30]
 
 5. **NME 的值域理解**：
    - 随机预测 NME ≈ 50-80%（依赖直径长度）
-   - 17.68% 是 Run 2 达到的，但仍比 HRNet（6.49%）差很多
-   - 最终目标是 < 6.49%（BPD）
+   - 17.68% 是 Run 2 达到的，当时仍比这里写的 HRNet 数字（6.49%）差很多
+   - [2026-07-14 更正] "6.49%" 这个数字本身不可信（见第 1 节更正说明），真正要比的是 Di Vece 发表的 BPD 8%
 
 ---
 

@@ -3,7 +3,8 @@
 
 > 对话时间 / Session date: 2026-06-12  
 > 分支 / Branch: `master`  
-> 基线参考 / Baseline reference: HRNet — BPD NME=0.0649, OFD NME=0.0441
+> 基线参考 / Baseline reference: Di Vece et al. published HRNet — BPD 8% (0.08±0.18), OFD 5% (0.05±0.11)
+> [2026-07-14 更正 / correction] 原写的 "HRNet BPD=0.0649, OFD=0.0441" 是早期只用 10-20 张图跑通 pipeline 的产物，不可信，不要引用对比 / the original "0.0649/0.0441" numbers were only a 10-20 image pipeline-sanity run, not a real reproduction — do not cite or compare against them.
 
 ---
 
@@ -277,7 +278,7 @@ Phase 2 (本次对话完成 / Completed this session):
 
 Phase 2 (待完成 / Next):
   ⬜ AutoDL GPU 训练 (BPD first)
-  ⬜ 验证 val_nme 收敛，对比 HRNet baseline (BPD 0.0649, OFD 0.0441)
+  ⬜ 验证 val_nme 收敛，对比 HRNet baseline（Di Vece 发表值 BPD 8%/OFD 5%，见文首更正说明）
   ⬜ OFD 训练
 
 Phase 3 (后续 ablations / Future ablations):

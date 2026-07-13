@@ -19,7 +19,9 @@
 | Method | BPD NME | OFD NME |
 |---|---|---|
 | HRNet-W18 (Di Vece et al., Table 2) | 0.08 ± 0.18 | 0.05 ± 0.11 |
-| HRNet-W18 (reproduced, 200 epochs) | 0.0649 | 0.0441 |
+| ~~HRNet-W18 (reproduced, 200 epochs)~~ | ~~0.0649~~ | ~~0.0441~~ |
+
+> [2026-07-14 更正] 上面这行"reproduced"数字不可信——那次复现只用了 10-20 张图跑通 pipeline，不是完整训练集上的真实复现，不要引用或对比。唯一有效的 baseline 是上面 Di Vece et al. 那一行。
 
 ## 11 Runs Summary
 

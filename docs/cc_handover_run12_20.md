@@ -10,7 +10,9 @@
 MSc thesis at UCL. Adapting **EoMT** (Encoder-Only Mask Transformer, DINOv2-ViT-S backbone) from semantic segmentation to **heatmap-based fetal biometry landmark detection** (BPD & OFD).
 
 - Supervisors: Dr. Zhehua Mao, Dr. Sophia Bano (SRV group)
-- Target: beat HRNet baseline → BPD NME=6.49%, OFD NME=4.41%
+- Target: beat published HRNet baseline (Di Vece et al.) → BPD 8% (0.08±0.18), OFD 5% (0.05±0.11)
+  [2026-07-14 correction: the "BPD 6.49% / OFD 4.41%" numbers previously written here were only a
+  10-20 image pipeline-sanity run, not a real reproduction — do not cite or compare against them]
 - **Current best: Run 18 → val NME 7.09%, test NME 13.66%**
 - Training server: AutoDL RTX 4090, `/root/eomt/`
 - W&B: https://wandb.ai/ucabnx1-ucl/eomt-landmark
