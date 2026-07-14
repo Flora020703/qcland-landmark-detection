@@ -76,6 +76,26 @@ def _load_pts(path: Path) -> np.ndarray:
     return pts - 1.0
 
 
+_BBOX_DIR_CANDIDATES = ["Bounding Boxes", "Bounding_Boxes", "bounding_boxes"]
+
+
+def _resolve_bbox_dir(data_root: Path) -> Path:
+    """
+    The 300W bounding-box folder is distributed as "Bounding Boxes" (with a
+    space), but scp/zip/unzip round-trips across Windows<->Linux commonly
+    turn that space into an underscore (or something else). Try the known
+    variants rather than hardcoding one exact name.
+    """
+    for name in _BBOX_DIR_CANDIDATES:
+        candidate = data_root / name
+        if candidate.is_dir():
+            return candidate
+    raise FileNotFoundError(
+        f"Could not find a bounding-box folder under {data_root} "
+        f"(tried: {_BBOX_DIR_CANDIDATES})"
+    )
+
+
 def _load_bbox_map(mat_path: Path) -> dict:
     """
     Parse a 300W `bounding_boxes_*.mat` file into {image_name: [x1,y1,x2,y2]}
@@ -249,8 +269,11 @@ class Face300WDataModule(lightning.LightningDataModule):
     there's no need for BPD/OFD's subject-grouped split.
 
     Args:
-        data_root   : root dir containing afw/, helen/, ibug/, lfpw/,
-                      "Bounding Boxes"/ (e.g. D:/.../300w or /root/autodl-tmp/300w)
+        data_root   : root dir containing afw/, helen/, ibug/, lfpw/, and a
+                      bounding-box folder (see _BBOX_DIR_CANDIDATES for the
+                      accepted name variants - "Bounding Boxes" vs
+                      "Bounding_Boxes" etc., since scp/zip round-trips often
+                      mangle the space) (e.g. D:/.../300w or /root/autodl-tmp/300w)
         test_subset : "common" | "challenging" | "full" - selects which test
                       images populate test_dataset, so common/challenging/full
                       NME can each be obtained via a separate `main_landmark.py
@@ -312,7 +335,7 @@ class Face300WDataModule(lightning.LightningDataModule):
 
     def _load_dir(self, rel_dir: str) -> list[dict]:
         d = self.data_root / rel_dir
-        bbox_map = _load_bbox_map(self.data_root / "Bounding Boxes" / _BBOX_FILES[rel_dir])
+        bbox_map = _load_bbox_map(_resolve_bbox_dir(self.data_root) / _BBOX_FILES[rel_dir])
         records = []
         for pts_path in sorted(d.glob("*.pts")):
             img_path = pts_path.with_suffix(".jpg")
