@@ -1,9 +1,17 @@
 # ---------------------------------------------------------------
-# MODIFIED: new config — 300W face landmark detection (68 points),
-# generalizability experiment. Reuses the fetal FPN+UDP recipe (Exp 7)
-# unchanged where the architecture is task-agnostic; only the things that
-# genuinely differ for 68 dense face points vs. 2 sparse fetal points are
-# changed (num_q, num_blocks, heatmap sigma, input size, NME normaliser).
+# MODIFIED: 300W data-efficiency ablation, rung 3/4 — +FPN+UDP.
+# (This file predates the 4-rung framing below; keeping its name/checkpoint
+# dir as-is since a real run already completed against it - see results:
+# common=5.22/5.25%, challenging=7.75/7.85%, full=5.72/5.76% val-best/last.
+# See configs/landmark/face300w_deconv_v2.yaml for the full ablation
+# rationale and the other 3 rungs: face300w_deconv_v2.yaml (baseline),
+# face300w_deconv_v2_fpn.yaml (+FPN), face300w_deconv_v2_fpn_udp_ema.yaml
+# (+FPN+UDP+EMA).)
+#
+# Reuses the fetal FPN+UDP recipe (Exp 7) unchanged where the architecture
+# is task-agnostic; only the things that genuinely differ for 68 dense face
+# points vs. 2 sparse fetal points are changed (num_q, num_blocks, heatmap
+# sigma, input size, NME normaliser).
 #
 # Corrections applied from the 300W prompt audit (see conversation/thesis
 # notes, not repeated in full here):
