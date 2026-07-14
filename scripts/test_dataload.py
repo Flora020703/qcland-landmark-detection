@@ -244,9 +244,10 @@ def test_face300w():
         Face300WDataModule, FLIP_PAIRS_68, INTER_OCULAR_PAIR, _load_pts,
     )
 
-    _win = Path("D:/download/Project coding/msc/300w")
-    _wsl = Path("/mnt/d/download/Project coding/msc/300w")
-    DATA_ROOT = _win if _win.exists() else _wsl
+    _win    = Path("D:/download/Project coding/msc/300w")
+    _wsl    = Path("/mnt/d/download/Project coding/msc/300w")
+    _server = Path("/root/autodl-tmp/300W/300w")
+    DATA_ROOT = next((p for p in (_win, _wsl, _server) if p.exists()), _server)
 
     print("\n" + "=" * 60)
     print("300W SMOKE-TEST")

@@ -28,9 +28,8 @@
 # an augmentation-free baseline first (one variable at a time), matching the
 # prompt's own suggested development order.
 #
-# data_root below is the LOCAL Windows path for dev/dry-run. On the server,
-# override via CLI: --data.init_args.data_root /root/autodl-tmp/300w
-# (path TBD - scp the same afw/helen/ibug/lfpw/"Bounding Boxes" structure).
+# data_root below is the AutoDL server path. For a local CPU dry run,
+# override via CLI: --data.init_args.data_root "D:/download/Project coding/msc/300w"
 # ---------------------------------------------------------------
 
 seed_everything: 42
@@ -106,7 +105,7 @@ model:
 data:
   class_path: datasets.face300w_dataset.Face300WDataModule
   init_args:
-    data_root: "D:/download/Project coding/msc/300w"
+    data_root: "/root/autodl-tmp/300W/300w"
     img_size: [256, 256]
     heatmap_size: [64, 64]
     sigma: 1.5
