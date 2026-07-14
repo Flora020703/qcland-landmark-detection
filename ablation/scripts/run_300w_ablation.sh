@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_300w_ablation.sh — 300W face landmark detection, augmentation-free
-# baseline (single seed=42, from configs/landmark/face300w_vit_small.yaml).
+# single run (seed=42, from configs/landmark/face300w_deconv_v2_fpn_udp.yaml).
 #
-# This is NOT a 5-seed ablation like the fetal scripts (yet) - it's the
-# first-ever 300W run, following the project's own "confirm the pipeline
-# works before optimising" order (see prompt's dev-step suggestions). Once
-# this baseline number is in and looks sane, promote to a proper multi-seed
-# ablation the same way BPD went from single runs -> Exp 4-9.
+# [2026-07-15] SUPERSEDED: this already ran once and produced rung 3
+# (+FPN+UDP) of the 4-rung data-efficiency ablation - see
+# ablation/scripts/run_300w_data_efficiency_ablation.sh for the other 3
+# rungs (baseline, +FPN, +FPN+UDP+EMA) and the actual thesis rationale.
+# The config this script points at was renamed face300w_vit_small.yaml ->
+# face300w_deconv_v2_fpn_udp.yaml to match that ladder's naming, but the
+# already-completed run's checkpoints/W&B run are still under the OLD name
+# (checkpoints/face300w-baseline/, wandb run "face300w-baseline") - not
+# retroactively renamed. No need to re-run this script unless reproducing
+# rung 3 from scratch.
+#
+# This was NOT a 5-seed ablation like the fetal scripts (still isn't) - it
+# was the first-ever 300W run, following the project's own "confirm the
+# pipeline works before optimising" order (see prompt's dev-step
+# suggestions).
 #
 # Reuses BPD/OFD's architecture unchanged (DeconvHead V2, FPN [4,8,12], UDP
 # pixel_center_align, hybrid loss) - only task-specific things differ:
@@ -34,8 +44,8 @@
 
 set -euo pipefail
 
-BASE_CONFIG="configs/landmark/face300w_vit_small.yaml"
-RUN_NAME="face300w-baseline"
+BASE_CONFIG="configs/landmark/face300w_deconv_v2_fpn_udp.yaml"
+RUN_NAME="face300w-deconv-v2-fpn-udp"
 RUN_DIR="checkpoints/${RUN_NAME}"
 
 # ---------------------------------------------------------------------------

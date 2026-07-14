@@ -1,12 +1,23 @@
 # ---------------------------------------------------------------
 # MODIFIED: 300W data-efficiency ablation, rung 3/4 — +FPN+UDP.
-# (This file predates the 4-rung framing below; keeping its name/checkpoint
-# dir as-is since a real run already completed against it - see results:
-# common=5.22/5.25%, challenging=7.75/7.85%, full=5.72/5.76% val-best/last.
+# [2026-07-15] Renamed from face300w_vit_small.yaml (this file predates the
+# 4-rung framing below - it was originally just "the pipeline-sanity
+# baseline run" before the ablation ladder existed). A real run already
+# completed against the OLD name (wandb run "face300w-baseline",
+# checkpoints/face300w-baseline/) - see results: common=5.22/5.25%,
+# challenging=7.75/7.85%, full=5.72/5.76% val-best/last. Those files are
+# NOT retroactively renamed on the server; only this template's future-run
+# name/dirpath changed, to line up with the other 3 rungs' naming and stop
+# it looking like rung 1 ("baseline") when it's actually rung 3. If you
+# need to re-test/ensemble against the already-completed run, its
+# checkpoints still live under checkpoints/face300w-baseline/ on the
+# server - `mv` that directory to checkpoints/face300w-deconv-v2-fpn-udp/
+# to match this file, or just remember the old name when looking it up.
+#
 # See configs/landmark/face300w_deconv_v2.yaml for the full ablation
 # rationale and the other 3 rungs: face300w_deconv_v2.yaml (baseline),
 # face300w_deconv_v2_fpn.yaml (+FPN), face300w_deconv_v2_fpn_udp_ema.yaml
-# (+FPN+UDP+EMA).)
+# (+FPN+UDP+EMA).
 #
 # Reuses the fetal FPN+UDP recipe (Exp 7) unchanged where the architecture
 # is task-agnostic; only the things that genuinely differ for 68 dense face
@@ -65,8 +76,8 @@ trainer:
         mode: min
         save_top_k: 1
         save_last: true
-        dirpath: checkpoints/face300w-baseline
-        filename: face300w-baseline_best
+        dirpath: checkpoints/face300w-deconv-v2-fpn-udp
+        filename: face300w-deconv-v2-fpn-udp_best
     - class_path: lightning.pytorch.callbacks.EarlyStopping
       init_args:
         monitor: metrics/val_nme
@@ -80,7 +91,7 @@ trainer:
     class_path: lightning.pytorch.loggers.WandbLogger
     init_args:
       project: eomt-landmark
-      name: face300w-baseline
+      name: face300w-deconv-v2-fpn-udp
       save_dir: logs
       log_model: false
 

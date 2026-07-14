@@ -2,7 +2,8 @@
 # =============================================================================
 # run_300w_data_efficiency_ablation.sh — 300W data-efficiency ablation,
 # 3 of 4 rungs (single seed=42 each; the 3rd rung, +FPN+UDP, already ran
-# against configs/landmark/face300w_vit_small.yaml - not repeated here).
+# against configs/landmark/face300w_deconv_v2_fpn_udp.yaml - not repeated
+# here).
 #
 # Purpose: this is NOT primarily about closing the gap to HRNet - it tests
 # whether the cross-dataset finding from BPD/HC18 ("FPN/UDP/EMA are
@@ -16,7 +17,9 @@
 #   1. baseline    - configs/landmark/face300w_deconv_v2.yaml
 #   2. +FPN        - configs/landmark/face300w_deconv_v2_fpn.yaml
 #   4. +FPN+UDP+EMA - configs/landmark/face300w_deconv_v2_fpn_udp_ema.yaml
-# (Rung 3, +FPN+UDP, already has results - see face300w_vit_small.yaml.)
+# (Rung 3, +FPN+UDP, already has results - see face300w_deconv_v2_fpn_udp.yaml,
+# formerly face300w_vit_small.yaml; its completed run is still under the OLD
+# name checkpoints/face300w-baseline/ on the server, not retroactively renamed.)
 #
 # Each rung: train once (seed=42, no augmentation), then test best/final
 # (and, for the EMA rung, the materialized EMA checkpoint too) against all
@@ -207,7 +210,7 @@ for ENTRY in "${RUNS[@]}"; do
 done
 
 echo ""
-echo "For reference, rung 3 (+FPN+UDP, already run against face300w_vit_small.yaml):"
+echo "For reference, rung 3 (+FPN+UDP, already run against face300w_deconv_v2_fpn_udp.yaml):"
 echo "  best/final common:      5.22% / 5.25%"
 echo "  best/final challenging:  7.75% / 7.85%"
 echo "  best/final full:        5.72% / 5.76%"

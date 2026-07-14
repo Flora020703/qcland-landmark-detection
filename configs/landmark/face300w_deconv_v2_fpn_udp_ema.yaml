@@ -12,7 +12,7 @@
 # see training/ema.py docstring) copied verbatim from
 # bpd_deconv_v2_fpn_udp_ema.yaml; task-agnostic, no changes needed.
 #
-# Only difference from face300w_vit_small.yaml (the +FPN+UDP rung, already
+# Only difference from face300w_deconv_v2_fpn_udp.yaml (the +FPN+UDP rung, already
 # run): the EMACallback block below.
 # ---------------------------------------------------------------
 

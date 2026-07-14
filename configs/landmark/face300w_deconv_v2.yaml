@@ -12,10 +12,10 @@
 # thesis-worthy finding spanning two domains and three dataset scales.
 #
 # Everything except use_fpn/pixel_center_align/EMA matches
-# face300w_vit_small.yaml (the existing +FPN+UDP rung, already run - see
+# face300w_deconv_v2_fpn_udp.yaml (the existing +FPN+UDP rung, already run - see
 # that file for results: common=5.22/5.25%, challenging=7.75/7.85%,
 # full=5.72/5.76% val-best/last). Same num_q=68, num_blocks=6, sigma=1.5,
-# batch_size=4 (OOM-driven, see face300w_vit_small.yaml), epochs=100 -
+# batch_size=4 (OOM-driven, see face300w_deconv_v2_fpn_udp.yaml), epochs=100 -
 # these are still first-guess/unablated values shared across all 4 rungs
 # so the FPN/UDP/EMA comparison stays apples-to-apples; only revisit them
 # if ALL 4 rungs look obviously broken.
