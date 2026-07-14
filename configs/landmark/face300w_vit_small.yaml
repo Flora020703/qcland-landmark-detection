@@ -23,10 +23,22 @@
 # sigma=1.5 (fetal's sigma=4.0 would badly overlap adjacent 64x64-heatmap
 # landmarks that are only ~1-3px apart, e.g. around the eyes/mouth), epochs=100
 # (fetal's 200 epochs compensates for only ~6 steps/epoch on 110 images;
-# 300W's 3148 images give ~196 steps/epoch at batch_size=16, so far fewer
-# epochs should suffice - unverified until a real run). augment=false: ship
-# an augmentation-free baseline first (one variable at a time), matching the
-# prompt's own suggested development order.
+# 300W's 3148 images give many more steps/epoch even at a smaller batch size,
+# so far fewer epochs should suffice - unverified until a real run).
+# augment=false: ship an augmentation-free baseline first (one variable at a
+# time), matching the prompt's own suggested development order.
+#
+# [2026-07-15] batch_size dropped 16 -> 4 after a real CUDA OOM on the first
+# server run (needed >18GB on a 24GB GPU during backward). num_q=68 (vs
+# fetal's num_q=2) makes DeconvHead V2 produce a 68-channel heatmap instead
+# of 2, and num_blocks=6 (vs fetal's 3) doubles how many transformer layers
+# carry that per-query heatmap for intermediate supervision - the combined
+# effect inflates heatmap-related activation memory by roughly two orders of
+# magnitude vs BPD/OFD at the same batch_size. Left num_blocks=6 untouched
+# (it's a real, still-unablated architecture choice, not just a memory knob)
+# and only pulled the batch_size lever, which doesn't change what's being
+# learned. Revisit upward (8?) once this is confirmed stable, if throughput
+# matters.
 #
 # data_root below is the AutoDL server path. For a local CPU dry run,
 # override via CLI: --data.init_args.data_root "D:/download/Project coding/msc/300w"
@@ -112,7 +124,7 @@ data:
     val_fraction: 0.1
     val_split_seed: 42
     test_subset: full
-    batch_size: 16
+    batch_size: 4
     num_workers: 4
     pixel_center_align: true
     augment: false
