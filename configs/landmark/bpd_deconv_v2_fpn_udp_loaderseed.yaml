@@ -1,0 +1,109 @@
+# ---------------------------------------------------------------
+# MODIFIED: Exp 7 rerun — FPN + UDP, WITH loader_seed enabled.
+#
+# Purpose: Exp 7 (bpd_deconv_v2_fpn_udp.yaml, val-best 13.21%±1.92% / last
+# 13.67%±1.08%) predates the loader_seed determinism fix
+# (datasets/landmark_dataset.py); Exp 8a (bpd_deconv_v2_fpn_udp_ema.yaml,
+# val-best 15.50%±1.13% / last 12.09%±2.74%) was the FIRST experiment to use
+# it. This means Exp7's "seed=N" and Exp8a's "seed=N" do not correspond to
+# the same actual data loading order/augmentation sequence - they are NOT a
+# clean A/B for isolating EMA's effect, as already flagged in
+# docs/experiment_summary_exp4-9_ensemble.md 3.6 ("重要 caveat"). For a
+# publication-grade cross-dataset ablation table, this needs to be fixed:
+# this config reruns Exp7's exact architecture (FPN+UDP, no EMA) with
+# loader_seed enabled, so it can be directly, cleanly compared against
+# Exp8a's numbers.
+#
+# Everything else is identical to bpd_deconv_v2_fpn_udp.yaml (deconv_v2 +
+# FPN [4,8,12] + UDP pixel_center_align, hybrid loss, DINOv2-ViT-S/14,
+# num_blocks=3) - only loader_seed is new, plus the checkpoint dirpath/
+# wandb name to keep this rerun's results separate from the original Exp7's
+# (which used a different, non-deterministic data order and should not be
+# silently overwritten).
+# ---------------------------------------------------------------
+
+seed_everything: 2024
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/deconv-v2-fpn-udp-loaderseed
+        filename: deconv-v2-fpn-udp-loaderseed_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: deconv-v2-fpn-udp-loaderseed
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size: [64, 64]
+        use_fpn: true
+        fpn_layers: [4, 8, 12]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/UCL/Head
+    ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
+    task: bpd
+    img_size: [512, 512]
+    heatmap_size: [64, 64]
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
+    pixel_center_align: true
+    loader_seed: 2024
