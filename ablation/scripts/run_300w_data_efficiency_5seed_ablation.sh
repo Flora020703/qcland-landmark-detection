@@ -53,11 +53,22 @@ RUNS=(
 )
 
 RESULTS_TSV="face300w_5seed_results.tsv"
+DONE_MARKER="checkpoints/.completed_seeds.txt"
+mkdir -p checkpoints
+touch "$DONE_MARKER"
 
 # ---------------------------------------------------------------------------
 # Seed the results file with the already-completed seed=42 numbers (single-
 # seed pass) so the final aggregation is a genuine 5-seed statistic.
+# [2026-07-17] Only seed if the file doesn't already exist - this script is
+# now resumable (see DONE_MARKER below), and re-running must NOT clobber
+# rows already appended by an earlier, interrupted invocation (this bit us
+# twice: a disk-full crash mid-ablation silently lost already-collected
+# rung1/rung2 results the first time we didn't guard this).
 # ---------------------------------------------------------------------------
+if [ -f "$RESULTS_TSV" ]; then
+    echo "[OK] ${RESULTS_TSV} already exists — not re-seeding, preserving prior results"
+else
 cat > "$RESULTS_TSV" <<'EOF'
 rung	seed	ckpt_tag	subset	nme
 face300w-deconv-v2	42	best	common	5.54
@@ -89,6 +100,7 @@ face300w-deconv-v2-fpn-udp-ema	42	ema	challenging	8.07
 face300w-deconv-v2-fpn-udp-ema	42	ema	full	5.99
 EOF
 echo "[OK] Seeded ${RESULTS_TSV} with the existing seed=42 results (27 rows)"
+fi
 
 # ---------------------------------------------------------------------------
 # Main loop: 4 rungs x 4 remaining seeds
@@ -108,6 +120,18 @@ for ENTRY in "${RUNS[@]}"; do
         RUN_LABEL="${RUN_NAME}-ablation-seed${SEED}"
         RUN_DIR="checkpoints/${RUN_NAME}-ablation/seed${SEED}"
         TMP_CFG="/tmp/${RUN_NAME}_seed${SEED}.yaml"
+
+        # [2026-07-17] Resumability: skip any (rung, seed) already recorded as
+        # done, so a rerun after a crash (disk-full has hit us twice) doesn't
+        # retrain work that already succeeded. Checkpoints for completed
+        # seeds get moved off this disk (see step 7 below), so a completed
+        # seed is tracked via DONE_MARKER, not by checking for a checkpoint
+        # file's presence.
+        if grep -qxF "${RUN_NAME}:${SEED}" "$DONE_MARKER" 2>/dev/null; then
+            echo ""
+            echo "--- SKIP (already completed): ${RUN_LABEL} ---"
+            continue
+        fi
 
         echo ""
         echo "============================================================"
@@ -272,6 +296,24 @@ with open(out_cfg, 'w') as f:
                 fi
             done
         done
+
+        # --- 7. Free system disk space: move this seed's checkpoint to the
+        #     data disk now that its NME is recorded. The raw weights aren't
+        #     needed again (no ensemble planned for 300W - mean+/-std only),
+        #     and letting checkpoints accumulate across many seeds/rungs on
+        #     the 30GB system disk caused repeated "No space left on device"
+        #     crashes mid-ablation. [2026-07-17]
+        BACKUP_DIR="/root/autodl-tmp/saved_checkpoints/300w/${RUN_NAME}-ablation/seed${SEED}"
+        mkdir -p "$(dirname "$BACKUP_DIR")"
+        if [ -d "${RUN_DIR}" ]; then
+            rm -rf "${BACKUP_DIR}"
+            mv "${RUN_DIR}" "${BACKUP_DIR}" \
+                && echo "[OK] moved checkpoint to ${BACKUP_DIR} (system disk freed)" \
+                || echo "[WARN] could not move checkpoint dir for ${RUN_LABEL}"
+        fi
+
+        # Mark this (rung, seed) done so a rerun after a crash skips it.
+        echo "${RUN_NAME}:${SEED}" >> "$DONE_MARKER"
 
         echo ""
         echo "--- DONE: ${RUN_LABEL} ---"
