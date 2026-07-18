@@ -1,0 +1,106 @@
+# ---------------------------------------------------------------
+# MODIFIED: DINOv3 backbone counterpart of face300w_deconv_v2_fpn_udp.yaml
+# (300W's best config: FPN+UDP, best-checkpoint 5-seed = 5.93%±0.15% with
+# DINOv2-ViT-S/14 — though the 5-seed ablation showed all 4 rungs are
+# statistically indistinguishable at this data scale, so "best config" here
+# just means "the config used for the flagship cross-dataset table row").
+#
+# ONLY difference from face300w_deconv_v2_fpn_udp.yaml: encoder.backbone_name.
+# See bpd_dinov3_fpn_udp_ema.yaml for the full rationale on why no other
+# code/config changes are needed for the DINOv2->DINOv3 backbone swap.
+#
+# Patch size changes 14->16 for this backbone. At 256x256 input that's
+# grid_size 16x16 (vs DINOv2's ~18x18) — num_upscale is computed generically
+# from patch_size in models/eomt.py (see that file's num_upscale formula),
+# and QueryConditionedDeconvHead's final F.interpolate always resizes to the
+# configured heatmap_size regardless of the incoming grid, so 64x64 output is
+# unaffected. batch_size stays at 4 (num_q=68 x num_blocks=6 is the memory
+# pressure, not the backbone) — bump only if DINOv3 OOMs at the same
+# batch_size DINOv2 used, and record it if so (see original file's OOM note).
+# ---------------------------------------------------------------
+
+seed_everything: 42
+
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 2
+  log_every_n_steps: 10
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/face300w-dinov3-fpn-udp
+        filename: face300w-dinov3-fpn-udp_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 15
+        min_delta: 0.001
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: face300w-dinov3-fpn-udp
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 68
+    nme_norm_pair: [36, 45]
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 68
+        num_blocks: 6
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size: [64, 64]
+        use_fpn: true
+        fpn_layers: [4, 8, 12]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: facebook/dinov3-vits16-pretrain-lvd1689m
+
+data:
+  class_path: datasets.face300w_dataset.Face300WDataModule
+  init_args:
+    data_root: "/root/autodl-tmp/300W/300w"
+    img_size: [256, 256]
+    heatmap_size: [64, 64]
+    sigma: 1.5
+    val_fraction: 0.1
+    val_split_seed: 42
+    test_subset: full
+    batch_size: 4
+    num_workers: 4
+    pixel_center_align: true
+    augment: false
+    loader_seed: 42
