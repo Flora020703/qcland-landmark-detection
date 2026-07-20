@@ -100,6 +100,29 @@ class LandmarkDataset(torch.utils.data.Dataset):
     img_size  : (H, W) — model input resolution; images are resized to this.
     heatmap_size: (H, W) — heatmap output resolution, typically (64, 64).
     augment   : if True, applies random hflip + conservative colour jitter (train only).
+    rotate_augment: if True (and augment=True), also applies HRNet-baseline-
+                matched random rotation (±30°, 0.6 probability — see Di Vece
+                et al.'s experiments/fetal/fetal_landmark_hrnet_w18_*.yaml,
+                identical across their UCL-only and multi-centre configs).
+                Separate flag from `augment` (not folded into the existing
+                hflip+jitter block) so it can be A/B tested via config,
+                since HeadLandmarkDataModule currently hardcodes augment=True
+                for the train split with no way to disable it. Default False
+                to keep exact reproducibility with all existing experiments.
+    scale_augment: if True (and augment=True), also applies HRNet-baseline-
+                matched random scale jitter (SCALE_FACTOR=0.25, i.e. scale
+                ~ Uniform(0.75, 1.25), applied unconditionally on every
+                augmented sample — unlike rotation, HRNet's own code has no
+                probability gate on this one). In-place zoom around the
+                image center at fixed canvas size (crop the excess if
+                zoomed in, pad with black if zoomed out) — see
+                rotate_augment's docstring for why this project doesn't
+                adopt HRNet's own center+scale crop architecture wholesale.
+                Independent flag from rotate_augment so either can be A/B
+                tested alone, though HRNet's reported baseline uses both
+                together (this project's "aligned with HRNet" config sets
+                both True, not scale alone). Default False to keep exact
+                reproducibility with all existing experiments.
     pixel_center_align: if True, coordinate rescaling uses the pixel-center
                 convention `(x + 0.5) * scale - 0.5` instead of naive
                 `x * scale`. PIL's resize (and PyTorch's default
@@ -122,6 +145,8 @@ class LandmarkDataset(torch.utils.data.Dataset):
         heatmap_size: tuple[int, int] = (64, 64),
         sigma: float = 1.0,
         augment: bool = False,
+        rotate_augment: bool = False,  # MODIFIED: HRNet-matched rotation (see docstring)
+        scale_augment: bool = False,  # MODIFIED: HRNet-matched scale jitter (see docstring)
         pixel_center_align: bool = False,  # MODIFIED: UDP-style coordinate scaling (see docstring)
     ):
         self.records = records
@@ -129,6 +154,8 @@ class LandmarkDataset(torch.utils.data.Dataset):
         self.heatmap_size = heatmap_size
         self.sigma = sigma
         self.augment = augment
+        self.rotate_augment = rotate_augment
+        self.scale_augment = scale_augment
         self.pixel_center_align = pixel_center_align
 
     def __len__(self) -> int:
@@ -158,6 +185,78 @@ class LandmarkDataset(torch.utils.data.Dataset):
         if self.augment and torch.rand(()) < 0.5:
             img = TF.hflip(img)
             lms[:, 0] = iw - 1.0 - lms[:, 0]
+
+        # 4b. random rotation (train only). Parameters match the HRNet
+        # baseline's own recipe (Di Vece et al. — see experiments/fetal/
+        # fetal_landmark_hrnet_w18_*.yaml: ROT_FACTOR=30, applied with 0.6
+        # probability): angle ~ Uniform(-30, 30) deg, else no rotation.
+        # Confirmed identical across their UCL-only and multi-centre configs
+        # (not tuned per dataset size), so treated as a stable, borrowable
+        # choice rather than a new hyperparameter to search.
+        #
+        # Unlike HRNet's own pipeline (which crops a center+scale region via
+        # a combined affine warp, sidestepping out-of-bounds coordinates by
+        # construction), this project resizes the *whole* image to img_size
+        # with no crop step — adopting HRNet's crop architecture would change
+        # the input field of view for every sample, including non-augmented
+        # ones, breaking comparability with every prior BPD/OFD/300W result.
+        # Instead: rotate the already-resized image in place around its own
+        # center, and if any landmark would land outside the canvas after
+        # rotating, skip the rotation for this sample entirely (keep the
+        # pre-rotation img/lms) rather than clamp or distort — clamping a
+        # landmark to the image edge silently moves the GT to the wrong
+        # place, which is worse than just not rotating that one sample.
+        if self.augment and self.rotate_augment and torch.rand(()) < 0.6:
+            angle = float(torch.empty(1).uniform_(-30.0, 30.0))
+            cx, cy = iw / 2.0, ih / 2.0  # matches PIL Image.rotate()'s default center
+            theta = math.radians(angle)
+            cos_t, sin_t = math.cos(theta), math.sin(theta)
+            dx = lms[:, 0] - cx
+            dy = lms[:, 1] - cy
+            # PIL's rotate(angle) is counter-clockwise (as viewed) for positive
+            # angle; image y grows downward, so the in-plane rotation formula
+            # picks up a sign flip on the sin term relative to the standard
+            # (y-up) convention.
+            rot_lms = lms.copy()
+            rot_lms[:, 0] = cx + dx * cos_t + dy * sin_t
+            rot_lms[:, 1] = cy - dx * sin_t + dy * cos_t
+
+            if np.all(rot_lms[:, 0] >= 0.0) and np.all(rot_lms[:, 0] <= iw - 1.0) \
+                    and np.all(rot_lms[:, 1] >= 0.0) and np.all(rot_lms[:, 1] <= ih - 1.0):
+                img = img.rotate(angle, resample=Image.BILINEAR, expand=False)
+                lms = rot_lms
+            # else: rotation would push a landmark off-canvas — skip it for
+            # this sample, img/lms stay at their pre-rotation values.
+
+        # 4c. random scale jitter (train only). Matches HRNet's SCALE_FACTOR=0.25
+        # (scale ~ Uniform(0.75, 1.25), applied unconditionally — no probability
+        # gate in HRNet's own code, unlike rotation's 0.6). In-place zoom around
+        # the image center at fixed canvas size: resize the content by factor s,
+        # then paste it back onto a same-size canvas centered — PIL's paste()
+        # clips automatically when the resized content is bigger than the
+        # canvas (s>1, zoom-in/crop) and leaves black borders when smaller
+        # (s<1, zoom-out/pad), so one code path handles both directions. Same
+        # out-of-bounds philosophy as rotation: skip the sample's scale jitter
+        # entirely (not clamp) if any landmark would land off-canvas.
+        if self.augment and self.scale_augment:
+            s = float(torch.empty(1).uniform_(0.75, 1.25))
+            cx, cy = iw / 2.0, ih / 2.0
+            scaled_lms = lms.copy()
+            scaled_lms[:, 0] = cx + (lms[:, 0] - cx) * s
+            scaled_lms[:, 1] = cy + (lms[:, 1] - cy) * s
+
+            if np.all(scaled_lms[:, 0] >= 0.0) and np.all(scaled_lms[:, 0] <= iw - 1.0) \
+                    and np.all(scaled_lms[:, 1] >= 0.0) and np.all(scaled_lms[:, 1] <= ih - 1.0):
+                new_w, new_h = max(1, round(iw * s)), max(1, round(ih * s))
+                resized_content = img.resize((new_w, new_h), Image.BILINEAR)
+                canvas = Image.new(img.mode, (iw, ih), color=0)
+                offset_x = round((iw - new_w) / 2.0)
+                offset_y = round((ih - new_h) / 2.0)
+                canvas.paste(resized_content, (offset_x, offset_y))
+                img = canvas
+                lms = scaled_lms
+            # else: scale jitter would push a landmark off-canvas — skip it
+            # for this sample, img/lms stay at their pre-scale values.
 
         # 5. DOD sort: channel 0 = left endpoint (lower x), channel 1 = right
         #    ensures consistent query-to-landmark assignment after any flip
@@ -228,6 +327,14 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
                 fix for the coordinate-scaling/image-resize convention
                 mismatch. Default False for exact reproducibility with
                 existing experiments.
+        rotate_augment: see LandmarkDataset docstring — HRNet-baseline-
+                matched random rotation, applied only to the train split.
+                Default False for exact reproducibility with existing
+                experiments.
+        scale_augment : see LandmarkDataset docstring — HRNet-baseline-
+                matched random scale jitter, applied only to the train
+                split. Default False for exact reproducibility with
+                existing experiments.
         loader_seed   : if set, DataLoaders get an explicit `generator`
                 seeded from this value (+ a small per-split offset) plus
                 `worker_init_fn=seed_worker`. Without this, shuffle order
@@ -259,6 +366,8 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         num_workers: int = 4,
         pin_memory: bool = True,
         pixel_center_align: bool = False,  # MODIFIED: UDP-style coordinate scaling
+        rotate_augment: bool = False,  # MODIFIED: HRNet-matched rotation (train split only)
+        scale_augment: bool = False,  # MODIFIED: HRNet-matched scale jitter (train split only)
         loader_seed: Optional[int] = None,  # MODIFIED: deterministic DataLoader shuffle/worker seeding
     ):
         super().__init__()
@@ -271,6 +380,8 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         self.img_size      = img_size
         self.heatmap_size  = heatmap_size
         self.sigma         = sigma
+        self.rotate_augment = rotate_augment
+        self.scale_augment = scale_augment
         self.val_fraction  = val_fraction
         self.val_split_seed = val_split_seed
         self.pixel_center_align = pixel_center_align
@@ -359,7 +470,7 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
             sigma=self.sigma,
             pixel_center_align=self.pixel_center_align,
         )
-        self.train_dataset = LandmarkDataset(train_recs, augment=True,  **ds_kw)
+        self.train_dataset = LandmarkDataset(train_recs, augment=True,  rotate_augment=self.rotate_augment, scale_augment=self.scale_augment, **ds_kw)
         self.val_dataset   = LandmarkDataset(val_recs,   augment=False, **ds_kw)
         self.test_dataset  = LandmarkDataset(test_recs,  augment=False, **ds_kw)
         return self
