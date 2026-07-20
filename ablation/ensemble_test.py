@@ -18,6 +18,7 @@
 # ---------------------------------------------------------------
 
 import argparse
+import importlib
 import sys
 from pathlib import Path
 
@@ -27,10 +28,21 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from datasets.landmark_dataset import HeadLandmarkDataModule
 from models.eomt import EoMT
 from models.vit import ViT
 from training.landmark_detection import LandmarkDetection, compute_nme, heatmap_to_coords
+
+
+def build_datamodule(cfg: dict):
+    """MODIFIED: resolve the data module class from cfg["data"]["class_path"]
+    instead of hardcoding HeadLandmarkDataModule — this script was only ever
+    exercised against BPD/OFD configs (HeadLandmarkDataModule) until now;
+    300W uses a different class (Face300WDataModule) with different
+    __init__ kwargs (data_root/test_subset vs images_dir/ann_*_csv/task)."""
+    class_path = cfg["data"]["class_path"]
+    module_path, class_name = class_path.rsplit(".", 1)
+    dm_class = getattr(importlib.import_module(module_path), class_name)
+    return dm_class(**cfg["data"]["init_args"])
 
 
 def build_model(cfg: dict) -> LandmarkDetection:
@@ -63,7 +75,7 @@ def main() -> None:
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dm = HeadLandmarkDataModule(**cfg["data"]["init_args"])
+    dm = build_datamodule(cfg)
     dm.setup()
     loader = dm.test_dataloader()
 
@@ -80,6 +92,12 @@ def main() -> None:
 
     heatmap_size = tuple(cfg["data"]["init_args"]["heatmap_size"])
     img_size = tuple(cfg["data"]["init_args"]["img_size"])
+    # MODIFIED: read the NME normaliser pair from config instead of relying on
+    # compute_nme()'s default (0,1) — that default is correct for BPD/OFD
+    # (N=2, normalise by the diameter itself) but silently wrong for 300W
+    # (N=68), which needs norm_pair=(36,45) (outer eye corners). Omitting
+    # this here previously produced a nonsensical ~23% "NME" on 300W.
+    norm_pair = tuple(cfg["model"]["init_args"].get("nme_norm_pair", (0, 1)))
 
     all_nme = []
     with torch.no_grad():
@@ -98,7 +116,7 @@ def main() -> None:
             avg_pred = summed / len(models)
 
             pred_coords = heatmap_to_coords(avg_pred)
-            nme = compute_nme(pred_coords, gt_coords, heatmap_size, img_size)
+            nme = compute_nme(pred_coords, gt_coords, heatmap_size, img_size, norm_pair=norm_pair)
             all_nme.extend(nme.cpu().tolist())
 
     mean_nme = sum(all_nme) / len(all_nme)
