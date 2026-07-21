@@ -15,6 +15,31 @@
 # Usage (from repo root):
 #   python3 ablation/ensemble_test.py --config configs/landmark/bpd_deconv_v2_fpn_udp_ema.yaml \
 #       --ckpts checkpoints/fpn-udp-ema-ablation/seed*/seed*_final.ckpt
+#
+# MODIFIED: two additions, both opt-in and OFF by default (default path is
+# byte-identical to the original heatmap-averaging behavior, so every
+# previously reported number is unaffected):
+#
+#   --ckpt-configs cfg1.yaml cfg2.yaml ...   (same length/order as --ckpts)
+#       Build each checkpoint from its OWN config instead of one shared
+#       --config. Needed for cross-architecture ensembles (e.g. DINOv2 +
+#       DINOv3 checkpoints together) — the previous single-config approach
+#       silently loaded a mismatched-architecture checkpoint with
+#       strict=False, leaving the backbone at its random init instead of
+#       raising an error.
+#
+#   --tta
+#       For each model, average its prediction on the image with its
+#       prediction on the horizontally-flipped image before ensembling
+#       across models. NOT a simple channel-index average: landmark
+#       channel identity is DOD-sorted by x-coordinate (see
+#       datasets/landmark_dataset.py), so a query's "channel 0" doesn't
+#       have a fixed anatomical meaning across a flip — the flipped
+#       prediction is unflipped back to original orientation, THEN
+#       re-sorted by x, before being combined with the original
+#       prediction's (also re-sorted) coordinates. Averaging is done in
+#       decoded coordinate space, not heatmap space, since the DOD
+#       resort only makes sense post-decode.
 # ---------------------------------------------------------------
 
 import argparse
@@ -64,40 +89,83 @@ def build_model(cfg: dict) -> LandmarkDetection:
     return LandmarkDetection(network=network, **model_kwargs)
 
 
+def dod_sort(coords: torch.Tensor) -> torch.Tensor:
+    """Re-canonicalize landmark channel identity by ascending x, matching
+    datasets/landmark_dataset.py's DOD sort (channel 0 = lower x). coords:
+    (B, Q, 2) with [x, y] in the last dim."""
+    order = coords[..., 0].argsort(dim=-1)  # (B, Q)
+    return torch.gather(coords, 1, order.unsqueeze(-1).expand(-1, -1, 2))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--config", required=True)
+    ap.add_argument("--config", default=None, help="shared config for all checkpoints")
     ap.add_argument("--ckpts", nargs="+", required=True)
+    ap.add_argument("--ckpt-configs", nargs="+", default=None,
+                     help="per-checkpoint config, same length/order as --ckpts — "
+                          "overrides --config, needed for cross-architecture ensembles")
+    ap.add_argument("--tta", action="store_true",
+                     help="average each model's prediction with its horizontal-flip "
+                          "prediction (DOD-resorted) before ensembling across models")
     args = ap.parse_args()
 
-    with open(args.config) as f:
-        cfg = yaml.safe_load(f)
+    if args.ckpt_configs:
+        assert len(args.ckpt_configs) == len(args.ckpts), \
+            f"--ckpt-configs ({len(args.ckpt_configs)}) must match --ckpts ({len(args.ckpts)}) in length"
+        config_paths = args.ckpt_configs
+    else:
+        assert args.config, "either --config or --ckpt-configs is required"
+        config_paths = [args.config] * len(args.ckpts)
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    dm = build_datamodule(cfg)
-    dm.setup()
-    loader = dm.test_dataloader()
-
     models = []
-    for ckpt_path in args.ckpts:
+    cfgs = []
+    for ckpt_path, cfg_path in zip(args.ckpts, config_paths):
+        with open(cfg_path) as f:
+            cfg = yaml.safe_load(f)
         model = build_model(cfg)
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing or unexpected:
-            print(f"[WARN] {ckpt_path}: missing={len(missing)} unexpected={len(unexpected)}")
+            print(f"[WARN] {ckpt_path} (config={cfg_path}): missing={len(missing)} unexpected={len(unexpected)}")
+            if len(missing) + len(unexpected) > 10:
+                print(f"       [!] large mismatch — this checkpoint's architecture may not match {cfg_path}, "
+                      f"check --ckpt-configs ordering before trusting this result")
         model.to(device).eval()
         models.append(model)
-    print(f"[OK] loaded {len(models)} checkpoints for ensembling")
+        cfgs.append(cfg)
+    print(f"[OK] loaded {len(models)} checkpoints for ensembling"
+          + (" [cross-config]" if args.ckpt_configs else "")
+          + (" [TTA]" if args.tta else ""))
 
-    heatmap_size = tuple(cfg["data"]["init_args"]["heatmap_size"])
-    img_size = tuple(cfg["data"]["init_args"]["img_size"])
+    # All checkpoints being combined must agree on heatmap/img size and NME
+    # normaliser — averaging coordinates or heatmaps across mismatched sizes
+    # would silently produce garbage. Loud failure instead.
+    heatmap_sizes = {tuple(c["data"]["init_args"]["heatmap_size"]) for c in cfgs}
+    img_sizes = {tuple(c["data"]["init_args"]["img_size"]) for c in cfgs}
+    assert len(heatmap_sizes) == 1, f"mismatched heatmap_size across configs: {heatmap_sizes}"
+    assert len(img_sizes) == 1, f"mismatched img_size across configs: {img_sizes}"
+    heatmap_size = heatmap_sizes.pop()
+    img_size = img_sizes.pop()
     # MODIFIED: read the NME normaliser pair from config instead of relying on
     # compute_nme()'s default (0,1) — that default is correct for BPD/OFD
     # (N=2, normalise by the diameter itself) but silently wrong for 300W
     # (N=68), which needs norm_pair=(36,45) (outer eye corners). Omitting
     # this here previously produced a nonsensical ~23% "NME" on 300W.
-    norm_pair = tuple(cfg["model"]["init_args"].get("nme_norm_pair", (0, 1)))
+    norm_pair = tuple(cfgs[0]["model"]["init_args"].get("nme_norm_pair", (0, 1)))
+
+    dm = build_datamodule(cfgs[0])
+    dm.setup()
+    loader = dm.test_dataloader()
+
+    def predict_coords(model, imgs):
+        mask_logits_per_layer, _, _ = model(imgs)
+        pred = F.interpolate(
+            mask_logits_per_layer[-1], heatmap_size,
+            mode="bilinear", align_corners=False,
+        )
+        return heatmap_to_coords(pred)  # (B, Q, 2), [x, y] in heatmap space
 
     all_nme = []
     with torch.no_grad():
@@ -105,22 +173,48 @@ def main() -> None:
             imgs = imgs.to(device)
             gt_coords = gt_coords.to(device)
 
-            summed = None
-            for model in models:
-                mask_logits_per_layer, _, _coord_pred = model(imgs)
-                pred = F.interpolate(
-                    mask_logits_per_layer[-1], heatmap_size,
-                    mode="bilinear", align_corners=False,
-                )
-                summed = pred if summed is None else summed + pred
-            avg_pred = summed / len(models)
+            if args.tta:
+                # Coordinate-space ensembling (needed for the DOD resort
+                # between the flip and un-flip steps to make sense).
+                coord_sum = None
+                for model in models:
+                    coords_orig = dod_sort(predict_coords(model, imgs))
 
-            pred_coords = heatmap_to_coords(avg_pred)
-            nme = compute_nme(pred_coords, gt_coords, heatmap_size, img_size, norm_pair=norm_pair)
+                    imgs_flipped = torch.flip(imgs, dims=[-1])
+                    coords_flip = predict_coords(model, imgs_flipped)
+                    hm_w = heatmap_size[1]
+                    coords_flip = coords_flip.clone()
+                    coords_flip[..., 0] = (hm_w - 1) - coords_flip[..., 0]
+                    coords_flip = dod_sort(coords_flip)
+
+                    coords_model = (coords_orig + coords_flip) / 2.0
+                    coord_sum = coords_model if coord_sum is None else coord_sum + coords_model
+                avg_coords = coord_sum / len(models)
+            else:
+                # Original heatmap-space ensembling — unchanged from before,
+                # byte-identical results to every previously reported number.
+                summed = None
+                for model in models:
+                    mask_logits_per_layer, _, _coord_pred = model(imgs)
+                    pred = F.interpolate(
+                        mask_logits_per_layer[-1], heatmap_size,
+                        mode="bilinear", align_corners=False,
+                    )
+                    summed = pred if summed is None else summed + pred
+                avg_pred = summed / len(models)
+                avg_coords = heatmap_to_coords(avg_pred)
+
+            nme = compute_nme(avg_coords, gt_coords, heatmap_size, img_size, norm_pair=norm_pair)
             all_nme.extend(nme.cpu().tolist())
 
     mean_nme = sum(all_nme) / len(all_nme)
-    print(f"[RESULT] Ensemble ({len(models)} models) test NME: {mean_nme * 100:.2f}%  (n={len(all_nme)} samples)")
+    tags = []
+    if args.ckpt_configs:
+        tags.append("cross-config")
+    if args.tta:
+        tags.append("TTA")
+    suffix = f" [{'+'.join(tags)}]" if tags else ""
+    print(f"[RESULT] Ensemble ({len(models)} models){suffix} test NME: {mean_nme * 100:.2f}%  (n={len(all_nme)} samples)")
 
 
 if __name__ == "__main__":

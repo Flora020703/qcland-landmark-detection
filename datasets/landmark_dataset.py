@@ -33,9 +33,22 @@ def seed_worker(worker_id: int) -> None:
 
 
 # CSV column pairs for each task (x_col, y_col) per landmark
+# MODIFIED: added apad/tad/fl (2026-07-21) — cross-anatomy generalizability
+# check (Abdomen/Femur, same UCL data source, same CSV schema as Head's
+# bpd/ofd: image_name/scale/center_w/center_h/<metric>_i_x/y/SubjectID or
+# Patient/Split). Abdomen_Train.csv has both tad_* and apad_* columns on
+# the same images (same relationship as bpd/ofd sharing Head images);
+# Femur_Train.csv has fl_* only. Subject grouping for the val split is
+# derived from the image filename's numeric prefix (_subject_id() below),
+# not from the CSV's SubjectID/Patient column, so the column-name
+# difference between Abdomen ("SubjectID") and Femur ("Patient") doesn't
+# matter.
 TASK_COLS = {
-    "bpd": [("bpd_1_x", "bpd_1_y"), ("bpd_2_x", "bpd_2_y")],
-    "ofd": [("ofd_1_x", "ofd_1_y"), ("ofd_2_x", "ofd_2_y")],
+    "bpd":  [("bpd_1_x",  "bpd_1_y"),  ("bpd_2_x",  "bpd_2_y")],
+    "ofd":  [("ofd_1_x",  "ofd_1_y"),  ("ofd_2_x",  "ofd_2_y")],
+    "apad": [("apad_1_x", "apad_1_y"), ("apad_2_x", "apad_2_y")],
+    "tad":  [("tad_1_x",  "tad_1_y"),  ("tad_2_x",  "tad_2_y")],
+    "fl":   [("fl_1_x",   "fl_1_y"),   ("fl_2_x",   "fl_2_y")],
 }
 
 
@@ -314,7 +327,9 @@ class HeadLandmarkDataModule(lightning.LightningDataModule):
         images_dir    : directory containing the JPEG images
         ann_train_csv : path to Head_Train.csv
         ann_test_csv  : path to Head_Test.csv
-        task          : "bpd" or "ofd"
+        task          : one of TASK_COLS's keys — "bpd"/"ofd" (Head), "apad"/"tad"
+                (Abdomen), "fl" (Femur). images_dir/ann_train_csv/ann_test_csv
+                must point at the matching anatomy's directory/CSVs.
         img_size      : (H, W) model input, default (512, 512)
         heatmap_size  : (H, W) heatmap output, default (64, 64)
         sigma         : Gaussian sigma in heatmap pixels, default 1.0

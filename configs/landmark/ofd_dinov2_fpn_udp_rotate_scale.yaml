@@ -1,0 +1,113 @@
+# ---------------------------------------------------------------
+# MODIFIED: ofd_deconv_v2_fpn_udp.yaml + rotate_augment: true + scale_augment: true.
+#
+# OFD counterpart of bpd_dinov2_fpn_udp_rotate_scale.yaml — tests the full
+# HRNet-aligned augmentation recipe (ROT_FACTOR=30 at 0.6 probability,
+# SCALE_FACTOR=0.25 unconditional, flip already always-on) on OFD, now that
+# the paper's primary headline result is OFD beating HRNet's baseline
+# (4.46% vs 5.00%), not BPD closing its gap. Two questions this answers:
+#   (1) does augmentation push OFD's already-baseline-beating ensemble
+#       number even further ahead?
+#   (2) does OFD (same images/architecture as BPD, same augmentation code)
+#       replicate BPD's "single-model improves, ensemble diversity collapses"
+#       pattern, or behave differently — either answer is informative.
+#
+# DINOv2 chosen over DINOv3 as the base here (opposite of BPD's choice)
+# because DINOv2 is currently OFD's better backbone (ensemble 4.46% vs
+# DINOv3's 4.54%), matching the same "build on the current headline number"
+# logic used when BPD's augmentation experiments started on DINOv3.
+#
+# ONLY difference from ofd_deconv_v2_fpn_udp.yaml: data.init_args.
+# rotate_augment / scale_augment. Everything else held fixed.
+#
+# Reference: DINOv2 OFD (no augment) ensemble = 4.46%, single-model last
+# = 4.86%±0.15%. HRNet baseline = 5.00%.
+# ---------------------------------------------------------------
+
+seed_everything: 2024
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/ofd-dinov2-fpn-udp-rotate-scale
+        filename: ofd-dinov2-fpn-udp-rotate-scale_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: ofd-dinov2-fpn-udp-rotate-scale
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size: [64, 64]
+        use_fpn: true
+        fpn_layers: [4, 8, 12]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/UCL/Head
+    ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
+    task: ofd
+    img_size: [512, 512]
+    heatmap_size: [64, 64]
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
+    pixel_center_align: true
+    rotate_augment: true
+    scale_augment: true
+    loader_seed: 2024
