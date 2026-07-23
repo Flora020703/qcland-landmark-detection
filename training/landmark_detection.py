@@ -217,6 +217,31 @@ def compute_nme(
     return nme_per_sample
 
 
+def compute_pixel_error(
+    pred_coords: torch.Tensor,
+    gt_coords: torch.Tensor,
+    heatmap_size: tuple[int, int],
+    img_size: tuple[int, int],
+) -> torch.Tensor:
+    """
+    Mean per-landmark Euclidean pixel error per sample, in model-input
+    pixel space (img_size, e.g. 512x512) — NOT the original un-cropped
+    image space, so converting to mm still requires accounting for any
+    crop/resize scale factor back to the original image. Separate
+    function (not folded into compute_nme's return) so existing
+    compute_nme call sites are untouched.
+
+    Returns:
+        pixel_error: (B,) mean pixel error per sample
+    """
+    hm_h, hm_w = heatmap_size
+    ih, iw = img_size
+    scale = pred_coords.new_tensor([iw / hm_w, ih / hm_h])
+    pred_img = pred_coords * scale
+    gt_img = gt_coords * scale
+    return (pred_img - gt_img).norm(dim=-1).mean(dim=-1)
+
+
 # -----------------------------------------------------------------------
 # Lightning module
 # -----------------------------------------------------------------------
@@ -267,6 +292,12 @@ class LandmarkDetection(LightningModule):
         # Checkpoint
         ckpt_path: Optional[str] = None,
         delta_weights: bool = False,
+        # MODIFIED: opt-in per-sample NME dump for paired significance testing
+        # against a second method's per-image errors on the same test set
+        # (relies on test_dataloader's shuffle=False/drop_last=False for
+        # deterministic, index-aligned ordering across separate eval runs).
+        # Default None: byte-identical to prior behaviour (no file written).
+        test_nme_dump_path: Optional[str] = None,
     ):
         super().__init__(
             network=network,
@@ -297,9 +328,12 @@ class LandmarkDetection(LightningModule):
         self.lambda_awing = lambda_awing
         self._awing = AdaptiveWingLoss(awing_omega, awing_theta, awing_alpha, awing_epsilon)
 
+        self.test_nme_dump_path = test_nme_dump_path
+
         # per-epoch NME accumulators (single-GPU; lists reset on epoch end)
         self._val_nme:  list[float] = []
         self._test_nme: list[float] = []
+        self._test_pixel_error: list[float] = []
 
         self.save_hyperparameters(ignore=["_class_path", "network"])
 
@@ -423,6 +457,12 @@ class LandmarkDetection(LightningModule):
         acc = self._test_nme if log_prefix == "test" else self._val_nme
         acc.extend(nme_per_sample.tolist())
 
+        if log_prefix == "test" and self.test_nme_dump_path:
+            pixel_error = compute_pixel_error(
+                pred_coords, gt_coords, self.heatmap_size, self.img_size,
+            )
+            self._test_pixel_error.extend(pixel_error.tolist())
+
     def on_validation_epoch_end(self):
         if not self._val_nme:
             return
@@ -448,5 +488,16 @@ class LandmarkDetection(LightningModule):
             return
         nme = sum(self._test_nme) / len(self._test_nme)
         self.log("metrics/test_nme", nme, prog_bar=True)
+        if self.test_nme_dump_path:
+            with open(self.test_nme_dump_path, "w") as f:
+                f.write("index,nme,pixel_error\n")
+                for i, v in enumerate(self._test_nme):
+                    pe = self._test_pixel_error[i] if i < len(self._test_pixel_error) else ""
+                    f.write(f"{i},{v:.8f},{pe if pe == '' else f'{pe:.4f}'}\n")
+            rank_zero_info(
+                f"{bold_green}Per-sample NME dumped to {self.test_nme_dump_path} "
+                f"(n={len(self._test_nme)}){reset}"
+            )
         self._test_nme.clear()
+        self._test_pixel_error.clear()
         rank_zero_info(f"{bold_green}Test NME: {nme * 100:.2f}%{reset}")
