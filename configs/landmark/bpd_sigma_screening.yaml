@@ -1,0 +1,100 @@
+# ---------------------------------------------------------------
+# MODIFIED: sigma screening base config — reconstructs the ORIGINAL
+# pre-DeconvHeadV2/FPN/UDP condition (einsum head, plain MSE loss,
+# num_blocks=3, masked_attn_enabled=true, 512x512 input) under the
+# CURRENT, fixed NME implementation, so sigma can be isolated as the
+# single variable under test.
+#
+# NOT the same as the early Run1->Run2 chronological-summary numbers
+# (those conflated sigma with num_blocks/masked_attn changes AND used
+# a since-fixed, invalid NME calculation) -- do not compare against
+# those old numbers, this is a fresh screening.
+#
+# `data.sigma` below (4.0) is a placeholder overwritten per rung by
+# ablation/scripts/run_bpd_sigma_screening.sh (sigma=1.0 vs sigma=4.0,
+# single seed=2024, matching this project's single-seed screening
+# convention e.g. bpd_vit_small.yaml).
+#
+# use_fpn / pixel_center_align / rotate_augment / scale_augment are
+# all omitted (default False) -- this deliberately has NONE of FPN,
+# UDP, or augmentation, matching the true "original condition".
+# ---------------------------------------------------------------
+
+seed_everything: 2024
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/bpd-sigma-screening
+        filename: bpd-sigma-screening_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: bpd-sigma-screening
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    loss_type: mse
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: einsum
+        heatmap_size: [64, 64]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/UCL/Head
+    ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
+    task: bpd
+    img_size: [512, 512]
+    heatmap_size: [64, 64]
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
