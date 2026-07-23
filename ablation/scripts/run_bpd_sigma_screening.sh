@@ -2,12 +2,34 @@
 # =============================================================================
 # run_bpd_sigma_screening.sh — BPD, single-seed (2024) sigma=1.0 vs sigma=4.0
 # screening, on the ORIGINAL condition (einsum head, plain MSE loss,
-# num_blocks=3, masked_attn_enabled=true, 512x512, no FPN/UDP/augmentation)
-# under the current, fixed NME implementation.
+# num_blocks=3, masked_attn_enabled=true, 512x512, no FPN, UDP, or
+# additional rotation-scale augmentation) under the current, fixed NME
+# implementation. NOTE: HeadLandmarkDataModule.setup() hardcodes
+# augment=True on the train split regardless of config, so the
+# inherited baseline flip (p=0.5) + colour-jitter pipeline remains
+# enabled identically in BOTH rungs -- this is the correct
+# reproduction of the original condition, not a gap.
 #
 # This is a SCREENING, not a full ablation -- single seed only, must be
 # reported in the thesis as "screening"/"sensitivity check", never with
 # 5-seed-level causal confidence (see project memory's Next-steps queue).
+# Answers "does sigma affect training under the ORIGINAL einsum+plain-MSE
+# condition", NOT "is sigma=4 still better under the final DeconvHeadV2+
+# hybrid-loss pipeline" -- report as a historical-configuration sigma
+# screening, not a final-pipeline sigma ablation.
+#
+# Decision rule for whether to extend to 5 seeds (42/0/123/2024/3407):
+# compare final-checkpoint against final-checkpoint (matches this
+# project's UCL reporting convention; val-best is diagnostic only).
+#   - If sigma=1 clearly collapses (training curve shows no learning)
+#     and sigma=4 learns normally: single-seed is sufficient as a
+#     mechanistic sensitivity check, keep it single-seed.
+#   - If the gap is small or the direction looks unstable, OR if sigma=4
+#     is going to be claimed as a formally-selected hyperparameter
+#     (not just "why we picked sigma=4 early on"): must extend to the
+#     full 5 seeds before drawing a conclusion -- compare the gap
+#     against BPD's known seed-to-seed variance (std ~0.5-3.0 depending
+#     on rung, see project memory) rather than trusting a single pair.
 #
 # NOT comparable to the early Run1->Run2 chronological-summary numbers
 # (those conflated sigma with num_blocks/masked_attn changes AND used a

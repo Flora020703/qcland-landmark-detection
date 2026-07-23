@@ -16,8 +16,21 @@
 # convention e.g. bpd_vit_small.yaml).
 #
 # use_fpn / pixel_center_align / rotate_augment / scale_augment are
-# all omitted (default False) -- this deliberately has NONE of FPN,
-# UDP, or augmentation, matching the true "original condition".
+# all omitted (default False) -- no FPN, UDP, or additional rotation-
+# scale augmentation. NOTE: HeadLandmarkDataModule.setup() hardcodes
+# augment=True on the train split regardless of config (see Rule in
+# feedback_training_pitfalls memory) -- so the inherited baseline
+# flip (p=0.5) + brightness/contrast/saturation jitter (each p=0.5)
+# pipeline remains enabled identically in BOTH sigma rungs. This is
+# the correct reproduction of the original condition (which was also
+# always trained through this same DataModule), not a gap to close.
+#
+# Scope: this answers "under the original einsum+plain-MSE condition,
+# what effect does sigma have on training behaviour" -- it does NOT
+# answer "under the final DeconvHeadV2+hybrid-loss pipeline, is
+# sigma=4 still better than sigma=1". Report in the thesis as a
+# historical-configuration sigma screening, not a final-pipeline
+# sigma ablation.
 # ---------------------------------------------------------------
 
 seed_everything: 2024
