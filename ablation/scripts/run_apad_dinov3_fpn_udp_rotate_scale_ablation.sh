@@ -181,8 +181,8 @@ PYEOF
     for CKPT_TAG in best final; do
         CKPT_PATH="${RUN_DIR}/seed${SEED}_${CKPT_TAG}.ckpt"
         if [ ! -f "${CKPT_PATH}" ]; then
-            echo "[WARN] ${CKPT_PATH} not found — skipping test"
-            continue
+            echo "[ERROR] ${CKPT_PATH} not found — seed=${SEED} incomplete, aborting (NOT marking DONE)"
+            exit 1
         fi
         echo ""
         echo "--- Test (${CKPT_TAG} checkpoint): ${CKPT_PATH} ---"
@@ -194,13 +194,20 @@ PYEOF
             | grep -E "test_nme|Test NME"
 
         NME=$(grep "Test NME:" "${LOG_FILE}" | grep -oE "[0-9]+\.[0-9]+" | tail -1 || echo "")
-        [ -n "$NME" ] && echo -e "${SEED}\t${CKPT_TAG}\t${NME}" >> "$RESULTS_TSV"
+        if [ -z "$NME" ]; then
+            echo "[ERROR] Failed to parse Test NME for seed=${SEED} ckpt_tag=${CKPT_TAG} — seed incomplete, aborting (NOT marking DONE)"
+            exit 1
+        fi
+        echo -e "${SEED}\t${CKPT_TAG}\t${NME}" >> "$RESULTS_TSV"
     done
 
     # --- 6. Keep checkpoints ON the system disk until all 5 seeds are done —
     #     the ensemble step needs all 5 val-best/final .ckpt files present at once.
     echo "[INFO] Checkpoints kept at ${RUN_DIR} (needed for ensemble step after all 5 seeds finish)"
 
+    # MODIFIED: only mark this seed DONE now that both best and final NME are
+    # confirmed captured above — writing DONE_MARKER unconditionally would let
+    # a resumed run silently skip a seed that never actually finished.
     echo "${SEED}" >> "$DONE_MARKER"
     echo ""
     echo "--- DONE: ${RUN_NAME} ---"
@@ -218,12 +225,16 @@ python3 - "$RESULTS_TSV" <<'PYEOF'
 import sys, statistics
 from collections import defaultdict
 
-groups = defaultdict(list)
+by_seed_tag = {}
 with open(sys.argv[1]) as f:
     next(f)
     for line in f:
         seed, ckpt_tag, nme = line.rstrip("\n").split("\t")
-        groups[ckpt_tag].append(float(nme))
+        by_seed_tag[(seed, ckpt_tag)] = float(nme)  # last write wins -- de-dupes any accidental repeat row
+
+groups = defaultdict(list)
+for (seed, ckpt_tag), nme in by_seed_tag.items():
+    groups[ckpt_tag].append(nme)
 
 print(f"\n  {'ckpt':<8}{'n':<4}{'mean':<8}{'std':<8}")
 for tag in ("best", "final"):

@@ -24,9 +24,11 @@
 #       Build each checkpoint from its OWN config instead of one shared
 #       --config. Needed for cross-architecture ensembles (e.g. DINOv2 +
 #       DINOv3 checkpoints together) — the previous single-config approach
-#       silently loaded a mismatched-architecture checkpoint with
-#       strict=False, leaving the backbone at its random init instead of
-#       raising an error.
+#       would have silently loaded a mismatched-architecture checkpoint.
+#       MODIFIED: state_dict loading is now strict — any missing/unexpected
+#       key (from either path) raises RuntimeError instead of warning and
+#       continuing, since every checkpoint combined here is expected to
+#       match its config's architecture exactly (see code review, 2026-07-24).
 #
 #   --tta
 #       For each model, average its prediction on the image with its
@@ -128,10 +130,21 @@ def main() -> None:
         state = torch.load(ckpt_path, map_location="cpu", weights_only=False)["state_dict"]
         missing, unexpected = model.load_state_dict(state, strict=False)
         if missing or unexpected:
-            print(f"[WARN] {ckpt_path} (config={cfg_path}): missing={len(missing)} unexpected={len(unexpected)}")
-            if len(missing) + len(unexpected) > 10:
-                print(f"       [!] large mismatch — this checkpoint's architecture may not match {cfg_path}, "
-                      f"check --ckpt-configs ordering before trusting this result")
+            # MODIFIED: was strict=False + print-and-continue (a single missing
+            # head/FPN param could silently change the result without ever
+            # exceeding some arbitrary "large mismatch" threshold). This script
+            # only ever combines same-architecture checkpoints — matched-seed
+            # under one --config, or matched-per-checkpoint under
+            # --ckpt-configs — so ANY mismatch means something is genuinely
+            # wrong (wrong config, wrong checkpoint file, mismatched
+            # --ckpt-configs ordering), not something to tolerate and average
+            # away. Fail loud instead.
+            raise RuntimeError(
+                f"[FAIL] {ckpt_path} (config={cfg_path}): missing={len(missing)} unexpected={len(unexpected)} keys — "
+                f"checkpoint does not match this config's architecture.\n"
+                f"  missing[:10]    = {missing[:10]}\n"
+                f"  unexpected[:10] = {unexpected[:10]}"
+            )
         model.to(device).eval()
         models.append(model)
         cfgs.append(cfg)

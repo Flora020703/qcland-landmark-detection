@@ -138,6 +138,7 @@ data      = cfg['data']['init_args']
 checks = [
     ('seed_everything',      cfg['seed_everything'],         seed),
     ('sigma',                data['sigma'],                  sigma),
+    ('task',                 data.get('task'),               'bpd'),
     ('loss_type',            m['loss_type'],                 'mse'),
     ('heatmap_head',         n['heatmap_head'],              'einsum'),
     ('freeze_backbone',      n['freeze_backbone'],           False),
@@ -194,8 +195,8 @@ PYEOF
     for CKPT_TAG in best final; do
         CKPT_PATH="${RUN_DIR}/${RUN_NAME}_${CKPT_TAG}.ckpt"
         if [ ! -f "${CKPT_PATH}" ]; then
-            echo "[WARN] ${CKPT_PATH} not found -- skipping test"
-            continue
+            echo "[ERROR] ${CKPT_PATH} not found -- sigma=${SIGMA} incomplete, aborting (NOT marking DONE)"
+            exit 1
         fi
         echo ""
         echo "--- Test (${CKPT_TAG} checkpoint): ${CKPT_PATH} ---"
@@ -207,9 +208,15 @@ PYEOF
             | grep -E "test_nme|Test NME"
 
         NME=$(grep "Test NME:" "${LOG_FILE}" | grep -oE "[0-9]+\.[0-9]+" | tail -1 || echo "")
-        [ -n "$NME" ] && echo -e "${SIGMA}\t${CKPT_TAG}\t${NME}" >> "$RESULTS_TSV"
+        if [ -z "$NME" ]; then
+            echo "[ERROR] Failed to parse Test NME for sigma=${SIGMA} ckpt_tag=${CKPT_TAG} -- incomplete, aborting (NOT marking DONE)"
+            exit 1
+        fi
+        echo -e "${SIGMA}\t${CKPT_TAG}\t${NME}" >> "$RESULTS_TSV"
     done
 
+    # MODIFIED: only mark this sigma DONE now that both best and final NME are
+    # confirmed captured above.
     echo "${SIGMA}" >> "$DONE_MARKER"
     echo ""
     echo "--- DONE: ${RUN_NAME} ---"
