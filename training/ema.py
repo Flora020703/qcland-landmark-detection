@@ -31,9 +31,13 @@ class EMACallback(Callback):
     always reflects the raw (non-EMA) weights, same as every other
     experiment, so ablation comparisons stay apples-to-apples.
 
-    decay warmup follows timm's ModelEmaV2: decay(t) = min(target, (1+t)/(10+t))
-    so the shadow isn't dragged by full-strength decay while weights are
-    still near their random init.
+    decay warmup: decay(t) = min(target, (1+t)/(10+t)), the same
+    update-count-dependent schedule as TensorFlow's
+    ExponentialMovingAverage(num_updates=...) -- NOT timm's ModelEmaV2,
+    which uses a fixed decay with no warmup (verified against timm's
+    model_ema.py source, 2026-07-23). This keeps the shadow from being
+    dragged by full-strength decay while weights are still near their
+    random init.
     """
 
     def __init__(self, decay: float = 0.999, use_warmup: bool = True):

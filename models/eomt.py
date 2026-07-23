@@ -108,16 +108,25 @@ class QueryConditionedDeconvHead(nn.Module):
 
         # Override conv2 to produce a small positive constant at init.
         #
-        # Why not zero? _attn_mask() uses (interpolated > 0) to build the attention mask.
-        # Zero-init → all-False mask → queries can't attend to ANY patch → learning blocked.
+        # NOTE (corrected 2026-07-23): this module's output does NOT feed
+        # _attn_mask() — that mask is built only from _predict_einsum()'s
+        # output inside the per-block loop in EoMT.forward(), and this head
+        # only runs afterwards, in _predict(), once the loop has already
+        # finished. So a zero-init here would NOT close the attention mask;
+        # the real reasons for this init are purely about this head's own
+        # loss scale at step 0, below.
         #
         # Why not kaiming? kaiming on conv2 gives output std ≈ 22 (see chain: GroupNorm →
         # FiLM → conv1 → ReLU → conv2). WMSE on pred≈22 vs target∈[0,1] → loss≈266,
         # which distorts the entire gradient trajectory for hundreds of epochs.
         #
-        # Small positive constant (0.01): loss starts at ~0.0001 per pixel (vs 266),
-        # attention mask sees 0.01 > 0 everywhere → fully open, and gradients from
-        # WMSE + coord loss naturally push the head toward correct peaks.
+        # Small positive constant (0.01) instead of exactly zero: loss starts
+        # at ~0.0001 per pixel (vs 266), and gradients from WMSE + coord loss
+        # naturally push the head toward correct peaks. Because conv2.weight
+        # is exactly zero at init, no gradient reaches film_generator/conv1
+        # through conv2 on the very first backward pass — conv2 itself is
+        # updated first, and earlier layers start receiving useful gradient
+        # once conv2's weight has moved away from zero.
         nn.init.zeros_(self.conv2.weight)
         nn.init.constant_(self.conv2.bias, 0.01)
 
@@ -160,10 +169,15 @@ class FeaturePyramidFusion(nn.Module):
     same reasoning as QueryConditionedDeconvHead's patch-feature norm) ->
     concat on channel dim -> 1x1 conv back to embed_dim.
 
-    Initialised as an identity pass-through of the last (deepest) level only
-    (zero weight on earlier levels), so enabling FPN does not perturb the
-    proven single-layer behaviour at step 0 — the model learns to blend in
-    shallower levels rather than starting from a cold, unproven fusion.
+    Initialised with zero weight on the two shallower levels and a unit
+    (identity) channel mapping on the deepest level, so at init the
+    output is GroupNorm(deepest_level) — NOT an exact identity
+    pass-through of the raw deepest-level features, since they're
+    GroupNorm-normalised here even though the non-FPN path uses them
+    directly. Shallower levels still make no initial contribution, so
+    the model learns to blend them in from a single known feature
+    source rather than starting from a cold, unproven three-way mix —
+    just not from bit-identical behaviour to FPN being off.
     """
 
     def __init__(self, embed_dim: int, num_levels: int):
