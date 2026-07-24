@@ -7,14 +7,20 @@
 # re-ablation on Multicentre (see project memory / 04_experimental_setup
 # .tex's sec:setup-evidence-scope).
 #
-# Processes ONE (task, backbone) group fully -- all 5 seeds, then that
-# group's ensemble -- before moving to the next group, so disk usage
-# stays bounded to roughly one group at a time (~3GB) rather than all 10
-# groups' checkpoints accumulating simultaneously (10 groups x ~3GB would
-# be ~30GB, uncomfortably close to this project's repeated disk-full
-# incidents -- see Rule 16/29 in project pitfalls memory). Checkpoints
-# are written directly to the data disk (no post-hoc mv step, per the
-# resolution-screening disk optimisation) under BACKUP_ROOT below.
+# SAFE-STOP DESIGN (2026-07-24, per review): this script processes ONE
+# (task, backbone) group fully -- all 5 seeds, then that group's ensemble
+# -- and then EXITS, rather than continuing on to the next group
+# unattended. Re-invoke the script to process the next incomplete group
+# (it resumes correctly; already-complete groups are skipped). This is a
+# deliberate choice given: (a) 10 groups x ~3GB each would be ~30GB,
+# uncomfortably close to this project's repeated disk-full incidents
+# (Rule 16/29 in project pitfalls memory) against a data disk that has
+# shown as little as ~14GB free, and (b) under thesis-deadline time
+# pressure, a human checking each group's ensemble numbers and disk
+# headroom before the next group starts is safer than any automatic
+# archive/delete policy touching formal-evidence checkpoints. Checkpoints
+# write directly to the data disk (no post-hoc mv step) under BACKUP_ROOT
+# below; last.ckpt is renamed (not copied) into *_final.ckpt.
 #
 # Records BOTH metrics per checkpoint AND per group-ensemble (swap-min
 # primary -- also used for validation/early-stopping/checkpoint-selection
@@ -30,7 +36,9 @@
 # against real data, 2026-07-24, via `python3 scripts/test_dataload.py
 # multicentre` -- a real HC18/UCL numeric-prefix collision exists in the
 # pooled Head data and the naive bare-prefix method would have merged
-# it).
+# it; that self-test also hard-fails if any image referenced by a CSV row
+# is missing on disk, rather than silently training on a shrunken
+# dataset -- run it before this script, on every fresh data transfer).
 #
 # Prerequisite: Multicentre data must be on the server first --
 #   /root/autodl-tmp/images/MULTICENTRE/{Head,Abdomen,Femur}/
@@ -43,12 +51,19 @@
 # Usage (on AutoDL server):
 #   cd /root/eomt
 #   nohup bash ablation/scripts/run_multicentre_5seed_ablation.sh > multicentre_5seed_ablation.log 2>&1 &
+#   # (re-invoke after each group finishes to continue to the next one)
 # =============================================================================
 
 set -euo pipefail
 
 BASE_CONFIG="configs/landmark/multicentre_fpn_udp_rotate_scale.yaml"
-SEEDS=(42 0 123 2024 3407)
+
+# Canonical 5-seed set -- NEVER overridden by CANARY_ONLY. Group
+# completeness (whether to run the group's ensemble) is always checked
+# against THIS list, not against whatever SEEDS below was reduced to for
+# a given invocation -- see the CANARY_ONLY bug this fixes, noted below.
+ALL_SEEDS=(42 0 123 2024 3407)
+SEEDS=("${ALL_SEEDS[@]}")
 
 DATA_ROOT="/root/autodl-tmp"
 IMAGES_ROOT="${DATA_ROOT}/images/MULTICENTRE"
@@ -75,21 +90,25 @@ BACKBONES=(
 # LightningCLI fit/test path rather than just scripts/test_dataload.py's
 # direct construction:
 #   CANARY_ONLY=1 bash ablation/scripts/run_multicentre_5seed_ablation.sh
-#     -> runs ONLY task=bpd, backbone=dinov2, seed=42 (1 of 50 runs),
-#        including its group-ensemble step (a 1-model "ensemble", just to
-#        exercise that code path too).
+#     -> runs ONLY task=bpd, backbone=dinov2, seed=42 (1 of 50 runs).
+#     IMPORTANT (fixed 2026-07-24, was broken before): this does NOT mark
+#     the bpd_dinov2 group complete and does NOT run its ensemble -- group
+#     completeness always checks against ALL_SEEDS (all 5), never against
+#     this reduced SEEDS list, so a later full-sweep invocation correctly
+#     still trains the remaining 4 seeds for bpd_dinov2 rather than
+#     silently skipping the whole group.
 #   bash ablation/scripts/run_multicentre_5seed_ablation.sh
-#     -> full sweep (resumes past anything CANARY_ONLY already completed).
+#     -> full sweep (resumes past anything CANARY_ONLY already completed,
+#        processes exactly one group to completion, then exits).
 if [ "${CANARY_ONLY:-0}" = "1" ]; then
     TASKS=("Head:bpd:1")
     BACKBONES=("dinov2:vit_small_patch14_reg4_dinov2")
     SEEDS=(42)
     echo "[CANARY_ONLY] restricting to task=bpd backbone=dinov2 seed=42 only"
+    echo "[CANARY_ONLY] this will NOT mark bpd_dinov2 complete or ensemble it -- needs all of: ${ALL_SEEDS[*]}"
 fi
 
 RESULTS_TSV="multicentre_5seed_results.tsv"
-DONE_MARKER="checkpoints/.multicentre_5seed_completed.txt"
-GROUP_DONE_MARKER="checkpoints/.multicentre_5seed_groups_completed.txt"
 BACKUP_ROOT="/root/autodl-tmp/saved_checkpoints/multicentre_5seed"
 
 if [ ! -d "${IMAGES_ROOT}/Head" ] || [ ! -f "${ANN_ROOT}/Head_Train.csv" ]; then
@@ -97,8 +116,7 @@ if [ ! -d "${IMAGES_ROOT}/Head" ] || [ ! -f "${ANN_ROOT}/Head_Train.csv" ]; then
     exit 1
 fi
 
-mkdir -p checkpoints "$(dirname "$DONE_MARKER")" "$BACKUP_ROOT"
-touch "$DONE_MARKER" "$GROUP_DONE_MARKER"
+mkdir -p checkpoints "$BACKUP_ROOT"
 [ -f "$RESULTS_TSV" ] || echo -e "task\tbackbone\tseed\tckpt_tag\tswap_min_nme\tfixed_channel_nme" > "$RESULTS_TSV"
 
 if [ ! -f "${BASE_CONFIG}" ]; then
@@ -122,9 +140,54 @@ check_disk() {
         exit 1
     fi
 }
+
+# --- (task, backbone) group-completeness helpers, computed fresh from
+#     the actual TSV/log files every time -- never trusted from a cached
+#     "done" marker (a marker can go stale, e.g. the CANARY_ONLY bug this
+#     rewrite fixes: writing a marker after only 1/5 seeds ran). ---
+
+seed_pair_done() {
+    # true if a given (task, backbone, seed) has both best+final TSV rows
+    local task="$1" backbone="$2" seed="$3"
+    local rows
+    rows=$(awk -F'\t' -v t="$task" -v b="$backbone" -v s="$seed" \
+        'NR>1 && $1==t && $2==b && $3==s && $4=="best" {x=1} \
+         NR>1 && $1==t && $2==b && $3==s && $4=="final" {y=1} \
+         END {print x+y}' \
+        "$RESULTS_TSV")
+    [ "$rows" -eq 2 ]
+}
+
+seeds_all_done() {
+    # true if ALL_SEEDS (always the canonical 5, regardless of CANARY_ONLY)
+    # each have both best+final TSV rows for this (task, backbone)
+    local task="$1" backbone="$2" seed
+    for seed in "${ALL_SEEDS[@]}"; do
+        seed_pair_done "$task" "$backbone" "$seed" || return 1
+    done
+    return 0
+}
+
+group_is_complete() {
+    # true if seeds_all_done AND all 4 ensemble log files exist and are
+    # non-empty -- used for the group-start skip decision
+    local task="$1" backbone="$2" group_dir="$3" tag metric
+    seeds_all_done "$task" "$backbone" || return 1
+    for tag in best final; do
+        for metric in swapmin fixedchannel; do
+            [ -s "${group_dir}/ensemble_${tag}_${metric}_log.txt" ] || return 1
+        done
+    done
+    return 0
+}
+
 check_disk
 echo "[OK] checkpoint disk preflight"
 df -h "$BACKUP_ROOT"
+
+# Set if any group is left partial (e.g. under CANARY_ONLY) so the final
+# summary doesn't wrongly claim every group is complete.
+ANY_GROUP_PARTIAL=0
 
 for TASK_SPEC in "${TASKS[@]}"; do
 IFS=":" read -r ANATOMY_DIR TASK HAS_HC18 <<< "$TASK_SPEC"
@@ -136,10 +199,10 @@ IFS=":" read -r BACKBONE_TAG BACKBONE_NAME <<< "$BACKBONE_SPEC"
     RUN_GROUP="multicentre-${TASK}-${BACKBONE_TAG}"
     GROUP_DIR="${BACKUP_ROOT}/${RUN_GROUP}"
 
-    if grep -qxF "${GROUP_KEY}" "$GROUP_DONE_MARKER" 2>/dev/null; then
+    if group_is_complete "$TASK" "$BACKBONE_TAG" "$GROUP_DIR"; then
         echo ""
         echo "############################################################"
-        echo "  SKIP whole group (already completed + ensembled): ${GROUP_KEY}"
+        echo "  SKIP whole group (verified complete + ensembled): ${GROUP_KEY}"
         echo "############################################################"
         continue
     fi
@@ -154,20 +217,24 @@ IFS=":" read -r BACKBONE_TAG BACKBONE_NAME <<< "$BACKBONE_SPEC"
 
     for SEED in "${SEEDS[@]}"; do
 
-        PAIR_KEY="${GROUP_KEY}_${SEED}"
         RUN_DIR="${GROUP_DIR}/seed${SEED}"
-        TSV_PAIR_ROWS=$(awk -F'\t' -v t="$TASK" -v b="$BACKBONE_TAG" -v s="$SEED" \
-            'NR>1 && $1==t && $2==b && $3==s && $4=="best" {x=1} \
-             NR>1 && $1==t && $2==b && $3==s && $4=="final" {y=1} \
-             END {print x+y}' \
-            "$RESULTS_TSV")
-        if grep -qxF "${PAIR_KEY}" "$DONE_MARKER" 2>/dev/null \
-           && [ "$TSV_PAIR_ROWS" -eq 2 ]; then
+
+        if seed_pair_done "$TASK" "$BACKBONE_TAG" "$SEED"; then
             echo ""
             echo "--- SKIP (already completed): task=${TASK} backbone=${BACKBONE_TAG} seed=${SEED} ---"
             LAST_SEED_CFG="${RUN_DIR}/seed${SEED}_config.yaml"
             continue
         fi
+
+        # MODIFIED: purge any stale/partial rows for this (task,backbone,
+        # seed) before (re)running it -- a crash between writing this
+        # seed's TSV rows and completing the rest could otherwise leave a
+        # duplicate row on retry (the rows are about to be regenerated
+        # fresh below). Idempotent: no-op if no such rows exist yet.
+        TMP_TSV="${RESULTS_TSV}.tmp"
+        awk -F'\t' -v t="$TASK" -v b="$BACKBONE_TAG" -v s="$SEED" \
+            'NR==1 || !($1==t && $2==b && $3==s)' "$RESULTS_TSV" > "$TMP_TSV"
+        mv "$TMP_TSV" "$RESULTS_TSV"
 
         RUN_NAME="${RUN_GROUP}-seed${SEED}"
         TMP_CFG="/tmp/${RUN_GROUP}_seed${SEED}.yaml"
@@ -313,7 +380,7 @@ PYEOF
         for CKPT_TAG in best final; do
             CKPT_PATH="${RUN_DIR}/seed${SEED}_${CKPT_TAG}.ckpt"
             if [ ! -f "${CKPT_PATH}" ]; then
-                echo "[ERROR] ${CKPT_PATH} not found -- task=${TASK} backbone=${BACKBONE_TAG} seed=${SEED} incomplete, aborting (NOT marking DONE)"
+                echo "[ERROR] ${CKPT_PATH} not found -- task=${TASK} backbone=${BACKBONE_TAG} seed=${SEED} incomplete, aborting (NOT recording result)"
                 exit 1
             fi
 
@@ -345,25 +412,31 @@ PYEOF
             FIXEDCHANNEL_NME=$(grep "Test NME:" "${LOG_FIXED}" | grep -oE "[0-9]+\.[0-9]+" | tail -1 || echo "")
 
             if [ -z "$SWAPMIN_NME" ] || [ -z "$FIXEDCHANNEL_NME" ]; then
-                echo "[ERROR] Failed to parse Test NME (swap-min='${SWAPMIN_NME}' fixed-channel='${FIXEDCHANNEL_NME}') for task=${TASK} backbone=${BACKBONE_TAG} seed=${SEED} ckpt_tag=${CKPT_TAG} -- incomplete, aborting (NOT marking DONE)"
+                echo "[ERROR] Failed to parse Test NME (swap-min='${SWAPMIN_NME}' fixed-channel='${FIXEDCHANNEL_NME}') for task=${TASK} backbone=${BACKBONE_TAG} seed=${SEED} ckpt_tag=${CKPT_TAG} -- incomplete, aborting (NOT recording result)"
                 exit 1
             fi
             echo -e "${TASK}\t${BACKBONE_TAG}\t${SEED}\t${CKPT_TAG}\t${SWAPMIN_NME}\t${FIXEDCHANNEL_NME}" >> "$RESULTS_TSV"
         done
 
-        # Only mark this (task, backbone, seed) DONE now that both
-        # checkpoint tags x both metrics are confirmed captured above.
-        echo "${PAIR_KEY}" >> "$DONE_MARKER"
         echo ""
         echo "--- DONE: ${RUN_NAME} ---"
 
     done
 
-    # --- Group finished (all 5 seeds): ensemble across seeds, both
-    #     checkpoint tags x both metrics. The swap-min ensemble uses
-    #     LAST_SEED_CFG as-is (endpoint_order_invariant_nme: true, same
-    #     across every seed's config in this group); the fixed-channel
-    #     ensemble uses a copy with that one field flipped. ---
+    # --- Only ensemble + treat the group as complete once ALL 5 canonical
+    #     seeds (not just whatever SEEDS was reduced to, e.g. under
+    #     CANARY_ONLY) have both checkpoint tags recorded. ---
+    if ! seeds_all_done "$TASK" "$BACKBONE_TAG"; then
+        ANY_GROUP_PARTIAL=1
+        echo ""
+        echo "############################################################"
+        echo "  GROUP PARTIAL (not all 5 seeds done): ${GROUP_KEY}"
+        echo "  Not ensembling, not marking complete. Re-invoke this script"
+        echo "  (without CANARY_ONLY) to train the remaining seeds."
+        echo "############################################################"
+        continue
+    fi
+
     echo ""
     echo "--- Ensembling group: ${GROUP_KEY} ---"
     FIXED_ENSEMBLE_CFG="/tmp/${RUN_GROUP}_ensemble_fixedchannel.yaml"
@@ -391,11 +464,23 @@ with open('${FIXED_ENSEMBLE_CFG}', 'w') as f:
             2>&1 | tee "${GROUP_DIR}/ensemble_${CKPT_TAG}_fixedchannel_log.txt"
     done
 
-    echo "${GROUP_KEY}" >> "$GROUP_DONE_MARKER"
-    echo ""
-    echo "############################################################"
-    echo "  GROUP DONE: ${GROUP_KEY}"
-    echo "############################################################"
+    # Re-verify (not just assume) the group is now actually complete --
+    # if any ensemble step above failed to produce a log, group_is_complete
+    # will correctly report incomplete on the next invocation rather than
+    # this script wrongly declaring victory.
+    if group_is_complete "$TASK" "$BACKBONE_TAG" "$GROUP_DIR"; then
+        echo ""
+        echo "############################################################"
+        echo "  GROUP DONE: ${GROUP_KEY}"
+        echo "############################################################"
+    else
+        echo ""
+        echo "############################################################"
+        echo "  [WARN] GROUP ${GROUP_KEY}: seeds finished but one or more"
+        echo "  ensemble logs are missing/empty -- re-invoke this script to"
+        echo "  retry the ensemble step for this group before trusting it."
+        echo "############################################################"
+    fi
     df -h "$BACKUP_ROOT"
     echo "NOTE: this group's checkpoints are at ${GROUP_DIR}."
     echo "Once you've confirmed the ensemble numbers above, consider"
@@ -405,13 +490,24 @@ with open('${FIXED_ENSEMBLE_CFG}', 'w') as f:
     echo "coordinates) preserve enough for later re-analysis even if the"
     echo "raw .ckpt files are removed. Do not delete without checking"
     echo "first (Rule 29 in project pitfalls memory)."
+    echo ""
+    echo "Stopping here by design (safe-stop, see script header) --"
+    echo "re-invoke this script to process the next incomplete group."
+    exit 0
 
 done
 done
 
 echo ""
 echo "============================================================"
-echo "  Multicentre 5-seed ablation: ALL GROUPS DONE"
+if [ "$ANY_GROUP_PARTIAL" -eq 1 ]; then
+    echo "  Multicentre 5-seed ablation: run finished, but at least one"
+    echo "  group is only PARTIALLY done (see GROUP PARTIAL messages above"
+    echo "  -- expected under CANARY_ONLY). Re-invoke without CANARY_ONLY"
+    echo "  to continue training the remaining seeds."
+else
+    echo "  Multicentre 5-seed ablation: ALL GROUPS ALREADY COMPLETE"
+fi
 echo "============================================================"
 echo "Per-seed results: ${RESULTS_TSV}"
 echo "Per-group ensemble logs: ${BACKUP_ROOT}/multicentre-<task>-<backbone>/ensemble_*_log.txt"

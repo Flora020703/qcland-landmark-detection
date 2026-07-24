@@ -488,12 +488,20 @@ def test_multicentre():
     wouldn't even match "Patient..." filenames), (3) Abdomen/Femur (no
     hc18_ann_csvs passed) correctly default every non-FP filename to UCL.
     """
+    import csv as _csv
     import re as _re
     from datasets.multicentre_dataset import MulticentreLandmarkDataModule
 
     _win    = Path("D:/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
     _wsl    = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
-    _server = Path("/root/autodl-tmp/MultiCentre-Fetal-Biometry-2025")
+    # MODIFIED: was "/root/autodl-tmp/MultiCentre-Fetal-Biometry-2025" -- did
+    # not match how the config/ablation script actually reference the data
+    # (images_dir=/root/autodl-tmp/images/MULTICENTRE/<Anatomy>, no
+    # intermediate "MultiCentre-Fetal-Biometry-2025" directory on the
+    # server), so this check would have silently looked in the wrong place
+    # after following the deployment instructions literally (caught in
+    # review, 2026-07-24, before ever running on the server).
+    _server = Path("/root/autodl-tmp")
     DATA_ROOT = next((p for p in (_win, _wsl, _server) if p.exists()), _server)
 
     print("\n" + "=" * 60)
@@ -513,14 +521,40 @@ def test_multicentre():
         "Abdomen": {"train": 662,  "test": 161},
         "Femur":   {"train": 533,  "test": 362},
     }
+
+    def _check_no_missing_images(anatomy: str, split: str, expected_rows: int) -> None:
+        """
+        MODIFIED: HeadLandmarkDataModule._parse_csv() (inherited unchanged
+        by MulticentreLandmarkDataModule) silently `continue`s past any row
+        whose image_name doesn't exist on disk -- a partial/incomplete data
+        transfer would previously pass this smoke-test's row-count check
+        (which only reads the CSV, never the images directory) and then
+        train silently on a shrunken dataset. This checks every row's image
+        actually exists and hard-fails, listing every missing filename, if
+        not -- run BEFORE constructing any DataModule so a bad transfer is
+        caught here rather than discovered as an unexplained sample-count
+        mismatch later.
+        """
+        csv_path = ann_root / f"{anatomy}_{split}.csv"
+        img_dir = images_root / anatomy
+        missing = []
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            rows = list(_csv.DictReader(f))
+        assert len(rows) == expected_rows, (
+            f"{anatomy}_{split}.csv: expected {expected_rows} data rows, got {len(rows)}"
+        )
+        for row in rows:
+            if not (img_dir / row["image_name"]).exists():
+                missing.append(row["image_name"])
+        assert not missing, (
+            f"{anatomy}_{split}: {len(missing)}/{expected_rows} images missing under "
+            f"{img_dir} -- data transfer is incomplete. First 20 missing: {missing[:20]}"
+        )
+        print(f"[{anatomy}_{split}] all {expected_rows} images present under {img_dir}")
+
     for anatomy, spec in expected.items():
-        with open(ann_root / f"{anatomy}_Train.csv", encoding="utf-8") as f:
-            n_train = sum(1 for _ in f) - 1
-        with open(ann_root / f"{anatomy}_Test.csv", encoding="utf-8") as f:
-            n_test = sum(1 for _ in f) - 1
-        assert n_train == spec["train"], f"{anatomy} train rows: expected {spec['train']}, got {n_train}"
-        assert n_test == spec["test"], f"{anatomy} test rows: expected {spec['test']}, got {n_test}"
-        print(f"[{anatomy}] row counts OK -- train={n_train} test={n_test}")
+        _check_no_missing_images(anatomy, "Train", spec["train"])
+        _check_no_missing_images(anatomy, "Test", spec["test"])
 
     dm_head = MulticentreLandmarkDataModule(
         images_dir=images_root / "Head",
@@ -536,7 +570,13 @@ def test_multicentre():
     dm_head.setup()
     n_train, n_val, n_test = len(dm_head.train_dataset), len(dm_head.val_dataset), len(dm_head.test_dataset)
     print(f"[Head] loaded train={n_train} val={n_val} test={n_test}")
-    assert n_train > 0 and n_val > 0 and n_test > 0
+    assert n_train + n_val == expected["Head"]["train"], (
+        f"Head loaded train+val={n_train + n_val}, expected {expected['Head']['train']} "
+        f"-- should be unreachable given _check_no_missing_images already passed above"
+    )
+    assert n_test == expected["Head"]["test"], (
+        f"Head loaded test={n_test}, expected {expected['Head']['test']}"
+    )
 
     all_head_records = dm_head.train_dataset.records + dm_head.val_dataset.records
 
@@ -599,12 +639,52 @@ def test_multicentre():
         pixel_center_align=True, rotate_augment=True, scale_augment=True,
     )
     dm_abdomen.setup()
+    n_train_ab = len(dm_abdomen.train_dataset)
+    n_val_ab = len(dm_abdomen.val_dataset)
+    n_test_ab = len(dm_abdomen.test_dataset)
+    print(f"[Abdomen] loaded train={n_train_ab} val={n_val_ab} test={n_test_ab}")
+    assert n_train_ab + n_val_ab == expected["Abdomen"]["train"], (
+        f"Abdomen loaded train+val={n_train_ab + n_val_ab}, expected {expected['Abdomen']['train']}"
+    )
+    assert n_test_ab == expected["Abdomen"]["test"], (
+        f"Abdomen loaded test={n_test_ab}, expected {expected['Abdomen']['test']}"
+    )
     abdomen_records = dm_abdomen.train_dataset.records + dm_abdomen.val_dataset.records
     non_fp = [r for r in abdomen_records if not r["img_name"].startswith("Patient")]
     assert non_fp, "expected at least one non-FP (UCL) Abdomen record"
     tag = dm_abdomen._subject_id(non_fp[0]["img_name"])
     assert tag.startswith("UCL_"), f"expected UCL_ tag with no hc18_ann_csvs, got {tag!r}"
     print(f"[Abdomen, no HC18 lookup] non-FP filename correctly tagged {tag!r}")
+
+    # --- Femur: same no-HC18 check as Abdomen, plus loaded-count check --
+    #     (previously untested by this smoke-test; added per review) ---
+    dm_femur = MulticentreLandmarkDataModule(
+        images_dir=images_root / "Femur",
+        ann_train_csv=ann_root / "Femur_Train.csv",
+        ann_test_csv=ann_root / "Femur_Test.csv",
+        task="fl",
+        img_size=(512, 512), heatmap_size=(64, 64), sigma=4.0,
+        val_fraction=0.1, val_split_seed=42,
+        batch_size=4, num_workers=0, pin_memory=False,
+        pixel_center_align=True, rotate_augment=True, scale_augment=True,
+    )
+    dm_femur.setup()
+    n_train_fl = len(dm_femur.train_dataset)
+    n_val_fl = len(dm_femur.val_dataset)
+    n_test_fl = len(dm_femur.test_dataset)
+    print(f"[Femur] loaded train={n_train_fl} val={n_val_fl} test={n_test_fl}")
+    assert n_train_fl + n_val_fl == expected["Femur"]["train"], (
+        f"Femur loaded train+val={n_train_fl + n_val_fl}, expected {expected['Femur']['train']}"
+    )
+    assert n_test_fl == expected["Femur"]["test"], (
+        f"Femur loaded test={n_test_fl}, expected {expected['Femur']['test']}"
+    )
+    femur_records = dm_femur.train_dataset.records + dm_femur.val_dataset.records
+    non_fp_fl = [r for r in femur_records if not r["img_name"].startswith("Patient")]
+    assert non_fp_fl, "expected at least one non-FP (UCL) Femur record"
+    tag_fl = dm_femur._subject_id(non_fp_fl[0]["img_name"])
+    assert tag_fl.startswith("UCL_"), f"expected UCL_ tag with no hc18_ann_csvs, got {tag_fl!r}"
+    print(f"[Femur, no HC18 lookup] non-FP filename correctly tagged {tag_fl!r}")
 
     print("\nMulticentre data loading OK")
 
