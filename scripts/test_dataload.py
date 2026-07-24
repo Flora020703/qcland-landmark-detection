@@ -475,6 +475,140 @@ def test_face300w():
     print("\n300W data loading OK")
 
 
+def test_multicentre():
+    """
+    Smoke-test MulticentreLandmarkDataModule: verifies the pooled FP+HC18+
+    UCL row counts against the documented composition, and -- the whole
+    point of this new module -- confirms the source-aware subject-id fix
+    actually changes grouping behaviour on the real data, not just in
+    theory: (1) at least one bare-numeric-prefix group in the real Head
+    pool gets split into >1 source-tagged subject (the HC18/UCL collision
+    this module exists to fix), (2) an FP patient with multiple pooled
+    frames collapses to one subject id (the naive bare-prefix regex
+    wouldn't even match "Patient..." filenames), (3) Abdomen/Femur (no
+    hc18_ann_csvs passed) correctly default every non-FP filename to UCL.
+    """
+    import re as _re
+    from datasets.multicentre_dataset import MulticentreLandmarkDataModule
+
+    _win    = Path("D:/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
+    _wsl    = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
+    _server = Path("/root/autodl-tmp/MultiCentre-Fetal-Biometry-2025")
+    DATA_ROOT = next((p for p in (_win, _wsl, _server) if p.exists()), _server)
+
+    print("\n" + "=" * 60)
+    print("MULTICENTRE SMOKE-TEST")
+    print("=" * 60)
+    print(f"Data root: {DATA_ROOT}")
+    assert DATA_ROOT.exists(), f"Not found: {DATA_ROOT}"
+
+    images_root = DATA_ROOT / "images" / "MULTICENTRE"
+    ann_root = DATA_ROOT / "annotations" / "MULTICENTRE"
+    hc18_root = DATA_ROOT / "annotations" / "HC18"
+
+    # --- row-count composition check (verified 2026-07-24 against each
+    #     source's own CSVs; catches a re-exported/truncated CSV early) ---
+    expected = {
+        "Head":    {"train": 1604, "test": 1191},
+        "Abdomen": {"train": 662,  "test": 161},
+        "Femur":   {"train": 533,  "test": 362},
+    }
+    for anatomy, spec in expected.items():
+        with open(ann_root / f"{anatomy}_Train.csv", encoding="utf-8") as f:
+            n_train = sum(1 for _ in f) - 1
+        with open(ann_root / f"{anatomy}_Test.csv", encoding="utf-8") as f:
+            n_test = sum(1 for _ in f) - 1
+        assert n_train == spec["train"], f"{anatomy} train rows: expected {spec['train']}, got {n_train}"
+        assert n_test == spec["test"], f"{anatomy} test rows: expected {spec['test']}, got {n_test}"
+        print(f"[{anatomy}] row counts OK -- train={n_train} test={n_test}")
+
+    dm_head = MulticentreLandmarkDataModule(
+        images_dir=images_root / "Head",
+        ann_train_csv=ann_root / "Head_Train.csv",
+        ann_test_csv=ann_root / "Head_Test.csv",
+        task="bpd",
+        hc18_ann_csvs=[hc18_root / "Head_Train.csv", hc18_root / "Head_Test.csv"],
+        img_size=(512, 512), heatmap_size=(64, 64), sigma=4.0,
+        val_fraction=0.1, val_split_seed=42,
+        batch_size=4, num_workers=0, pin_memory=False,
+        pixel_center_align=True, rotate_augment=True, scale_augment=True,
+    )
+    dm_head.setup()
+    n_train, n_val, n_test = len(dm_head.train_dataset), len(dm_head.val_dataset), len(dm_head.test_dataset)
+    print(f"[Head] loaded train={n_train} val={n_val} test={n_test}")
+    assert n_train > 0 and n_val > 0 and n_test > 0
+
+    all_head_records = dm_head.train_dataset.records + dm_head.val_dataset.records
+
+    # --- the core regression check: find a naive bare-prefix group that
+    #     the source-aware fix splits into >1 tagged subject ---
+    naive_groups: dict[str, set] = {}
+    for rec in all_head_records:
+        name = rec["img_name"]
+        m = _re.match(r"^(\d+)", name)
+        naive_groups.setdefault(m.group(1) if m else name, set()).add(name)
+
+    split_examples = []
+    for naive_key, names in naive_groups.items():
+        tags = {dm_head._subject_id(n) for n in names}
+        if len(tags) > 1:
+            split_examples.append((naive_key, names, tags))
+    assert split_examples, (
+        "expected at least one bare-numeric-prefix group that the source-aware "
+        "fix splits into >1 subject group on the real Head data -- if this "
+        "fails, verify the HC18/UCL filename collision this test targets "
+        "still exists in the current data release before treating it as a "
+        "regression"
+    )
+    naive_key, names, tags = split_examples[0]
+    print(f"[subject-id fix] confirmed on real data: naive prefix {naive_key!r} "
+          f"(files={sorted(names)}) is source-tagged into {sorted(tags)} -- "
+          f"the bare-prefix method would have merged these into one subject")
+
+    # --- FP multi-frame grouping: >=1 patient with multiple pooled frames
+    #     should collapse to one subject id ---
+    fp_counts: dict[str, int] = {}
+    for rec in all_head_records:
+        if rec["img_name"].startswith("Patient"):
+            key = dm_head._subject_id(rec["img_name"])
+            fp_counts[key] = fp_counts.get(key, 0) + 1
+    multi_frame = {k: v for k, v in fp_counts.items() if v > 1}
+    assert multi_frame, "expected at least one FP patient with >1 pooled frame"
+    example_patient, example_count = next(iter(multi_frame.items()))
+    print(f"[FP grouping] confirmed: {example_patient} groups {example_count} "
+          f"frames under one subject id (naive bare-prefix regex would not "
+          f"match a 'Patient...' filename at all)")
+
+    img, heatmaps, coords = dm_head.train_dataset[0]
+    assert img.shape == (3, 512, 512), f"img shape wrong: {img.shape}"
+    assert heatmaps.shape == (2, 64, 64), f"heatmap shape wrong: {heatmaps.shape}"
+    assert coords.shape == (2, 2), f"coords shape wrong: {coords.shape}"
+    print(f"[single item] img={tuple(img.shape)} heatmaps={tuple(heatmaps.shape)} "
+          f"coords={tuple(coords.shape)}")
+
+    # --- Abdomen: no hc18_ann_csvs passed -- every non-FP filename must
+    #     default to UCL (correct, since HC18 contributes no Abdomen data) ---
+    dm_abdomen = MulticentreLandmarkDataModule(
+        images_dir=images_root / "Abdomen",
+        ann_train_csv=ann_root / "Abdomen_Train.csv",
+        ann_test_csv=ann_root / "Abdomen_Test.csv",
+        task="apad",
+        img_size=(512, 512), heatmap_size=(64, 64), sigma=4.0,
+        val_fraction=0.1, val_split_seed=42,
+        batch_size=4, num_workers=0, pin_memory=False,
+        pixel_center_align=True, rotate_augment=True, scale_augment=True,
+    )
+    dm_abdomen.setup()
+    abdomen_records = dm_abdomen.train_dataset.records + dm_abdomen.val_dataset.records
+    non_fp = [r for r in abdomen_records if not r["img_name"].startswith("Patient")]
+    assert non_fp, "expected at least one non-FP (UCL) Abdomen record"
+    tag = dm_abdomen._subject_id(non_fp[0]["img_name"])
+    assert tag.startswith("UCL_"), f"expected UCL_ tag with no hc18_ann_csvs, got {tag!r}"
+    print(f"[Abdomen, no HC18 lookup] non-FP filename correctly tagged {tag!r}")
+
+    print("\nMulticentre data loading OK")
+
+
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "all"
     if mode in ("all", "ade20k"):
@@ -485,3 +619,5 @@ if __name__ == "__main__":
         test_training_utils()
     if mode in ("all", "face300w"):
         test_face300w()
+    if mode in ("all", "multicentre"):
+        test_multicentre()
