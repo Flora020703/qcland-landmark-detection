@@ -173,6 +173,7 @@ def compute_nme(
     heatmap_size: tuple[int, int],
     img_size: tuple[int, int],
     norm_pair: tuple[int, int] = (0, 1),
+    endpoint_order_invariant: bool = False,
 ) -> torch.Tensor:
     """
     Normalised Mean Error (NME) per sample, normalised by the Euclidean
@@ -187,13 +188,31 @@ def compute_nme(
     using eye-centre distance would make NME numbers incomparable to
     published 300W baselines.
 
+    MODIFIED: endpoint_order_invariant (default False, preserves prior
+    behaviour for 300W and any other caller). When True, matches
+    Di Vece et al.'s published fetal-endpoint NME exactly:
+        NME = min(d_std, d_swap) / (2 * ||gt_0 - gt_1||),
+    where d_std/d_swap are the summed two-endpoint errors under the
+    identity vs. swapped predicted-to-GT correspondence. Ground-truth
+    endpoints are canonicalised left-to-right by x-coordinate in the
+    dataset pipeline (datasets/landmark_dataset.py), but predicted
+    endpoints are NOT re-sorted after heatmap_to_coords() decodes them —
+    they keep whichever query channel produced them. So a query-channel
+    "crossover" (query 0's peak landing right of query 1's) is exactly
+    what this flag is for: it lets NME resolve that crossover the same
+    way the published baseline does, instead of penalising it as a
+    coordinate error. Only defined for N=2; raises if N != 2.
+
     Args:
         pred_coords: (B, N, 2) in heatmap pixel space
         gt_coords:   (B, N, 2) in heatmap pixel space
         heatmap_size: (H, W) of the heatmap
         img_size:     (H, W) of the model input image
         norm_pair:    indices of the two GT landmarks whose distance is
-                      used as the normaliser.
+                      used as the normaliser. Ignored (must be (0, 1))
+                      when endpoint_order_invariant=True.
+        endpoint_order_invariant: use the published swap-min two-endpoint
+                      formula instead of the fixed-channel formula.
 
     Returns:
         nme: (B,) NME per sample
@@ -205,6 +224,25 @@ def compute_nme(
     scale = pred_coords.new_tensor([iw / hm_w, ih / hm_h])
     pred_img = pred_coords * scale    # (B, N, 2)
     gt_img   = gt_coords   * scale   # (B, N, 2)
+
+    if endpoint_order_invariant:
+        n_landmarks = pred_img.shape[1]
+        if n_landmarks != 2:
+            raise ValueError(
+                "endpoint_order_invariant=True is only defined for N=2 "
+                f"two-endpoint fetal measurements, got N={n_landmarks}."
+            )
+        err_std = (
+            (pred_img[:, 0] - gt_img[:, 0]).norm(dim=-1)
+            + (pred_img[:, 1] - gt_img[:, 1]).norm(dim=-1)
+        )
+        err_swap = (
+            (pred_img[:, 0] - gt_img[:, 1]).norm(dim=-1)
+            + (pred_img[:, 1] - gt_img[:, 0]).norm(dim=-1)
+        )
+        diameter = (gt_img[:, 0] - gt_img[:, 1]).norm(dim=-1).clamp(min=1.0)
+        nme_per_sample = torch.minimum(err_std, err_swap) / (2.0 * diameter)
+        return nme_per_sample
 
     # normaliser: Euclidean distance between the two configured GT landmarks
     i0, i1 = norm_pair
@@ -222,6 +260,7 @@ def compute_pixel_error(
     gt_coords: torch.Tensor,
     heatmap_size: tuple[int, int],
     img_size: tuple[int, int],
+    endpoint_order_invariant: bool = False,
 ) -> torch.Tensor:
     """
     Mean per-landmark Euclidean pixel error per sample, in model-input
@@ -231,14 +270,39 @@ def compute_pixel_error(
     function (not folded into compute_nme's return) so existing
     compute_nme call sites are untouched.
 
+    MODIFIED: endpoint_order_invariant (default False) — when True, uses
+    the SAME identity-vs-swap correspondence choice as compute_nme's
+    swap-min formula (whichever pairing gives the smaller summed distance
+    for that sample), so this stays consistent with a swap-min NME instead
+    of silently reporting a fixed-channel distance while NME reports a
+    swap-corrected one. Only defined for N=2, mirroring compute_nme.
+
     Returns:
-        pixel_error: (B,) mean pixel error per sample
+        pixel_error: (B,) mean per-landmark pixel error per sample
     """
     hm_h, hm_w = heatmap_size
     ih, iw = img_size
     scale = pred_coords.new_tensor([iw / hm_w, ih / hm_h])
     pred_img = pred_coords * scale
     gt_img = gt_coords * scale
+
+    if endpoint_order_invariant:
+        n_landmarks = pred_img.shape[1]
+        if n_landmarks != 2:
+            raise ValueError(
+                "endpoint_order_invariant=True is only defined for N=2 "
+                f"two-endpoint fetal measurements, got N={n_landmarks}."
+            )
+        err_std = (
+            (pred_img[:, 0] - gt_img[:, 0]).norm(dim=-1)
+            + (pred_img[:, 1] - gt_img[:, 1]).norm(dim=-1)
+        )
+        err_swap = (
+            (pred_img[:, 0] - gt_img[:, 1]).norm(dim=-1)
+            + (pred_img[:, 1] - gt_img[:, 0]).norm(dim=-1)
+        )
+        return torch.minimum(err_std, err_swap) / n_landmarks
+
     return (pred_img - gt_img).norm(dim=-1).mean(dim=-1)
 
 
@@ -266,6 +330,12 @@ class LandmarkDetection(LightningModule):
         num_landmarks: int = 2,
         heatmap_size: tuple[int, int] = (64, 64),
         nme_norm_pair: tuple[int, int] = (0, 1),  # MODIFIED: (36, 45) for 300W inter-ocular NME
+        # MODIFIED: opt-in published-compatible swap-min NME for two-endpoint
+        # fetal tasks (matches Di Vece et al.'s BiometryNet baseline metric
+        # exactly, see compute_nme()'s docstring). Explicit per-config flag,
+        # default False so existing behaviour (incl. 300W, which is N=68 and
+        # must never set this) is unchanged unless a fetal config opts in.
+        endpoint_order_invariant_nme: bool = False,
         # Attention mask annealing — disabled initially; add as ablation later
         attn_mask_annealing_enabled: bool = False,
         attn_mask_annealing_start_steps: Optional[List[int]] = None,
@@ -321,6 +391,13 @@ class LandmarkDetection(LightningModule):
         self.heatmap_size = heatmap_size
         self.num_landmarks = num_landmarks
         self.nme_norm_pair = tuple(nme_norm_pair)
+        self.endpoint_order_invariant_nme = endpoint_order_invariant_nme
+        if endpoint_order_invariant_nme and num_landmarks != 2:
+            raise ValueError(
+                "endpoint_order_invariant_nme=True is only valid for "
+                f"two-endpoint fetal tasks (num_landmarks=2), got "
+                f"num_landmarks={num_landmarks}. Do not enable this for 300W."
+            )
         self.loss_type   = loss_type
         self.alpha       = alpha
         self.temperature = temperature
@@ -334,6 +411,11 @@ class LandmarkDetection(LightningModule):
         self._val_nme:  list[float] = []
         self._test_nme: list[float] = []
         self._test_pixel_error: list[float] = []
+        # MODIFIED: raw (image-pixel-space) coordinates, dumped alongside NME
+        # so per-image results can be re-scored offline under a different NME
+        # definition later without re-running inference on the checkpoint.
+        self._test_pred_coords: list = []
+        self._test_gt_coords: list = []
 
         self.save_hyperparameters(ignore=["_class_path", "network"])
 
@@ -453,6 +535,7 @@ class LandmarkDetection(LightningModule):
         nme_per_sample = compute_nme(
             pred_coords, gt_coords, self.heatmap_size, self.img_size,
             norm_pair=self.nme_norm_pair,
+            endpoint_order_invariant=self.endpoint_order_invariant_nme,
         )                                  # (B,)
         acc = self._test_nme if log_prefix == "test" else self._val_nme
         acc.extend(nme_per_sample.tolist())
@@ -460,8 +543,18 @@ class LandmarkDetection(LightningModule):
         if log_prefix == "test" and self.test_nme_dump_path:
             pixel_error = compute_pixel_error(
                 pred_coords, gt_coords, self.heatmap_size, self.img_size,
+                endpoint_order_invariant=self.endpoint_order_invariant_nme,
             )
             self._test_pixel_error.extend(pixel_error.tolist())
+            # MODIFIED: also stash raw coordinates (image-pixel space, same
+            # frame as pixel_error) so per-image results can be re-scored
+            # offline under a different NME definition later without
+            # re-running inference on the checkpoint.
+            hm_h, hm_w = self.heatmap_size
+            ih, iw = self.img_size
+            coord_scale = pred_coords.new_tensor([iw / hm_w, ih / hm_h])
+            self._test_pred_coords.extend((pred_coords * coord_scale).tolist())
+            self._test_gt_coords.extend((gt_coords * coord_scale).tolist())
 
     def on_validation_epoch_end(self):
         if not self._val_nme:
@@ -489,15 +582,33 @@ class LandmarkDetection(LightningModule):
         nme = sum(self._test_nme) / len(self._test_nme)
         self.log("metrics/test_nme", nme, prog_bar=True)
         if self.test_nme_dump_path:
+            # MODIFIED: also dump raw (image-pixel-space) pred/gt coordinates
+            # per landmark, not just nme/pixel_error — enables offline
+            # re-scoring under a different NME definition later without
+            # re-running inference on the checkpoint (see eval_step).
             with open(self.test_nme_dump_path, "w") as f:
-                f.write("index,nme,pixel_error\n")
+                header = ["index", "nme", "pixel_error"]
+                for j in range(self.num_landmarks):
+                    header += [f"pred_x{j}", f"pred_y{j}", f"gt_x{j}", f"gt_y{j}"]
+                f.write(",".join(header) + "\n")
                 for i, v in enumerate(self._test_nme):
                     pe = self._test_pixel_error[i] if i < len(self._test_pixel_error) else ""
-                    f.write(f"{i},{v:.8f},{pe if pe == '' else f'{pe:.4f}'}\n")
+                    row = [str(i), f"{v:.8f}", "" if pe == "" else f"{pe:.4f}"]
+                    if i < len(self._test_pred_coords):
+                        pred_c = self._test_pred_coords[i]
+                        gt_c = self._test_gt_coords[i]
+                        for j in range(self.num_landmarks):
+                            row += [
+                                f"{pred_c[j][0]:.8f}", f"{pred_c[j][1]:.8f}",
+                                f"{gt_c[j][0]:.8f}", f"{gt_c[j][1]:.8f}",
+                            ]
+                    f.write(",".join(row) + "\n")
             rank_zero_info(
                 f"{bold_green}Per-sample NME dumped to {self.test_nme_dump_path} "
                 f"(n={len(self._test_nme)}){reset}"
             )
         self._test_nme.clear()
         self._test_pixel_error.clear()
+        self._test_pred_coords.clear()
+        self._test_gt_coords.clear()
         rank_zero_info(f"{bold_green}Test NME: {nme * 100:.2f}%{reset}")

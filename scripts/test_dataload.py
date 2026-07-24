@@ -230,6 +230,89 @@ def test_training_utils():
         f"NME value wrong: {nme_shifted[0].item():.5f} vs {expected_nme:.5f}"
     print(f"[compute_nme]       4-px shift → NME={nme_shifted[0].item():.4f} (expected {expected_nme:.4f}) OK")
 
+    # --- endpoint_order_invariant=True: published (Di Vece et al.) swap-min
+    #     two-endpoint NME. Uses the same B,N=2 fake heatmaps as above. ---
+
+    # (1) same channel order as GT: swap-min result must equal the
+    #     fixed-channel result (no crossover to resolve).
+    nme_fixed = compute_nme(pred_coords, coords, heatmap_size, img_size)
+    nme_swapmin_same_order = compute_nme(
+        pred_coords, coords, heatmap_size, img_size,
+        endpoint_order_invariant=True,
+    )
+    assert torch.allclose(nme_fixed, nme_swapmin_same_order, atol=1e-6), (
+        f"swap-min should equal fixed-channel NME when channel order "
+        f"already matches GT: {nme_swapmin_same_order} vs {nme_fixed}"
+    )
+    print("[compute_nme]       swap-min == fixed-channel when order matches OK")
+
+    # (2) predicted endpoints swapped (channel 0 <-> channel 1): swap-min
+    #     result must be IDENTICAL to the unswapped case (it resolves the
+    #     crossover), while the fixed-channel metric must increase a lot
+    #     (it penalises the crossover as if it were a coordinate error).
+    pred_coords_swapped = pred_coords.flip(dims=[1])   # (B, N, 2), N=2 swap
+    nme_swapmin_swapped = compute_nme(
+        pred_coords_swapped, coords, heatmap_size, img_size,
+        endpoint_order_invariant=True,
+    )
+    assert torch.allclose(nme_swapmin_swapped, nme_swapmin_same_order, atol=1e-6), (
+        f"swap-min must be invariant to which predicted channel holds which "
+        f"endpoint: {nme_swapmin_swapped} vs {nme_swapmin_same_order}"
+    )
+    nme_fixed_swapped = compute_nme(pred_coords_swapped, coords, heatmap_size, img_size)
+    assert nme_fixed_swapped.min().item() > nme_fixed.max().item(), (
+        "fixed-channel NME should increase sharply once predicted "
+        f"endpoints are swapped: {nme_fixed_swapped} vs baseline {nme_fixed}"
+    )
+    print("[compute_nme]       swap-min invariant to channel swap; "
+          "fixed-channel is NOT (penalises it) OK")
+
+    # Pixel error must make the same correspondence choice as swap-min NME.
+    from training.landmark_detection import compute_pixel_error
+    pe_same = compute_pixel_error(
+        pred_coords, coords, heatmap_size, img_size,
+        endpoint_order_invariant=True,
+    )
+    pe_swapped = compute_pixel_error(
+        pred_coords_swapped, coords, heatmap_size, img_size,
+        endpoint_order_invariant=True,
+    )
+    assert torch.allclose(pe_same, pe_swapped, atol=1e-6), (
+        "swap-min pixel error must be invariant to predicted-channel swap: "
+        f"{pe_same} vs {pe_swapped}"
+    )
+    print("[compute_pixel_error] swap-min correspondence matches NME and is "
+          "channel-swap invariant OK")
+
+    # (3) per-sample manual computation matches the batched result (sample 0
+    #     of the "4-px shift" case: lm-0 shifted +4hm-px in x, lm-1 exact).
+    d_std_manual = (
+        (pred_coords[0, 0] - coords[0, 0]).norm()
+        + (pred_coords[0, 1] - coords[0, 1]).norm()
+    ) * (512 / 64)   # heatmap px -> image px
+    d_swap_manual = (
+        (pred_coords[0, 0] - coords[0, 1]).norm()
+        + (pred_coords[0, 1] - coords[0, 0]).norm()
+    ) * (512 / 64)
+    diameter_manual = expected_norm  # already computed in image-pixel space above
+    expected_swapmin = min(d_std_manual.item(), d_swap_manual.item()) / (2.0 * diameter_manual)
+    assert abs(nme_swapmin_same_order[0].item() - expected_swapmin) < 1e-4, (
+        f"batched swap-min NME doesn't match manual per-sample computation: "
+        f"{nme_swapmin_same_order[0].item():.5f} vs {expected_swapmin:.5f}"
+    )
+    print("[compute_nme]       batched swap-min matches manual per-sample calc OK")
+
+    # (4) N != 2 (the 300W path) must reject endpoint_order_invariant=True
+    #     outright, rather than silently computing something wrong -- 300W
+    #     must never pass this flag, and this guard is what enforces that.
+    coords68 = torch.randn(B, 68, 2)
+    try:
+        compute_nme(coords68, coords68, heatmap_size, img_size, endpoint_order_invariant=True)
+        raise AssertionError("expected ValueError for N=68 with endpoint_order_invariant=True")
+    except ValueError:
+        print("[compute_nme]       endpoint_order_invariant=True correctly "
+              "rejects N!=2 (300W path unaffected) OK")
+
     print("\nTraining utils OK")
 
 

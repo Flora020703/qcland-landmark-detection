@@ -167,6 +167,17 @@ def main() -> None:
     # (N=68), which needs norm_pair=(36,45) (outer eye corners). Omitting
     # this here previously produced a nonsensical ~23% "NME" on 300W.
     norm_pair = tuple(cfgs[0]["model"]["init_args"].get("nme_norm_pair", (0, 1)))
+    # MODIFIED: same reasoning for endpoint_order_invariant_nme -- this
+    # standalone script previously computed a fixed-channel NME for every
+    # task (see training/landmark_detection.py's compute_nme() docstring:
+    # the fixed-channel metric is NOT the same as Di Vece et al.'s
+    # published swap-min two-endpoint NME). Reads the flag from config so
+    # fetal-task configs that opt in (endpoint_order_invariant_nme: true)
+    # get the published-compatible metric here too, not just in the main
+    # LightningCLI training entrypoint.
+    endpoint_order_invariant = bool(
+        cfgs[0]["model"]["init_args"].get("endpoint_order_invariant_nme", False)
+    )
 
     dm = build_datamodule(cfgs[0])
     dm.setup()
@@ -217,7 +228,11 @@ def main() -> None:
                 avg_pred = summed / len(models)
                 avg_coords = heatmap_to_coords(avg_pred)
 
-            nme = compute_nme(avg_coords, gt_coords, heatmap_size, img_size, norm_pair=norm_pair)
+            nme = compute_nme(
+                avg_coords, gt_coords, heatmap_size, img_size,
+                norm_pair=norm_pair,
+                endpoint_order_invariant=endpoint_order_invariant,
+            )
             all_nme.extend(nme.cpu().tolist())
 
     mean_nme = sum(all_nme) / len(all_nme)

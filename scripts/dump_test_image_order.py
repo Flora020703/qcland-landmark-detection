@@ -4,12 +4,10 @@
 # test split, in the exact order test_dataloader() iterates (shuffle=False,
 # so this order is deterministic and stable across runs of the same config).
 #
-# training/landmark_detection.py's test_nme_dump_path only records
-# "index,nme,pixel_error" (integer position in iteration order, not
-# filename) -- this script provides the other half of that mapping, so
-# per-image results can be joined back to actual images for outlier
-# inspection, paired bootstrap, or re-scoring under a different NME
-# definition later.
+# training/landmark_detection.py's test_nme_dump_path records metrics and
+# coordinates keyed by integer iteration index, but not the image name.
+# This script provides the index-to-image mapping so those rows can be
+# joined back to actual images for outlier inspection and paired analysis.
 #
 # Usage:
 #   python3 scripts/dump_test_image_order.py --config configs/landmark/bpd_resolution_screening.yaml \
@@ -17,6 +15,7 @@
 # ---------------------------------------------------------------
 
 import argparse
+import csv
 import importlib
 import sys
 from pathlib import Path
@@ -48,10 +47,11 @@ def main() -> None:
     records = dm.test_dataset.records
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(out_path, "w") as f:
-        f.write("index,filename\n")
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["index", "filename"])
         for i, rec in enumerate(records):
-            f.write(f"{i},{Path(rec['img_path']).name}\n")
+            writer.writerow([i, Path(rec["img_path"]).name])
 
     print(f"[OK] wrote {len(records)} (index,filename) rows to {out_path}")
 

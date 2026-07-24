@@ -32,11 +32,16 @@
 # seeds if the result is to be leaned on for a real methodological
 # claim). Report as a single-seed sensitivity check.
 #
-# NOTE: compute_nme() here is still the fixed-channel metric, not Di
-# Vece's swap-min (permutation-invariant) metric -- the 256-vs-512
-# internal comparison is still fair (identical metric both rungs), but
-# before formally reporting in the thesis, re-test both checkpoints under
-# whatever fetal NME definition is finally adopted (no retraining needed).
+# NOTE: this config sets `model.init_args.endpoint_order_invariant_nme:
+# true` -- validation, early stopping, AND best-checkpoint selection all
+# use Di Vece et al.'s published swap-min two-endpoint NME from the start
+# of training, not the fixed-channel formula. This was a deliberate fix
+# (2026-07-24, caught in review): training under one metric and only
+# switching at final test time would leave checkpoint selection itself
+# biased toward the wrong metric, unfixable after the fact short of
+# retraining. Per-image dumps (see the ablation script) also store raw
+# pred/gt coordinates, so results can still be re-scored offline under a
+# further-revised NME definition later without re-running inference.
 # ---------------------------------------------------------------
 
 seed_everything: 2024
@@ -75,6 +80,14 @@ model:
   class_path: training.landmark_detection.LandmarkDetection
   init_args:
     num_landmarks: 2
+    # MODIFIED: use the published-compatible swap-min two-endpoint NME
+    # (matches Di Vece et al.'s BiometryNet baseline metric exactly) for
+    # validation, early stopping, AND best-checkpoint selection from the
+    # start of training -- not just at final test time. Training under the
+    # fixed-channel metric and only switching metrics afterward would leave
+    # checkpoint selection itself biased toward the wrong metric, with no
+    # way to fix that after the fact short of retraining.
+    endpoint_order_invariant_nme: true
     loss_type: hybrid
     alpha: 5.0
     temperature: 10.0

@@ -19,18 +19,23 @@
 # controlled experiment -- an unremoved confound in every EoMT-vs-HRNet
 # comparison so far.
 #
-# NOTE: compute_nme() here is still the fixed-channel metric, not Di Vece's
-# swap-min (permutation-invariant) metric -- the 256-vs-512 internal
-# comparison is still fair (identical metric both rungs), but before
-# formally reporting in the thesis, re-test both checkpoints under
-# whatever fetal NME definition is finally adopted (no retraining needed --
-# per-image dumps below make this cheap).
+# NOTE: the config sets `endpoint_order_invariant_nme: true`, so
+# validation, early stopping, AND best-checkpoint selection all use Di
+# Vece et al.'s published swap-min two-endpoint NME from the start of
+# training (fixed 2026-07-24 after review -- training under one metric
+# and switching only at final test time would leave checkpoint selection
+# itself biased toward the wrong metric, unfixable short of retraining).
+# compute_pixel_error() is called with the same endpoint_order_invariant
+# flag, so the per-image pixel_error column stays consistent with NME
+# (no fixed-channel-vs-swap-min mismatch between the two columns).
 #
-# Each test run also dumps per-image NME (via --model.init_args.
-# test_nme_dump_path) and an (index -> filename) mapping (via
-# scripts/dump_test_image_order.py), since 256/512 share the same test
-# images and this is nearly free -- supports later outlier inspection,
-# paired bootstrap, and re-scoring once the final NME metric is settled.
+# Each test run also dumps per-image NME + pixel_error + raw pred/gt
+# coordinates (via --model.init_args.test_nme_dump_path) and an
+# (index -> filename) mapping (via scripts/dump_test_image_order.py),
+# since 256/512 share the same test images and this is nearly free --
+# supports later outlier inspection, paired bootstrap, AND re-scoring
+# under a further-revised NME definition without re-running inference
+# (the raw coordinates make that possible offline from the CSV alone).
 #
 # Prerequisite: data must be on the server first --
 #   /root/autodl-tmp/images/UCL/Head/
@@ -140,6 +145,7 @@ checks = [
     ('heatmap_size (data)',  data['heatmap_size'],            [64, 64]),
     ('task',                 data.get('task'),               'bpd'),
     ('loss_type',            m['loss_type'],                 'hybrid'),
+    ('swap-min fetal NME',   m.get('endpoint_order_invariant_nme', False), True),
     ('heatmap_head',         n['heatmap_head'],              'deconv_v2'),
     ('freeze_backbone',      n['freeze_backbone'],           False),
     ('num_blocks',           n['num_blocks'],                3),
