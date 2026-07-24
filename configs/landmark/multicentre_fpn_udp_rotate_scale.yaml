@@ -1,0 +1,117 @@
+# ---------------------------------------------------------------
+# MODIFIED: Multicentre base config — the DINOv2/DINOv3 matched-protocol
+# reference configuration (DeconvHeadV2 + FPN + UDP + rotate+scale),
+# same recipe as the 5-anatomy UCL-only DINOv2-vs-DINOv3 comparison,
+# now pointed at the pooled Multicentre (FP+HC18+UCL) data via
+# datasets.multicentre_dataset.MulticentreLandmarkDataModule instead of
+# HeadLandmarkDataModule. No component re-ablation on Multicentre (per
+# the scope decision in project memory / 04_experimental_setup.tex's
+# sec:setup-evidence-scope) -- this evaluates the already-fixed pipeline,
+# it does not re-derive it.
+#
+# This is a TEMPLATE: images_dir / ann_train_csv / ann_test_csv / task /
+# hc18_ann_csvs / backbone_name / seed_everything / loader_seed are all
+# placeholders overwritten per (anatomy, backbone, seed) by
+# ablation/scripts/run_multicentre_5seed_ablation.sh -- do not train
+# directly from this file as-is.
+#
+# endpoint_order_invariant_nme: true -- per the locked fetal-NME-metric
+# decision (project memory), all NEW experiments (this one included) use
+# swap-min NME for validation/early-stopping/checkpoint-selection AND
+# record fixed-channel NME as a secondary metric at test time (via the
+# ablation script's dual `test` invocations), connecting Multicentre to
+# the historical fixed-channel EoMT series without retroactively
+# reprocessing it.
+# ---------------------------------------------------------------
+
+seed_everything: 2024
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/multicentre-placeholder
+        filename: multicentre-placeholder_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: multicentre-placeholder
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    endpoint_order_invariant_nme: true
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size: [64, 64]
+        use_fpn: true
+        fpn_layers: [4, 8, 12]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.multicentre_dataset.MulticentreLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/MULTICENTRE/Head
+    ann_train_csv: /root/autodl-tmp/annotations/MULTICENTRE/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/MULTICENTRE/Head_Test.csv
+    task: bpd
+    hc18_ann_csvs:
+      - /root/autodl-tmp/annotations/HC18/Head_Train.csv
+      - /root/autodl-tmp/annotations/HC18/Head_Test.csv
+    img_size: [512, 512]
+    heatmap_size: [64, 64]
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
+    pixel_center_align: true
+    rotate_augment: true
+    scale_augment: true
+    loader_seed: 2024
