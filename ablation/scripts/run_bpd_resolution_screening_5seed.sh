@@ -85,6 +85,20 @@ fi
 
 mkdir -p checkpoints "$(dirname "$DONE_MARKER")"
 touch "$DONE_MARKER"
+mkdir -p "$BACKUP_ROOT"
+
+# Eight new runs retain best+final checkpoints. Abort early if the data disk
+# has less than 6 GiB free rather than failing halfway through a checkpoint
+# write. This is a safety floor, not a prediction of exact usage.
+AVAILABLE_KB=$(df -Pk "$BACKUP_ROOT" | awk 'NR==2 {print $4}')
+MIN_AVAILABLE_KB=$((6 * 1024 * 1024))
+if [ "$AVAILABLE_KB" -lt "$MIN_AVAILABLE_KB" ]; then
+    echo "[ERROR] Less than 6 GiB free on checkpoint disk: $BACKUP_ROOT"
+    df -h "$BACKUP_ROOT"
+    exit 1
+fi
+echo "[OK] checkpoint disk preflight"
+df -h "$BACKUP_ROOT"
 
 # --- Pre-seed seed=2024's already-known results (from the original
 #     single-seed screening run + its follow-up fixed-channel re-test,
@@ -157,7 +171,10 @@ for RES in "${RESOLUTIONS[@]}"; do
     fi
 
     RUN_NAME="${RUN_GROUP}-res${RES}-seed${SEED}"
-    RUN_DIR="checkpoints/${RUN_GROUP}/res${RES}/seed${SEED}"
+    # Write large checkpoint files directly to the data disk. The system
+    # disk has insufficient headroom for eight runs; only the small TSV,
+    # DONE marker and top-level log remain under /root/eomt.
+    RUN_DIR="${BACKUP_ROOT}/res${RES}/seed${SEED}"
     TMP_CFG="/tmp/${RUN_GROUP}_res${RES}_seed${SEED}.yaml"
 
     echo ""
@@ -261,8 +278,10 @@ PYEOF
     LAST_SRC="${RUN_DIR}/last.ckpt"
     FINAL_CKPT="${RUN_DIR}/${RUN_NAME}_final.ckpt"
     if [ -f "${LAST_SRC}" ]; then
-        cp "${LAST_SRC}" "${FINAL_CKPT}"
-        echo "[OK] final ckpt saved"
+        # `last.ckpt` is the final training state. Rename it instead of
+        # copying it, avoiding one redundant ~checkpoint-sized file per run.
+        mv "${LAST_SRC}" "${FINAL_CKPT}"
+        echo "[OK] final ckpt saved (last.ckpt renamed, no duplicate copy)"
     else
         echo "[WARN] last.ckpt not found -- skipping final checkpoint"
     fi
@@ -408,9 +427,7 @@ echo "the seed=2024 screening's checkpoint/metric-dependent direction --"
 echo "state this explicitly in the thesis, and report all 5 seeds"
 echo "regardless of outcome (do not add/drop seeds based on results)."
 echo ""
-echo "After reviewing results, move checkpoints off the system disk:"
-echo "  mkdir -p ${BACKUP_ROOT}"
-echo "  mv checkpoints/${RUN_GROUP}/res256 ${BACKUP_ROOT}/"
-echo "  mv checkpoints/${RUN_GROUP}/res512 ${BACKUP_ROOT}/"
+echo "Checkpoints were written directly to the data disk:"
+echo "  ${BACKUP_ROOT}"
 echo ""
 echo "W&B: https://wandb.ai/ucabnx1-ucl/eomt-landmark"
