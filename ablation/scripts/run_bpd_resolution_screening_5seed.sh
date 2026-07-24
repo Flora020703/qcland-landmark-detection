@@ -28,9 +28,11 @@
 #   - swap-min (endpoint_order_invariant_nme=true in the config -- matches
 #     Di Vece et al.'s published BiometryNet formula). This is also what
 #     validation/early-stopping/checkpoint-selection use during training,
-#     consistent with seed=2024's original run and the locked fetal-NME-
-#     metric decision (see project memory) -- do not disable it for
-#     training, only override it for the second, fixed-channel test pass.
+#     consistent with seed=2024's original run. This does not retroactively
+#     replace the historical fixed-channel ablation series; swap-min is kept
+#     here so all five resolution-screening seeds share one training and
+#     checkpoint-selection metric. Override it only for the second,
+#     fixed-channel test pass.
 #   - fixed-channel (this project's historical metric, re-tested post-hoc
 #     via `--model.init_args.endpoint_order_invariant_nme false` on the
 #     SAME per-run generated config -- per Rule 32, never the shared base
@@ -45,12 +47,13 @@
 #     not just two independent per-resolution mean+-SD groups -- same
 #     seed/split/init/everything-but-img_size makes the paired structure
 #     more informative than an unpaired comparison.
-#   - The defensible conclusion, whatever the numbers show, is "no
-#     consistent resolution advantage was detected across the five matched
-#     seeds" -- NEVER "resolution has no effect" (that would need a
-#     pre-specified equivalence margin and an equivalence test, which this
-#     screening was not designed or powered for; n=5 is likely underpowered
-#     for that anyway).
+#   - Let the completed paired results determine the direction. If seed
+#     directions are mixed and the paired CI spans zero, the defensible
+#     wording is "no consistent resolution advantage was detected". If the
+#     results are consistent, report that observed advantage without calling
+#     the resolutions equivalent or claiming a universal causal effect.
+#     "Resolution has no effect" is never supported here: that would require
+#     a pre-specified equivalence margin and an equivalence test.
 #
 # Prerequisite: data must be on the server first --
 #   /root/autodl-tmp/images/UCL/Head/
@@ -85,15 +88,45 @@ touch "$DONE_MARKER"
 
 # --- Pre-seed seed=2024's already-known results (from the original
 #     single-seed screening run + its follow-up fixed-channel re-test,
-#     2026-07-24) -- only if the TSV doesn't already exist, per Rule 15. ---
-if [ ! -f "$RESULTS_TSV" ]; then
-    echo -e "seed\tresolution\tckpt_tag\tswap_min_nme\tfixed_channel_nme" > "$RESULTS_TSV"
-    echo -e "2024\t256\tbest\t7.44\t11.74"  >> "$RESULTS_TSV"
-    echo -e "2024\t256\tfinal\t5.52\t11.68" >> "$RESULTS_TSV"
-    echo -e "2024\t512\tbest\t6.01\t8.30"   >> "$RESULTS_TSV"
-    echo -e "2024\t512\tfinal\t6.88\t11.11" >> "$RESULTS_TSV"
-    echo "[OK] pre-seeded results TSV with seed=2024's known values"
-fi
+#     2026-07-24). Insert each missing row independently so resuming from a
+#     header-only or partially written TSV cannot silently lose seed 2024. ---
+python3 - "$RESULTS_TSV" <<'PYEOF'
+import csv
+import os
+import sys
+
+path = sys.argv[1]
+header = ["seed", "resolution", "ckpt_tag", "swap_min_nme", "fixed_channel_nme"]
+known = [
+    ["2024", "256", "best",  "7.44", "11.74"],
+    ["2024", "256", "final", "5.52", "11.68"],
+    ["2024", "512", "best",  "6.01", "8.30"],
+    ["2024", "512", "final", "6.88", "11.11"],
+]
+
+rows = []
+if os.path.exists(path):
+    with open(path, newline="") as f:
+        reader = csv.reader(f, delimiter="\t")
+        rows = list(reader)
+    if rows and rows[0] != header:
+        raise SystemExit(f"[ERROR] unexpected TSV header in {path}: {rows[0]!r}")
+else:
+    rows = [header]
+
+if not rows:
+    rows = [header]
+present = {(r[0], r[1], r[2]) for r in rows[1:] if len(r) == 5}
+added = 0
+for row in known:
+    if tuple(row[:3]) not in present:
+        rows.append(row)
+        added += 1
+
+with open(path, "w", newline="") as f:
+    csv.writer(f, delimiter="\t", lineterminator="\n").writerows(rows)
+print(f"[OK] seed=2024 rows present in {path} (added {added})")
+PYEOF
 grep -qxF "2024_256" "$DONE_MARKER" || echo "2024_256" >> "$DONE_MARKER"
 grep -qxF "2024_512" "$DONE_MARKER" || echo "2024_512" >> "$DONE_MARKER"
 
@@ -111,7 +144,13 @@ for SEED in "${SEEDS[@]}"; do
 for RES in "${RESOLUTIONS[@]}"; do
 
     PAIR_KEY="${SEED}_${RES}"
-    if grep -qxF "${PAIR_KEY}" "$DONE_MARKER" 2>/dev/null; then
+    TSV_PAIR_ROWS=$(awk -F'\t' -v s="$SEED" -v r="$RES" \
+        'NR>1 && $1==s && $2==r && $3=="best" {b=1} \
+         NR>1 && $1==s && $2==r && $3=="final" {f=1} \
+         END {print b+f}' \
+        "$RESULTS_TSV")
+    if grep -qxF "${PAIR_KEY}" "$DONE_MARKER" 2>/dev/null \
+       && [ "$TSV_PAIR_ROWS" -eq 2 ]; then
         echo ""
         echo "--- SKIP (already completed): seed=${SEED} resolution=${RES} ---"
         continue
@@ -307,7 +346,16 @@ with open(sys.argv[1]) as f:
             "fixed_channel": float(fixed_channel),
         }  # dict keyed by (seed,res,tag) -- de-dupes any accidental repeat row
 
-seeds = sorted({s for (s, r, t) in rows}, key=int)
+seeds = ["0", "42", "123", "2024", "3407"]
+required = {
+    (seed, res, tag)
+    for seed in seeds
+    for res in ("256", "512")
+    for tag in ("best", "final")
+}
+missing = sorted(required - set(rows), key=lambda x: (int(x[0]), int(x[1]), x[2]))
+if missing:
+    raise SystemExit(f"[ERROR] paired summary incomplete; missing rows: {missing}")
 T_975_DF4 = 2.776  # two-sided 95% CI critical value, df=4 (n=5 paired seeds)
 
 for ckpt_tag in ("best", "final"):
@@ -352,15 +400,17 @@ for ckpt_tag in ("best", "final"):
 PYEOF
 
 echo ""
-echo "NOTE: report as 'no consistent resolution advantage detected across"
-echo "the five matched seeds' -- NOT 'resolution has no effect' (that needs"
-echo "a pre-specified equivalence margin + equivalence test, not run here)."
+echo "NOTE: interpret the observed paired directions and CI; do not hard-code"
+echo "a null conclusion before seeing them. Never write 'resolution has no"
+echo "effect' without a pre-specified equivalence margin and equivalence test."
 echo "This 5-seed expansion is a follow-up robustness analysis triggered by"
 echo "the seed=2024 screening's checkpoint/metric-dependent direction --"
 echo "state this explicitly in the thesis, and report all 5 seeds"
 echo "regardless of outcome (do not add/drop seeds based on results)."
 echo ""
 echo "After reviewing results, move checkpoints off the system disk:"
-echo "  mkdir -p ${BACKUP_ROOT} && mv checkpoints/${RUN_GROUP}/res*/seed* ${BACKUP_ROOT}/"
+echo "  mkdir -p ${BACKUP_ROOT}"
+echo "  mv checkpoints/${RUN_GROUP}/res256 ${BACKUP_ROOT}/"
+echo "  mv checkpoints/${RUN_GROUP}/res512 ${BACKUP_ROOT}/"
 echo ""
 echo "W&B: https://wandb.ai/ucabnx1-ucl/eomt-landmark"
