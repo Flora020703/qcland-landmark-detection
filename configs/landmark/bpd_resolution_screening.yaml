@@ -1,7 +1,10 @@
 # ---------------------------------------------------------------
-# MODIFIED: resolution screening base config — the current final adopted
-# pipeline (DeconvHeadV2 + FPN + UDP + rotate+scale, DINOv2 backbone,
-# hybrid loss), identical to bpd_dinov2_fpn_udp_rotate_scale.yaml except
+# MODIFIED: resolution screening base config — the DINOv2 matched-protocol
+# reference configuration (DeconvHeadV2 + FPN + UDP + rotate+scale, DINOv2
+# backbone, hybrid loss) used as the DINOv2 side of the 5-anatomy DINOv2-
+# vs-DINOv3 comparison. NOT called "final adopted pipeline" -- the thesis
+# does not select a single test-set-chosen final pipeline (see Chapter 4's
+# locked scope). Identical to bpd_dinov2_fpn_udp_rotate_scale.yaml except
 # `data.init_args.img_size` (256x256 vs 512x512, overridden per rung by
 # ablation/scripts/run_bpd_resolution_screening.sh). Single seed=2024,
 # matching this project's single-seed screening convention.
@@ -21,13 +24,19 @@
 # Scope (per Rule 30 in feedback_training_pitfalls memory -- do not
 # overclaim beyond exactly what is manipulated/measured here): this
 # screening answers "does input resolution affect test NME under the
-# CURRENT final adopted pipeline, for this one seed" -- it does NOT
-# establish 512x512 (or 256x256) as formally optimal, and does NOT by
-# itself remove the resolution confound from the EoMT-vs-HRNet
+# DINOv2 matched-protocol reference configuration, for this one seed" --
+# it does NOT establish 512x512 (or 256x256) as formally optimal, and does
+# NOT by itself remove the resolution confound from the EoMT-vs-HRNet
 # comparison (that would need this to be reported as a Limitations-
 # section confound either way, plus ideally the same check on more
 # seeds if the result is to be leaned on for a real methodological
 # claim). Report as a single-seed sensitivity check.
+#
+# NOTE: compute_nme() here is still the fixed-channel metric, not Di
+# Vece's swap-min (permutation-invariant) metric -- the 256-vs-512
+# internal comparison is still fair (identical metric both rungs), but
+# before formally reporting in the thesis, re-test both checkpoints under
+# whatever fetal NME definition is finally adopted (no retraining needed).
 # ---------------------------------------------------------------
 
 seed_everything: 2024

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_bpd_resolution_screening.sh — BPD, single-seed (2024) img_size=256x256
-# vs 512x512 screening, on the CURRENT final adopted pipeline (DeconvHeadV2
-# + FPN + UDP + rotate+scale, DINOv2 backbone, hybrid loss). heatmap_size
-# is held fixed at 64x64 for both rungs -- only input resolution varies.
+# vs 512x512 screening, on the DINOv2 matched-protocol reference
+# configuration (DeconvHeadV2 + FPN + UDP + rotate+scale, DINOv2 backbone,
+# hybrid loss) -- NOT called a "final adopted pipeline"; the thesis does
+# not select a single test-set-chosen final pipeline (Chapter 4's locked
+# scope). heatmap_size is held fixed at 64x64 for both rungs -- only
+# input resolution varies.
 #
 # This is a SCREENING, not a full ablation -- single seed only. Per Rule 30
 # (feedback_training_pitfalls memory): report only what is directly
@@ -15,6 +18,19 @@
 # convention") never compared against HRNet's own 256x256 input in a
 # controlled experiment -- an unremoved confound in every EoMT-vs-HRNet
 # comparison so far.
+#
+# NOTE: compute_nme() here is still the fixed-channel metric, not Di Vece's
+# swap-min (permutation-invariant) metric -- the 256-vs-512 internal
+# comparison is still fair (identical metric both rungs), but before
+# formally reporting in the thesis, re-test both checkpoints under
+# whatever fetal NME definition is finally adopted (no retraining needed --
+# per-image dumps below make this cheap).
+#
+# Each test run also dumps per-image NME (via --model.init_args.
+# test_nme_dump_path) and an (index -> filename) mapping (via
+# scripts/dump_test_image_order.py), since 256/512 share the same test
+# images and this is nearly free -- supports later outlier inspection,
+# paired bootstrap, and re-scoring once the final NME metric is settled.
 #
 # Prerequisite: data must be on the server first --
 #   /root/autodl-tmp/images/UCL/Head/
@@ -36,8 +52,10 @@ RUN_GROUP="bpd-resolution-screening"
 RESULTS_TSV="bpd_resolution_screening_results.tsv"
 DONE_MARKER="checkpoints/.bpd_resolution_screening_completed_resolutions.txt"
 
-if [ ! -d /root/autodl-tmp/images/UCL/Head ] || [ ! -f /root/autodl-tmp/annotations/UCL/Head_Train.csv ]; then
-    echo "[ERROR] Head data not found on server -- transfer images/UCL/Head/ and annotations/UCL/Head_*.csv first"
+if [ ! -d /root/autodl-tmp/images/UCL/Head ] \
+   || [ ! -f /root/autodl-tmp/annotations/UCL/Head_Train.csv ] \
+   || [ ! -f /root/autodl-tmp/annotations/UCL/Head_Test.csv ]; then
+    echo "[ERROR] Head images or Train/Test annotations not found on server -- transfer images/UCL/Head/ and annotations/UCL/Head_*.csv first"
     exit 1
 fi
 
@@ -176,6 +194,16 @@ PYEOF
 
     cp "${TMP_CFG}" "${RUN_DIR}/${RUN_NAME}_config.yaml"
 
+    # --- 4b. Dump (index -> filename) mapping for this resolution's test
+    #     split, so per-image NME below can be joined back to actual images
+    #     later (outlier inspection, paired bootstrap, re-scoring under a
+    #     different NME definition once one is finalized). 256/512 share the
+    #     same underlying test CSV/order, but this is dumped per-resolution
+    #     directory to keep each run_dir self-contained.
+    python3 scripts/dump_test_image_order.py \
+        --config "${TMP_CFG}" \
+        --out "${RUN_DIR}/test_image_order.csv"
+
     # --- 5. Test val-best / last checkpoints ---
     for CKPT_TAG in best final; do
         CKPT_PATH="${RUN_DIR}/${RUN_NAME}_${CKPT_TAG}.ckpt"
@@ -186,15 +214,21 @@ PYEOF
         echo ""
         echo "--- Test (${CKPT_TAG} checkpoint): ${CKPT_PATH} ---"
         LOG_FILE="${RUN_DIR}/${RUN_NAME}_${CKPT_TAG}_test_log.txt"
+        PER_IMAGE_CSV="${RUN_DIR}/${RUN_NAME}_${CKPT_TAG}_per_image.csv"
         python3 main_landmark.py test \
             --config "${TMP_CFG}" \
-            --ckpt_path "${CKPT_PATH}" 2>&1 \
+            --ckpt_path "${CKPT_PATH}" \
+            --model.init_args.test_nme_dump_path "${PER_IMAGE_CSV}" 2>&1 \
             | tee "${LOG_FILE}" \
-            | grep -E "test_nme|Test NME"
+            | grep -E "test_nme|Test NME|Per-sample NME dumped"
 
         NME=$(grep "Test NME:" "${LOG_FILE}" | grep -oE "[0-9]+\.[0-9]+" | tail -1 || echo "")
         if [ -z "$NME" ]; then
             echo "[ERROR] Failed to parse Test NME for resolution=${RES} ckpt_tag=${CKPT_TAG} -- incomplete, aborting (NOT marking DONE)"
+            exit 1
+        fi
+        if [ ! -f "${PER_IMAGE_CSV}" ]; then
+            echo "[ERROR] ${PER_IMAGE_CSV} was not written -- per-image dump failed for resolution=${RES} ckpt_tag=${CKPT_TAG}, aborting (NOT marking DONE)"
             exit 1
         fi
         echo -e "${RES}\t${CKPT_TAG}\t${NME}" >> "$RESULTS_TSV"
