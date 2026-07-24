@@ -169,13 +169,17 @@ seeds_all_done() {
 }
 
 group_is_complete() {
-    # true if seeds_all_done AND all 4 ensemble log files exist and are
-    # non-empty -- used for the group-start skip decision
+    # True only if all seed results exist AND every ensemble log contains
+    # the terminal success line for exactly five models.  A failed command
+    # piped through `tee` can leave a non-empty traceback log, so file size
+    # alone is not evidence that an ensemble completed successfully.
     local task="$1" backbone="$2" group_dir="$3" tag metric
     seeds_all_done "$task" "$backbone" || return 1
     for tag in best final; do
         for metric in swapmin fixedchannel; do
-            [ -s "${group_dir}/ensemble_${tag}_${metric}_log.txt" ] || return 1
+            local log="${group_dir}/ensemble_${tag}_${metric}_log.txt"
+            [ -s "$log" ] || return 1
+            grep -qF "[RESULT] Ensemble (5 models)" "$log" || return 1
         done
     done
     return 0
@@ -306,6 +310,8 @@ with open(cfg_path) as f:
 m    = cfg['model']['init_args']
 n    = m['network']['init_args']
 data = cfg['data']['init_args']
+trainer = cfg['trainer']
+early_stopping = trainer['callbacks'][1]['init_args']
 
 checks = [
     ('seed_everything',      cfg['seed_everything'],         seed),
@@ -325,8 +331,17 @@ checks = [
     ('pixel_center_align',   data.get('pixel_center_align', False), True),
     ('rotate_augment',       data.get('rotate_augment', False), True),
     ('scale_augment',        data.get('scale_augment', False), True),
+    ('img_size',             data.get('img_size'),             [512, 512]),
+    ('heatmap_size (data)',  data.get('heatmap_size'),         [64, 64]),
     ('heatmap_size (net)',   n['heatmap_size'],              [64, 64]),
     ('sigma',                data['sigma'],                  4.0),
+    ('val_fraction',         data.get('val_fraction'),       0.1),
+    ('val_split_seed',       data.get('val_split_seed'),     42),
+    ('batch_size',           data.get('batch_size'),         16),
+    ('max_epochs',           trainer.get('max_epochs'),      200),
+    ('validation interval',  trainer.get('check_val_every_n_epoch'), 5),
+    ('early-stop patience',  early_stopping.get('patience'), 20),
+    ('early-stop min_delta', early_stopping.get('min_delta'), 0.005),
     ('backbone_name',        n.get('encoder', {}).get('init_args', {}).get('backbone_name'),
                               backbone),
 ]
@@ -449,18 +464,40 @@ with open('${FIXED_ENSEMBLE_CFG}', 'w') as f:
     yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
 "
     for CKPT_TAG in best final; do
+        # Build the checkpoint list from the canonical seed set rather than
+        # a broad glob.  TSV rows alone are not sufficient evidence that the
+        # underlying checkpoints still exist, and ensemble_test.py is valid
+        # for arbitrary ensemble sizes, so it would otherwise happily run a
+        # four-model ensemble and produce a plausible-looking number.
+        CKPTS=()
+        for SEED in "${ALL_SEEDS[@]}"; do
+            CKPT_PATH="${GROUP_DIR}/seed${SEED}/seed${SEED}_${CKPT_TAG}.ckpt"
+            if [ ! -f "$CKPT_PATH" ]; then
+                echo "[ERROR] Missing ${CKPT_TAG} checkpoint required for the formal 5-model ensemble:"
+                echo "        ${CKPT_PATH}"
+                echo "        TSV rows exist for this group, so restore the checkpoint or"
+                echo "        remove that seed's stale TSV rows before retraining it."
+                exit 1
+            fi
+            CKPTS+=("$CKPT_PATH")
+        done
+        if [ "${#CKPTS[@]}" -ne 5 ]; then
+            echo "[ERROR] Expected exactly 5 ${CKPT_TAG} checkpoints, found ${#CKPTS[@]}"
+            exit 1
+        fi
+
         echo ""
         echo "=== Ensemble (${CKPT_TAG}, swap-min): task=${TASK} backbone=${BACKBONE_TAG} ==="
         python3 ablation/ensemble_test.py \
             --config "${LAST_SEED_CFG}" \
-            --ckpts "${GROUP_DIR}"/seed*/seed*_${CKPT_TAG}.ckpt \
+            --ckpts "${CKPTS[@]}" \
             2>&1 | tee "${GROUP_DIR}/ensemble_${CKPT_TAG}_swapmin_log.txt"
 
         echo ""
         echo "=== Ensemble (${CKPT_TAG}, fixed-channel): task=${TASK} backbone=${BACKBONE_TAG} ==="
         python3 ablation/ensemble_test.py \
             --config "${FIXED_ENSEMBLE_CFG}" \
-            --ckpts "${GROUP_DIR}"/seed*/seed*_${CKPT_TAG}.ckpt \
+            --ckpts "${CKPTS[@]}" \
             2>&1 | tee "${GROUP_DIR}/ensemble_${CKPT_TAG}_fixedchannel_log.txt"
     done
 
@@ -477,9 +514,11 @@ with open('${FIXED_ENSEMBLE_CFG}', 'w') as f:
         echo ""
         echo "############################################################"
         echo "  [WARN] GROUP ${GROUP_KEY}: seeds finished but one or more"
-        echo "  ensemble logs are missing/empty -- re-invoke this script to"
-        echo "  retry the ensemble step for this group before trusting it."
+        echo "  ensemble logs are missing or lack a verified 5-model result"
+        echo "  -- re-invoke this script to retry the ensemble step for this"
+        echo "  group before trusting it."
         echo "############################################################"
+        exit 1
     fi
     df -h "$BACKUP_ROOT"
     echo "NOTE: this group's checkpoints are at ${GROUP_DIR}."

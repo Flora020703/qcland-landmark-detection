@@ -543,6 +543,14 @@ def test_multicentre():
         assert len(rows) == expected_rows, (
             f"{anatomy}_{split}.csv: expected {expected_rows} data rows, got {len(rows)}"
         )
+        wrong_split = [
+            row["image_name"] for row in rows
+            if row.get("Split", "").strip().lower() != split.lower()
+        ]
+        assert not wrong_split, (
+            f"{anatomy}_{split}.csv: {len(wrong_split)} rows have a Split value "
+            f"different from {split!r}. First 20: {wrong_split[:20]}"
+        )
         for row in rows:
             if not (img_dir / row["image_name"]).exists():
                 missing.append(row["image_name"])
@@ -577,6 +585,41 @@ def test_multicentre():
     assert n_test == expected["Head"]["test"], (
         f"Head loaded test={n_test}, expected {expected['Head']['test']}"
     )
+
+    # OFD shares the Head images and split with BPD but uses a distinct set
+    # of four CSV coordinate fields.  Construct it separately so missing or
+    # malformed OFD columns cannot be hidden by a successful BPD smoke-test.
+    dm_ofd = MulticentreLandmarkDataModule(
+        images_dir=images_root / "Head",
+        ann_train_csv=ann_root / "Head_Train.csv",
+        ann_test_csv=ann_root / "Head_Test.csv",
+        task="ofd",
+        hc18_ann_csvs=[hc18_root / "Head_Train.csv", hc18_root / "Head_Test.csv"],
+        img_size=(512, 512), heatmap_size=(64, 64), sigma=4.0,
+        val_fraction=0.1, val_split_seed=42,
+        batch_size=4, num_workers=0, pin_memory=False,
+        pixel_center_align=True, rotate_augment=True, scale_augment=True,
+    )
+    dm_ofd.setup()
+    assert len(dm_ofd.train_dataset) + len(dm_ofd.val_dataset) == expected["Head"]["train"]
+    assert len(dm_ofd.test_dataset) == expected["Head"]["test"]
+    head_train_names = {r["img_name"] for r in dm_head.train_dataset.records}
+    head_val_names = {r["img_name"] for r in dm_head.val_dataset.records}
+    ofd_train_names = {r["img_name"] for r in dm_ofd.train_dataset.records}
+    ofd_val_names = {r["img_name"] for r in dm_ofd.val_dataset.records}
+    assert head_train_names.isdisjoint(head_val_names), "Head train/validation image overlap"
+    assert head_train_names == ofd_train_names and head_val_names == ofd_val_names, (
+        "BPD and OFD must use the identical fixed Head train/validation split"
+    )
+    head_train_groups = {dm_head._subject_id(n) for n in head_train_names}
+    head_val_groups = {dm_head._subject_id(n) for n in head_val_names}
+    assert head_train_groups.isdisjoint(head_val_groups), (
+        "Head train/validation split is not source-aware-group-disjoint"
+    )
+    _img_ofd, hm_ofd, coords_ofd = dm_ofd.train_dataset[0]
+    assert hm_ofd.shape == (2, 64, 64) and coords_ofd.shape == (2, 2)
+    print("[Head split] BPD/OFD identical and source-aware-group-disjoint OK")
+    print("[OFD] coordinate columns parsed and sample generated OK")
 
     all_head_records = dm_head.train_dataset.records + dm_head.val_dataset.records
 
@@ -649,6 +692,39 @@ def test_multicentre():
     assert n_test_ab == expected["Abdomen"]["test"], (
         f"Abdomen loaded test={n_test_ab}, expected {expected['Abdomen']['test']}"
     )
+
+    # TAD shares the Abdomen split with APAD but has distinct coordinate
+    # columns; exercise it explicitly for the same reason as OFD above.
+    dm_tad = MulticentreLandmarkDataModule(
+        images_dir=images_root / "Abdomen",
+        ann_train_csv=ann_root / "Abdomen_Train.csv",
+        ann_test_csv=ann_root / "Abdomen_Test.csv",
+        task="tad",
+        img_size=(512, 512), heatmap_size=(64, 64), sigma=4.0,
+        val_fraction=0.1, val_split_seed=42,
+        batch_size=4, num_workers=0, pin_memory=False,
+        pixel_center_align=True, rotate_augment=True, scale_augment=True,
+    )
+    dm_tad.setup()
+    assert len(dm_tad.train_dataset) + len(dm_tad.val_dataset) == expected["Abdomen"]["train"]
+    assert len(dm_tad.test_dataset) == expected["Abdomen"]["test"]
+    apad_train_names = {r["img_name"] for r in dm_abdomen.train_dataset.records}
+    apad_val_names = {r["img_name"] for r in dm_abdomen.val_dataset.records}
+    tad_train_names = {r["img_name"] for r in dm_tad.train_dataset.records}
+    tad_val_names = {r["img_name"] for r in dm_tad.val_dataset.records}
+    assert apad_train_names.isdisjoint(apad_val_names), "Abdomen train/validation image overlap"
+    assert apad_train_names == tad_train_names and apad_val_names == tad_val_names, (
+        "APAD and TAD must use the identical fixed Abdomen train/validation split"
+    )
+    abdomen_train_groups = {dm_abdomen._subject_id(n) for n in apad_train_names}
+    abdomen_val_groups = {dm_abdomen._subject_id(n) for n in apad_val_names}
+    assert abdomen_train_groups.isdisjoint(abdomen_val_groups), (
+        "Abdomen train/validation split is not source-aware-group-disjoint"
+    )
+    _img_tad, hm_tad, coords_tad = dm_tad.train_dataset[0]
+    assert hm_tad.shape == (2, 64, 64) and coords_tad.shape == (2, 2)
+    print("[Abdomen split] APAD/TAD identical and source-aware-group-disjoint OK")
+    print("[TAD] coordinate columns parsed and sample generated OK")
     abdomen_records = dm_abdomen.train_dataset.records + dm_abdomen.val_dataset.records
     non_fp = [r for r in abdomen_records if not r["img_name"].startswith("Patient")]
     assert non_fp, "expected at least one non-FP (UCL) Abdomen record"
@@ -678,6 +754,14 @@ def test_multicentre():
     )
     assert n_test_fl == expected["Femur"]["test"], (
         f"Femur loaded test={n_test_fl}, expected {expected['Femur']['test']}"
+    )
+    femur_train_names = {r["img_name"] for r in dm_femur.train_dataset.records}
+    femur_val_names = {r["img_name"] for r in dm_femur.val_dataset.records}
+    assert femur_train_names.isdisjoint(femur_val_names), "Femur train/validation image overlap"
+    femur_train_groups = {dm_femur._subject_id(n) for n in femur_train_names}
+    femur_val_groups = {dm_femur._subject_id(n) for n in femur_val_names}
+    assert femur_train_groups.isdisjoint(femur_val_groups), (
+        "Femur train/validation split is not source-aware-group-disjoint"
     )
     femur_records = dm_femur.train_dataset.records + dm_femur.val_dataset.records
     non_fp_fl = [r for r in femur_records if not r["img_name"].startswith("Patient")]
