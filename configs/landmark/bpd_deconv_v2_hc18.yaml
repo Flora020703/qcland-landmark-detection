@@ -1,4 +1,12 @@
 # ---------------------------------------------------------------
+# EXCLUDED FROM THESIS FORMAL EVIDENCE (2026-07-24): HC18 was dropped
+# as a formal evaluation dataset in the thesis (single-seed only, no
+# full component-ablation chain, different task from the direct
+# two-point UCL landmarks) and replaced by the Multicentre dataset,
+# which is verified NOT centre-disjoint (see project memory /
+# EoMT_Landmark_Detection_Full_Chronological_Summary_*.md §0.1). This
+# config is kept as a documented exploratory pilot, not deleted.
+#
 # MODIFIED: Experiment 1 — HC18 (737 train / 262 test) + deconv_v2.
 #
 # Goal: does deconv_v2 benefit from more training data the way HRNet does
