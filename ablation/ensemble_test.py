@@ -109,6 +109,14 @@ def main() -> None:
     ap.add_argument("--tta", action="store_true",
                      help="average each model's prediction with its horizontal-flip "
                           "prediction (DOD-resorted) before ensembling across models")
+    ap.add_argument(
+        "--align-fetal-channels",
+        action="store_true",
+        help=("for two-endpoint fetal tasks, reorder each model's heatmap "
+              "channels from left to right for every sample before averaging; "
+              "this prevents seed-dependent query permutations from mixing "
+              "the two endpoint response maps"),
+    )
     args = ap.parse_args()
 
     if args.ckpt_configs:
@@ -178,6 +186,12 @@ def main() -> None:
     endpoint_order_invariant = bool(
         cfgs[0]["model"]["init_args"].get("endpoint_order_invariant_nme", False)
     )
+    num_landmarks = int(cfgs[0]["model"]["init_args"].get("num_landmarks", 2))
+    if args.align_fetal_channels and num_landmarks != 2:
+        raise ValueError(
+            "--align-fetal-channels is defined only for two-endpoint fetal "
+            f"tasks, but num_landmarks={num_landmarks}"
+        )
 
     dm = build_datamodule(cfgs[0])
     dm.setup()
@@ -224,9 +238,39 @@ def main() -> None:
                         mask_logits_per_layer[-1], heatmap_size,
                         mode="bilinear", align_corners=False,
                     )
+                    if args.align_fetal_channels:
+                        # Query indices are not a stable endpoint identity across
+                        # independently trained models.  Determine the left/right
+                        # order from each model's decoded peaks, then apply that
+                        # permutation to the complete heatmaps before averaging.
+                        # This retains heatmap-space ensembling without blending
+                        # the two anatomical endpoint response maps together.
+                        coords = heatmap_to_coords(pred)
+                        order = coords[..., 0].argsort(dim=1)
+                        pred = torch.gather(
+                            pred,
+                            1,
+                            order[:, :, None, None].expand_as(pred),
+                        )
                     summed = pred if summed is None else summed + pred
                 avg_pred = summed / len(models)
                 avg_coords = heatmap_to_coords(avg_pred)
+                if args.align_fetal_channels:
+                    # Averaging two already aligned response-map channels can
+                    # still change their respective argmax locations (for
+                    # example when broad or secondary peaks differ by seed).
+                    # Re-apply the dataset's DOD convention after the single
+                    # ensemble decode so fixed-channel evaluation uses the same
+                    # left-to-right channel definition as the ground truth.
+                    avg_coords = dod_sort(avg_coords)
+
+            if args.align_fetal_channels and torch.any(
+                gt_coords[:, 0, 0] > gt_coords[:, 1, 0]
+            ):
+                raise RuntimeError(
+                    "test ground truth is not left-to-right DOD sorted; "
+                    "fixed-channel ensemble evaluation would be ill-defined"
+                )
 
             nme = compute_nme(
                 avg_coords, gt_coords, heatmap_size, img_size,
@@ -241,6 +285,9 @@ def main() -> None:
         tags.append("cross-config")
     if args.tta:
         tags.append("TTA")
+    if args.align_fetal_channels:
+        tags.append("channel-aligned")
+        tags.append("DOD-final")
     suffix = f" [{'+'.join(tags)}]" if tags else ""
     print(f"[RESULT] Ensemble ({len(models)} models){suffix} test NME: {mean_nme * 100:.2f}%  (n={len(all_nme)} samples)")
 

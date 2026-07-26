@@ -179,7 +179,7 @@ group_is_complete() {
         for metric in swapmin fixedchannel; do
             local log="${group_dir}/ensemble_${tag}_${metric}_log.txt"
             [ -s "$log" ] || return 1
-            grep -qF "[RESULT] Ensemble (5 models)" "$log" || return 1
+            grep -qF "[RESULT] Ensemble (5 models) [channel-aligned+DOD-final]" "$log" || return 1
         done
     done
     return 0
@@ -490,6 +490,7 @@ with open('${FIXED_ENSEMBLE_CFG}', 'w') as f:
         echo "=== Ensemble (${CKPT_TAG}, swap-min): task=${TASK} backbone=${BACKBONE_TAG} ==="
         python3 ablation/ensemble_test.py \
             --config "${LAST_SEED_CFG}" \
+            --align-fetal-channels \
             --ckpts "${CKPTS[@]}" \
             2>&1 | tee "${GROUP_DIR}/ensemble_${CKPT_TAG}_swapmin_log.txt"
 
@@ -497,6 +498,7 @@ with open('${FIXED_ENSEMBLE_CFG}', 'w') as f:
         echo "=== Ensemble (${CKPT_TAG}, fixed-channel): task=${TASK} backbone=${BACKBONE_TAG} ==="
         python3 ablation/ensemble_test.py \
             --config "${FIXED_ENSEMBLE_CFG}" \
+            --align-fetal-channels \
             --ckpts "${CKPTS[@]}" \
             2>&1 | tee "${GROUP_DIR}/ensemble_${CKPT_TAG}_fixedchannel_log.txt"
     done
