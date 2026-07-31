@@ -21,9 +21,9 @@ RTX 4090 instance this project trains on.
 whatever CUDA toolkit the AutoDL image already has (the same one used for
 this project's own EoMT training, i.e. current AutoDL image = PyTorch
 2.8/CUDA 12.8 per CLAUDE.md), plus current `numpy`/`opencv-python`/`scipy`,
-and `tensorboardX`, `yacs`, `hdf5storage`, `pandas`, `scikit-learn`,
-`matplotlib` (whatever versions install cleanly against that Python/torch —
-none of these are version-sensitive for this codebase, see below).
+and `tensorboardX`, `yacs`, `hdf5storage`, `pandas`, `scikit-learn`, and
+`matplotlib`. The resolved versions must be recorded: forward-compatible
+syntax does not establish numerical equivalence across dependency versions.
 
 **Checked before recommending this**: grepped the entire `lib/`/`tools/` tree
 for the classic PyTorch-1.0-era / Python-2-era patterns that break on a
@@ -33,9 +33,8 @@ call), `np.float`/`np.int`/`np.bool` bare aliases (removed in numpy>=1.24),
 old positional-arg signature, `Variable(...)`, `.data[0]`,
 `size_average=`/`reduce=` loss kwargs, `volatile=`. **None found** beyond the
 one already-fixed `np.math.floor` call. `cudnn.benchmark`/`cudnn.deterministic`
-are read from config, not hardcoded. This means the model/training code
-itself is written in a style that's already forward-compatible; only the
-pinned dependency *versions* are the problem, not the code.
+are read from config, not hardcoded. This lowers the expected compatibility
+risk, but does not replace a real GPU canary under the resolved environment.
 
 **Recommended env for the AutoDL server** (adjust exact pins to whatever
 resolves cleanly against the already-installed CUDA 12.8 driver):
@@ -53,9 +52,13 @@ yacs
 hdf5storage
 ```
 
-If training actually breaks on the modern stack in a way this grep didn't
-catch, fix the specific error surfaced (e.g. a changed default kwarg) rather
-than downgrading torch — downgrading is not an option on this GPU.
+If training breaks on the modern stack, fix only the specific compatibility
+error and document it; do not change architecture, data handling or training
+hyperparameters. The driver records the exact versions, CUDA/cuDNN, GPU,
+source commit and pretrained-weight hash on every invocation. The latest
+snapshot is stored in `environment_audit.txt`, while
+`environment_audit_history.txt` retains the canary/formal history so an
+environment change between them cannot be silently hidden.
 
 **Document this substitution in Appendix B** alongside the existing
 HRNet-Facial-Landmark-Detection commit-pinning TODO: state plainly that the

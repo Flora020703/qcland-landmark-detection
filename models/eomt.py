@@ -50,8 +50,12 @@ class QueryConditionedDeconvHead(nn.Module):
 
     Input:
       query_tokens  : (B, Q, C) — raw last-block query tokens (NOT mask_head output)
-      patch_features: (B, C, H_f, W_f) — post-upscale patch features from self.upscale
-                      e.g. (B, 384, 72, 72) for 512×512 input with patch_size=14
+      patch_features: (B, C, H_f, W_f) — post-upscale patch features from
+                      self.upscale. In the thesis configurations, 512×512
+                      inputs use a runtime 16×16 patch embedding: DINOv2
+                      ViT-S/14 kernels are resampled to 16×16, while DINOv3
+                      is natively patch16. This gives a 32×32 token grid and
+                      (B, 384, 128, 128) features after two ScaleBlocks.
 
     Output: (B, Q, hm_H, hm_W) — same interface as the einsum path.
 

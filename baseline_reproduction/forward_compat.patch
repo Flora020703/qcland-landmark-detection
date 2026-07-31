@@ -1,0 +1,38 @@
+diff --git a/lib/utils/transforms.py b/lib/utils/transforms.py
+index 4c7124a..679851c 100644
+--- a/lib/utils/transforms.py
++++ b/lib/utils/transforms.py
+@@ -6,6 +6,7 @@
+ # Modified by Chiara Di Vece (chiara.divece.20@ucl.ac.uk)
+ # ------------------------------------------------------------------------------
+ import cv2
++import math
+ import torch
+ import numpy as np
+ 
+@@ -232,9 +233,9 @@ def crop(img, center, scale, output_size, rot=0):
+     if sf < 2:
+         sf = 1
+     else:
+-        new_size = int(np.math.floor(max(ht, wd) / sf))
+-        new_ht = int(np.math.floor(ht / sf))
+-        new_wd = int(np.math.floor(wd / sf))
++        new_size = int(math.floor(max(ht, wd) / sf))
++        new_ht = int(math.floor(ht / sf))
++        new_wd = int(math.floor(wd / sf))
+         if new_size < 2:
+             return torch.zeros(output_size[0], output_size[1], img.shape[2]) \
+                         if len(img.shape) > 2 else torch.zeros(output_size[0], output_size[1])
+
+diff --git a/tools/test.py b/tools/test.py
+--- a/tools/test.py
++++ b/tools/test.py
+@@ -108,7 +108,7 @@ def main():
+     model = nn.DataParallel(model, device_ids=gpus).cuda()
+ 
+     # Load model checkpoint
+-    payload = torch.load(args.model_file, map_location="cpu")
++    payload = torch.load(args.model_file, map_location="cpu", weights_only=False)
+ 
+     # ---- Extract weights + d_vect if present ----
+     # The checkpoint may contain:
