@@ -20,6 +20,19 @@ an original-space d_vect, or computing NME directly in 512-space) would
 fail these assertions -- a square synthetic image cannot expose an
 anisotropic-scaling bug.
 
+Also includes coverage (added 2026-08-07, second same-day round) for a
+SECOND, subtler discrepancy in the same conversion: EoMT's real dump is
+NOT simply `to_model_space()` of the original point -- it round-trips
+through a pixel-centre-aligned heatmap encode (in
+datasets/landmark_dataset.py) composed with a naive (non-pixel-centre)
+heatmap-to-"img_size" scale-back (in training/landmark_detection.py),
+leaving a constant +/-3.5px (for 512/64) offset relative to true
+model-input-space coordinates. `_simulate_real_eomt_dump()` below
+reproduces this EXACT real chain (verified against both source files line
+by line, not assumed) so these tests fail if `load_eomt_per_image` ever
+used a naive `to_model_space()`-only (no heatmap round-trip) recovery
+instead of `_heatmap_dump_to_model_input_space()` + `to_image_space()`.
+
 Run directly: python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
 """
 
@@ -39,8 +52,12 @@ sys.path.insert(0, str(_REPO_ROOT / "rtmpose_reproduction"))
 from geometry import to_image_space, to_model_space  # noqa: E402
 
 from rescore_endpoint_conventions import (
+    EOMT_HEATMAP_SIZE,
+    EOMT_MODEL_INPUT_SIZE,
     LoadError,
     _ImageSizeCache,
+    _heatmap_dump_to_model_input_space,
+    _min_paired_max_abs_diff,
     cross_method_gt_consistency_check,
     dod_sort,
     fixed_channel_nme,
@@ -51,7 +68,26 @@ from rescore_endpoint_conventions import (
 )
 
 SEEDS = (42, 0, 123, 2024, 3407)
-EOMT_INPUT_SIZE = 512
+EOMT_INPUT_SIZE = EOMT_MODEL_INPUT_SIZE
+
+
+def _simulate_real_eomt_dump(orig_point: tuple[float, float], width: float, height: float) -> tuple[float, float]:
+    """Reproduces EXACTLY what training/landmark_detection.py's real
+    per-image dump writes for an original-image-space point, under a
+    pixel_center_align=True, heatmap_size=64, img_size=512 config (the
+    matched-protocol setting every analyzed EoMT run uses) -- verified line
+    by line against datasets/landmark_dataset.py (orig->input, then
+    pixel-centre input->heatmap encode) and training/landmark_detection.py
+    (naive heatmap->"img_size" scale-back, `coord_scale = img_size/heatmap_size`).
+    NOT a shortcut via to_model_space() alone -- that would skip the
+    heatmap round-trip and fail to reproduce the real +3.5px discrepancy
+    this fix specifically addresses."""
+    input_x, input_y = to_model_space(*orig_point, width, height, EOMT_MODEL_INPUT_SIZE)
+    hm_scale = EOMT_HEATMAP_SIZE / EOMT_MODEL_INPUT_SIZE
+    heatmap_x = (input_x + 0.5) * hm_scale - 0.5
+    heatmap_y = (input_y + 0.5) * hm_scale - 0.5
+    dump_scale = EOMT_MODEL_INPUT_SIZE / EOMT_HEATMAP_SIZE
+    return heatmap_x * dump_scale, heatmap_y * dump_scale
 
 
 def _write_hrnet_synthetic(root: Path, dataset: str, task_tag: str, filenames_and_points):
@@ -93,11 +129,12 @@ def _write_eomt_synthetic(root: Path, task: str, backbone: str,
                            filenames_points_and_sizes, is_multicentre: bool = False):
     """filenames_points_and_sizes: list of (filename, gt0, gt1, pred0, pred1,
     orig_width, orig_height), all points in TRUE ORIGINAL image space. This
-    helper converts to 512x512 model-input space (via to_model_space --
-    EoMT's own forward formula) before writing the CSV, exactly mirroring
-    what training/landmark_detection.py's real dump actually contains, so
-    that a correct load_eomt_per_image() has to invert it back to recover
-    the original-space points passed in here."""
+    helper runs each point through `_simulate_real_eomt_dump()` (the real
+    orig->input->heatmap->dump chain, including the pixel-centre-vs-naive
+    discrepancy) before writing the CSV, exactly mirroring what
+    training/landmark_detection.py's real dump actually contains, so that a
+    correct load_eomt_per_image() has to invert BOTH steps to recover the
+    original-space points passed in here."""
     for seed in SEEDS:
         if is_multicentre:
             run_dir = root / f"multicentre-{task}-{backbone}" / f"seed{seed}"
@@ -121,21 +158,26 @@ def _write_eomt_synthetic(root: Path, task: str, backbone: str,
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
             for i, (fn, gt0, gt1, pred0, pred1, width, height) in enumerate(filenames_points_and_sizes):
-                # EoMT's real dump writes 512-model-input-space coordinates
-                # (training/landmark_detection.py) -- its own "nme" column
-                # is therefore computed FROM the 512-space points, in
-                # 512-space, exactly as the real training code does.
-                gt0_512 = to_model_space(*gt0, width, height, EOMT_INPUT_SIZE)
-                gt1_512 = to_model_space(*gt1, width, height, EOMT_INPUT_SIZE)
-                pred0_512 = to_model_space(*pred0, width, height, EOMT_INPUT_SIZE)
-                pred1_512 = to_model_space(*pred1, width, height, EOMT_INPUT_SIZE)
-                nme = fixed_channel_nme(pred0_512, pred1_512, gt0_512, gt1_512)
+                # EoMT's real dump is NOT plain 512-model-input-space
+                # coordinates -- it round-trips through a pixel-centre
+                # heatmap encode + naive scale-back, leaving a constant
+                # offset relative to true model-input-space (see this
+                # module's docstring and _simulate_real_eomt_dump). Its
+                # "nme" column is computed FROM these same dumped points,
+                # in this same (slightly-off) space, exactly as the real
+                # training code does -- so the native-reproduction sanity
+                # check must still pass on these values as-is.
+                gt0_dump = _simulate_real_eomt_dump(gt0, width, height)
+                gt1_dump = _simulate_real_eomt_dump(gt1, width, height)
+                pred0_dump = _simulate_real_eomt_dump(pred0, width, height)
+                pred1_dump = _simulate_real_eomt_dump(pred1, width, height)
+                nme = fixed_channel_nme(pred0_dump, pred1_dump, gt0_dump, gt1_dump)
                 writer.writerow({
                     "index": i, "nme": nme, "pixel_error": "",
-                    "pred_x0": pred0_512[0], "pred_y0": pred0_512[1],
-                    "gt_x0": gt0_512[0], "gt_y0": gt0_512[1],
-                    "pred_x1": pred1_512[0], "pred_y1": pred1_512[1],
-                    "gt_x1": gt1_512[0], "gt_y1": gt1_512[1],
+                    "pred_x0": pred0_dump[0], "pred_y0": pred0_dump[1],
+                    "gt_x0": gt0_dump[0], "gt_y0": gt0_dump[1],
+                    "pred_x1": pred1_dump[0], "pred_y1": pred1_dump[1],
+                    "gt_x1": gt1_dump[0], "gt_y1": gt1_dump[1],
                 })
 
 
@@ -251,6 +293,56 @@ def test_eomt_loader_inverts_anisotropic_coordinate_space_correctly():
             "distinguish a correct fix from the original bug"
         )
         print("[PASS] test_eomt_loader_inverts_anisotropic_coordinate_space_correctly")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_heatmap_dump_offset_recovery_matches_real_encode_chain():
+    """Regression test for the SECOND coordinate-space bug (2026-08-07):
+    EoMT's real dump is NOT plain to_model_space() of the original point --
+    it round-trips through a pixel-centre heatmap encode + a naive
+    (non-pixel-centre) scale-back, leaving a constant +3.5px offset (for
+    512/64) relative to true model-input-space coordinates. A loader that
+    used to_model_space()/to_image_space() alone (skipping
+    _heatmap_dump_to_model_input_space) would recover a point shifted by a
+    few pixels in ORIGINAL-image space -- small enough to not obviously
+    break NME/ordering (a shared per-image translation, mostly cancels in
+    pairwise quantities) but large enough to cause spurious cross-method GT
+    mismatches (this exact discrepancy on every single image, in the
+    consistency check the previous round added)."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        width, height = 300.0, 640.0
+        gt0, gt1 = (140.0, 600.0), (145.0, 30.0)
+        pred0, pred1 = (142.0, 598.0), (143.0, 32.0)
+        samples = [("h.jpg", gt0, gt1, pred0, pred1, width, height)]
+        _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        _write_synthetic_image(images_root, "Head", "h.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        data = load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
+        row = data["per_seed"][42]["h.jpg"]
+        # Correct fix: exact round-trip recovery (sub-micro-pixel tolerance).
+        assert abs(row["gt0"][0] - gt0[0]) < 1e-6 and abs(row["gt0"][1] - gt0[1]) < 1e-6
+        assert abs(row["gt1"][0] - gt1[0]) < 1e-6 and abs(row["gt1"][1] - gt1[1]) < 1e-6
+
+        # A loader missing the heatmap-offset recovery (to_image_space()
+        # applied directly to the raw dump, as the FIRST fix round did)
+        # would NOT recover the true original point -- demonstrate the
+        # discrepancy is large enough to matter (not sub-pixel noise).
+        with open(tmp / "bpd_dinov2" / "seed42" / "final_fixedchannel_per_image.csv", newline="") as f:
+            raw_row = next(csv.DictReader(f))
+        naive_recovered = to_image_space(float(raw_row["gt_x0"]), float(raw_row["gt_y0"]),
+                                          width, height, EOMT_INPUT_SIZE)
+        naive_err = max(abs(naive_recovered[0] - gt0[0]), abs(naive_recovered[1] - gt0[1]))
+        assert naive_err > 0.5, (
+            "test construction error: expected the heatmap-offset recovery "
+            "to matter by more than trivial floating-point noise here"
+        )
+        print("[PASS] test_heatmap_dump_offset_recovery_matches_real_encode_chain "
+              f"(naive-vs-fixed recovery error: {naive_err:.3f}px)")
     finally:
         shutil.rmtree(tmp)
         shutil.rmtree(images_root)
@@ -405,13 +497,49 @@ def test_cross_method_gt_consistency_check_detects_mismatch():
     print("[PASS] test_cross_method_gt_consistency_check_detects_mismatch")
 
 
+def test_cross_method_gt_consistency_check_tolerates_channel_order_convention_difference():
+    """Regression test for the THIRD bug (2026-08-07): HRNet's own native
+    gt0/gt1 channel order follows DOD, EoMT's follows x-sort -- for the SAME
+    two physical points, the two methods may legitimately disagree on which
+    one is called 'channel 0' whenever x-sort and DOD disagree for that
+    image (exactly the population this whole analysis studies). Method A's
+    GT is (p0, p1); Method B's GT is the SAME two physical points with
+    channels SWAPPED, (p1, p0). The consistency check must not flag this as
+    a coordinate-recovery bug -- the warning list must be empty."""
+    p0, p1 = (10.0, 10.0), (90.0, 10.0)
+    method_a = {
+        "gt_by_filename": {"x.jpg": (p0, p1)},
+        "disagree_by_filename": {"x.jpg": False},
+    }
+    method_b = {
+        "gt_by_filename": {"x.jpg": (p1, p0)},  # same physical points, swapped channel order
+        "disagree_by_filename": {"x.jpg": False},
+    }
+    warnings = cross_method_gt_consistency_check("UCL", "bpd", {"hrnet": method_a, "eomt_dinov2": method_b})
+    assert warnings == [], f"expected no warning for a pure channel-order convention difference, got {warnings}"
+    print("[PASS] test_cross_method_gt_consistency_check_tolerates_channel_order_convention_difference")
+
+
+def test_min_paired_max_abs_diff_picks_closer_pairing():
+    """Direct unit test of the pairing-robust comparison helper itself."""
+    bg0, bg1 = (10.0, 10.0), (90.0, 10.0)
+    # Same physical points, swapped -> distance should be ~0 (min over both pairings).
+    assert _min_paired_max_abs_diff(bg0, bg1, bg1, bg0) < 1e-9
+    # Genuinely different second point -> distance should reflect the real gap.
+    assert abs(_min_paired_max_abs_diff(bg0, bg1, bg1, (200.0, 10.0)) - 110.0) < 1e-9
+    print("[PASS] test_min_paired_max_abs_diff_picks_closer_pairing")
+
+
 def main():
     test_hrnet_loader_and_native_nme_matches_stored_value()
     test_eomt_loader_joins_order_and_coords_correctly()
     test_eomt_loader_inverts_anisotropic_coordinate_space_correctly()
+    test_heatmap_dump_offset_recovery_matches_real_encode_chain()
     test_eomt_loader_rejects_missing_images_root_file()
     test_native_sanity_check_detects_corrupted_stored_nme()
     test_cross_method_gt_consistency_check_detects_mismatch()
+    test_cross_method_gt_consistency_check_tolerates_channel_order_convention_difference()
+    test_min_paired_max_abs_diff_picks_closer_pairing()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")

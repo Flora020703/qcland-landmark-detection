@@ -48,6 +48,31 @@ into DOD (or computing NME on them without conversion) is invalid whenever
 the source image is not square -- effectively always, for these ultrasound
 images -- which is exactly the bug this fix corrects.
 
+**Second coordinate-space note (fixed 2026-08-07, same day, a review
+finding against the FIRST fix above)**: EoMT's dump is not exactly
+512-model-input-space coordinates either -- it round-trips through a
+pixel-centre-aligned heatmap encode (`datasets/landmark_dataset.py`,
+`pixel_center_align=True`) composed with a naive, non-pixel-centre
+scale-back in the dump itself (`training/landmark_detection.py`), leaving
+a constant offset (+3.5px for the standard 512-model-input/64-heatmap
+setting, verified against both source files directly). This is recovered
+exactly (`_heatmap_dump_to_model_input_space()`) before the original-image
+inversion above. The offset cancels out of NME/ordering (a shared
+translation across all four points in an image), so it did not corrupt
+the first fix's own verification -- but it does shift the recovered
+ABSOLUTE coordinate, which matters for the cross-method GT consistency
+check below.
+
+**Third fix, same day**: the cross-method GT consistency check initially
+compared HRNet's and EoMT's GT points index-to-index (`gt0` vs `gt0`).
+This is wrong: HRNet's own native channel order follows DOD, EoMT's
+follows x-sort, so the two methods may legitimately (and often will)
+label the SAME two physical points with swapped channel indices whenever
+x-sort and DOD disagree for that image -- exactly the population this
+analysis studies. Fixed to compare both possible pairings and take
+whichever is closer, so a pure convention difference is no longer
+misreported as a coordinate-recovery bug.
+
 **Important limitation, state this to the supervisor alongside any
 numbers**: this quantifies how much the EXTERNAL SCORING RULE alone
 changes each method's reported NME and whether conclusions (rankings,

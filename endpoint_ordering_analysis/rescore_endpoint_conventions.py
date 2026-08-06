@@ -55,6 +55,49 @@ the actual image file (matching the pattern
 rtmpose_reproduction/convert_csv_to_coco.py already uses) -- see
 `--ucl-images-root`/`--multicentre-images-root` below.
 
+*** SECOND CRITICAL FIX (2026-08-07, review finding against the FIRST fix
+above) ***: the "512-model-input space" description above is itself only
+approximately true. `training/landmark_detection.py`'s dump does not invert
+its own heatmap encoding exactly -- it converts heatmap-space coordinates
+to "img_size space" via a plain multiply
+(`coord_scale = img_size / heatmap_size`), but
+`datasets/landmark_dataset.py` encodes model-input-space coordinates INTO
+heatmap space using the PIXEL-CENTRE-ALIGNED formula (confirmed via
+`grep` that every matched-protocol landmark config this analysis targets --
+every `{bpd,ofd,apad,tad,fl}_{dinov2,dinov3}_fpn_udp_rotate_scale.yaml` plus
+`multicentre_fpn_udp_rotate_scale.yaml` -- sets `pixel_center_align: true`
+and `heatmap_size: [64, 64]` with `img_size: [512, 512]`):
+`heatmap = (input + 0.5) * (heatmap_size/input_size) - 0.5`. Composing the
+encode with the dump's naive (non-pixel-centre) inverse leaves a residual,
+purely additive offset that is IDENTICAL for every point in every image
+(a function only of `input_size`/`heatmap_size`, not of image content):
+`dumped = input - 0.5 * (input_size/heatmap_size - 1) = input - 3.5` for
+512/64. This offset cancels out of any within-image pairwise quantity
+(distances, NME, x-sort/DOD ordering decisions all unaffected -- it is a
+shared translation applied identically to pred0/pred1/gt0/gt1), so it did
+NOT corrupt anything the first fix's own verification checked. It DOES
+shift the recovered ABSOLUTE original-space coordinate, which matters for
+the cross-method GT consistency check below (comparing an EoMT-recovered
+GT location against HRNet's own GT location for the same filename) --
+without this correction that check would report a spurious ~3.5-pixel
+(in model-input-space, scaled further by the original/512 resize factor)
+mismatch on every single image, even though nothing was actually wrong
+with the ordering-convention numbers themselves. See
+`_heatmap_dump_to_model_input_space()` below for the exact recovery.
+
+*** THIRD FIX, same round ***: the cross-method GT consistency check
+initially compared `gt0<->gt0`, `gt1<->gt1` directly across methods.
+This is wrong on its own terms: HRNet's own native gt0/gt1 channel order
+follows the DOD convention (its training-time channel assignment), EoMT's
+follows x-sort -- for the SAME two physical points, the two methods may
+legitimately (and often will) disagree on which one is called "channel 0"
+whenever x-sort and DOD disagree for that image, which is exactly the
+population this whole analysis is studying. Comparing channel-index to
+channel-index directly conflates this EXPECTED convention difference with
+an actual coordinate-recovery bug. Fixed to compare the two POSSIBLE
+pairings (standard and swapped) and take whichever is closer -- see
+`_min_paired_max_abs_diff()` below.
+
 The three canonicalisation rules, everything now genuinely in ORIGINAL
 image pixel coordinates for BOTH methods:
   1. NATIVE: recomputed directly from each file's OWN raw dumped
@@ -86,12 +129,19 @@ Cross-checks this script performs and reports (do not trust any "unified"
 number if these fail):
   - Native-reproduction sanity check: each file's own recomputed NME
     (using its own raw coordinates, no space conversion) vs its stored
-    `nme`/`fixed_channel_nme` column, per method, per cell.
+    `nme`/`fixed_channel_nme` column, per method, per cell -- using a
+    COMBINED absolute+relative tolerance (see NATIVE_SANITY_ATOL/RTOL),
+    since a pure relative tolerance is unstable for near-zero NME values.
   - Cross-method GT consistency: for a given (dataset, task), HRNet's own
     GT and EoMT's (inverted-to-original-space) GT should describe the SAME
-    physical annotation for the SAME filename -- checked directly by
-    comparing coordinates (should match closely, small resize/round-trip
-    error only) wherever both methods have that filename.
+    physical annotation for the SAME filename -- checked by comparing
+    coordinates under the CLOSER of the two possible channel pairings
+    (`_min_paired_max_abs_diff`), not index-to-index, since HRNet's own
+    native channel order follows DOD while EoMT's follows x-sort and the
+    two conventions legitimately disagree on which physical point is
+    "channel 0" for some images -- comparing index-to-index directly would
+    conflate that expected convention difference with an actual
+    coordinate-recovery bug.
   - Cross-method GT disagreement-rate consistency: the x-sort-vs-DOD
     disagreement rate on GT alone should be (near-)IDENTICAL whether
     computed from HRNet's GT or EoMT's (inverted) GT for the same
@@ -139,7 +189,31 @@ HRNET_TASK_TAG = {
 }
 ANATOMY_BY_TASK = {"bpd": "Head", "ofd": "Head", "apad": "Abdomen", "tad": "Abdomen", "fl": "Femur"}
 EOMT_MODEL_INPUT_SIZE = 512  # matches every matched-protocol EoMT config's img_size
-NATIVE_SANITY_TOLERANCE = 1e-4  # relative; dumped values are text-formatted to 8 decimals
+EOMT_HEATMAP_SIZE = 64  # verified via grep: every matched-protocol landmark config
+                        # (bpd/ofd/apad/tad/fl x dinov2/dinov3 x _fpn_udp_rotate_scale.yaml,
+                        # plus multicentre_fpn_udp_rotate_scale.yaml) sets
+                        # heatmap_size: [64, 64] and pixel_center_align: true
+# Combined absolute+relative tolerance for the native-reproduction sanity
+# check -- a pure relative tolerance is unstable for near-zero stored NME
+# values, where the CSV's own 8-decimal text formatting alone can produce
+# a large relative (but tiny absolute) discrepancy.
+NATIVE_SANITY_RTOL = 1e-4
+NATIVE_SANITY_ATOL = 5e-8
+
+
+def _heatmap_dump_to_model_input_space(dumped_x: float, dumped_y: float) -> tuple[float, float]:
+    """Recovers true 512x512 model-input-space coordinates from EoMT's raw
+    per-image dump -- see this module's docstring ("SECOND CRITICAL FIX")
+    for the full derivation. `training/landmark_detection.py` dumps
+    heatmap-space coordinates via a naive scale multiply
+    (`coord_scale = img_size/heatmap_size`), which is NOT the exact inverse
+    of how `datasets/landmark_dataset.py` encoded them (pixel-centre-aligned:
+    `heatmap = (input + 0.5) * (heatmap_size/input_size) - 0.5`). The
+    residual is a constant offset, identical for every point in every
+    image: `dumped = input - 0.5 * (input_size/heatmap_size - 1)`."""
+    scale = EOMT_MODEL_INPUT_SIZE / EOMT_HEATMAP_SIZE
+    offset = 0.5 * scale - 0.5
+    return dumped_x + offset, dumped_y + offset
 
 
 def _canon_filename(value: str) -> str:
@@ -253,7 +327,7 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
         if set(per_seed[seed]) != keys:
             raise LoadError(f"HRNet {dataset}/{task}: filename set differs across seeds")
 
-    _check_native_sanity("HRNet", dataset, task, per_seed, already_original_space=True)
+    _check_native_sanity("HRNet", dataset, task, per_seed)
     return {"per_seed": per_seed, "filenames": sorted(keys)}
 
 
@@ -333,12 +407,16 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     # numbers reproduces the file's own stored `nme` value exactly (EoMT's
     # native convention is computed in ITS OWN space, with no re-sort
     # needed since predicted/GT channels are already aligned 1:1 as trained).
-    _check_native_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw, already_original_space=False)
+    _check_native_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw)
 
     # *** THE FIX ***: convert every coordinate to real original-image
     # pixel space, using each image's REAL width/height (opened once per
-    # filename, reused across all 5 seeds) and the EXACT inverse of EoMT's
-    # own resize formula.
+    # filename, reused across all 5 seeds). Two steps, composed: (1) recover
+    # true 512x512 model-input-space coordinates from the raw dump (undoes
+    # the dump's own naive-vs-pixel-centre-encode mismatch, a constant
+    # +3.5 offset for 512/64 -- see _heatmap_dump_to_model_input_space's
+    # docstring and this module's "SECOND CRITICAL FIX" note); (2) invert
+    # the original-image -> 512-model-input resize via to_image_space.
     filenames = sorted(keys)
     sizes = {fn: image_size_cache.size(fn) for fn in filenames}
     per_seed_converted: dict[int, dict[str, dict]] = {}
@@ -347,11 +425,16 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
         for fn in filenames:
             row = by_name[fn]
             width, height = sizes[fn]
+
+            def _to_orig(point: tuple[float, float]) -> tuple[float, float]:
+                model_space = _heatmap_dump_to_model_input_space(*point)
+                return to_image_space(*model_space, width, height, EOMT_MODEL_INPUT_SIZE)
+
             converted[fn] = {
-                "pred0": to_image_space(*row["pred0"], width, height, EOMT_MODEL_INPUT_SIZE),
-                "pred1": to_image_space(*row["pred1"], width, height, EOMT_MODEL_INPUT_SIZE),
-                "gt0": to_image_space(*row["gt0"], width, height, EOMT_MODEL_INPUT_SIZE),
-                "gt1": to_image_space(*row["gt1"], width, height, EOMT_MODEL_INPUT_SIZE),
+                "pred0": _to_orig(row["pred0"]),
+                "pred1": _to_orig(row["pred1"]),
+                "gt0": _to_orig(row["gt0"]),
+                "gt1": _to_orig(row["gt1"]),
                 "native_fixed_nme": row["native_fixed_nme"],
             }
         per_seed_converted[seed] = converted
@@ -359,32 +442,47 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     return {"per_seed": per_seed_converted, "filenames": filenames}
 
 
-def _check_native_sanity(method_label: str, dataset: str, task: str,
-                          per_seed: dict, already_original_space: bool) -> None:
+def _check_native_sanity(method_label: str, dataset: str, task: str, per_seed: dict) -> None:
     """Recomputes fixed_channel_nme directly from each row's OWN raw
     coordinates (no unified re-sort, no space conversion) and asserts it
     matches the file's own stored value -- validates this script's parsing
     is correct, independent of the separate original-space conversion
-    (EoMT) or lack thereof (HRNet, already original space)."""
+    (EoMT) or lack thereof (HRNet, already original space).
+
+    Uses a COMBINED absolute+relative tolerance (`abs_err <= atol +
+    rtol*|stored|`), not a pure relative tolerance: for images with a
+    near-zero true NME, the stored value's own 8-decimal text formatting
+    alone can produce a large relative error despite a tiny, meaningless
+    absolute discrepancy -- a pure-relative check would wrongly exclude
+    such cells."""
+    worst_abs_err = 0.0
     worst_rel_err = 0.0
+    all_within_tolerance = True
     n_checked = 0
     for seed, by_name in per_seed.items():
         for fn, row in by_name.items():
             recomputed = fixed_channel_nme(row["pred0"], row["pred1"], row["gt0"], row["gt1"])
             stored = row["native_fixed_nme"]
-            rel_err = abs(recomputed - stored) / max(abs(stored), 1e-9)
+            abs_err = abs(recomputed - stored)
+            rel_err = abs_err / max(abs(stored), 1e-12)
+            worst_abs_err = max(worst_abs_err, abs_err)
             worst_rel_err = max(worst_rel_err, rel_err)
+            if abs_err > NATIVE_SANITY_ATOL + NATIVE_SANITY_RTOL * abs(stored):
+                all_within_tolerance = False
             n_checked += 1
-    if worst_rel_err > NATIVE_SANITY_TOLERANCE:
+    if not all_within_tolerance:
         raise LoadError(
             f"{method_label} {dataset}/{task}: native-reproduction sanity check FAILED "
-            f"(worst relative error {worst_rel_err:.6g} across {n_checked} (seed, image) "
-            f"pairs exceeds tolerance {NATIVE_SANITY_TOLERANCE}) -- this script's own "
-            f"coordinate parsing does not reproduce the file's own stored NME; do not "
-            f"trust any unified-convention number for this cell until this is resolved."
+            f"(worst absolute error {worst_abs_err:.3e}, worst relative error "
+            f"{worst_rel_err:.6g}, across {n_checked} (seed, image) pairs -- exceeds "
+            f"combined tolerance atol={NATIVE_SANITY_ATOL}, rtol={NATIVE_SANITY_RTOL}) -- "
+            f"this script's own coordinate parsing does not reproduce the file's own "
+            f"stored NME; do not trust any unified-convention number for this cell "
+            f"until this is resolved."
         )
     print(f"  [native sanity OK] {method_label} {dataset}/{task}: "
-          f"worst relative error {worst_rel_err:.2e} over {n_checked} (seed,image) pairs")
+          f"worst absolute error {worst_abs_err:.2e}, worst relative error "
+          f"{worst_rel_err:.2e}, over {n_checked} (seed,image) pairs")
 
 
 def bootstrap_ci(values: np.ndarray, replicates: int, rng: np.random.Generator) -> tuple[float, float]:
@@ -503,6 +601,27 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     return seed_rows, [summary_row]
 
 
+def _min_paired_max_abs_diff(bg0: tuple, bg1: tuple, og0: tuple, og1: tuple) -> float:
+    """Compares two methods' GT pairs for the SAME two physical points
+    WITHOUT assuming they use the same channel-order convention: HRNet's
+    own native gt0/gt1 order follows DOD, EoMT's follows x-sort, so for any
+    image where the two rules disagree, `base_gt0` and `other_gt0` may
+    legitimately refer to DIFFERENT physical points even when both methods
+    recovered the location correctly. Comparing channel-index to
+    channel-index directly (as the first version of this check did) would
+    conflate this EXPECTED convention difference with an actual
+    coordinate-recovery bug. Tries both possible pairings and returns
+    whichever is closer -- robust even at an exact x-sort tie, unlike
+    re-canonicalising both sides with x_sort first (which could pick
+    different channels between methods right at a tie under floating-point
+    rounding)."""
+    standard = max(abs(bg0[0] - og0[0]), abs(bg0[1] - og0[1]),
+                   abs(bg1[0] - og1[0]), abs(bg1[1] - og1[1]))
+    swapped = max(abs(bg0[0] - og1[0]), abs(bg0[1] - og1[1]),
+                  abs(bg1[0] - og0[0]), abs(bg1[1] - og0[1]))
+    return min(standard, swapped)
+
+
 def cross_method_gt_consistency_check(dataset: str, task: str, rescored_by_method: dict) -> list[dict]:
     """Per this file's own module docstring: HRNet's GT and EoMT's
     (inverted-to-original-space) GT should describe the SAME physical
@@ -527,8 +646,7 @@ def cross_method_gt_consistency_check(dataset: str, task: str, rescored_by_metho
         for fn in common:
             (bg0, bg1) = base["gt_by_filename"][fn]
             (og0, og1) = other["gt_by_filename"][fn]
-            d = max(abs(bg0[0] - og0[0]), abs(bg0[1] - og0[1]),
-                    abs(bg1[0] - og1[0]), abs(bg1[1] - og1[1]))
+            d = _min_paired_max_abs_diff(bg0, bg1, og0, og1)
             max_gt_coord_diff = max(max_gt_coord_diff, d)
             if base["disagree_by_filename"][fn] != other["disagree_by_filename"][fn]:
                 disagreement_mismatches += 1
