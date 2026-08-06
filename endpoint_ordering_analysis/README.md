@@ -73,6 +73,19 @@ analysis studies. Fixed to compare both possible pairings and take
 whichever is closer, so a pure convention difference is no longer
 misreported as a coordinate-recovery bug.
 
+**Tightened thresholds (fixed 2026-08-07, round 10)**: the cross-method GT
+consistency check originally warned only above a single 5.0px cutoff --
+judged too loose to safely gate a supervisor-facing result on. Now two
+tiers: `max_gt_coord_diff_px > 0.1px` writes a row to
+`cross_method_gt_consistency_warnings.tsv` (a `severe` column marks
+whether it also crosses the next tier); `max_gt_coord_diff_px > 1.0px` is
+a HARD FAILURE -- the script prints exactly which (dataset, task) cells
+are affected and exits non-zero, and those cells' results must not be
+used. The actual max error is always printed for every comparison made
+(`[cross-method GT check] ...`), whether or not it crosses either
+threshold, so a below-threshold result can still be inspected, not just
+inferred from the absence of a warning.
+
 **Important limitation, state this to the supervisor alongside any
 numbers**: this quantifies how much the EXTERNAL SCORING RULE alone
 changes each method's reported NME and whether conclusions (rankings,

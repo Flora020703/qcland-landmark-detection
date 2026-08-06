@@ -122,6 +122,8 @@ Full item-by-item table (all rows re-verified against the CORRECT
 | `custom_hooks: PipelineSwitchHook` (stage-2 augmentation cooldown) | MISSING | **DELIBERATELY NOT ADDED** -- the official stage-2 switch reduces the OFFICIAL RandomBBoxTransform's own scale/rotate ranges; this project already replaces that whole augmentation with EoMT/HRNet-matched values (PROTOCOL_LOCKED.md), so there is no equivalent "official range" to cool down between two stages |
 | `max_epochs=420` | is 200 (configurable) | **KEPT at 200, documented, not silently accidental** -- 420 epochs was tuned for COCO's ~118k training images; this project's fetal datasets are 2-3 orders of magnitude smaller (Train ~100-1600 images per task), so a directly-copied epoch count has no principled basis either way. 200 is this project's own choice, adjustable via `--max-epochs` -- MUST be justified by the canary's own train/val convergence curve, not asserted a priori, per a reviewer's explicit requirement. |
 | Pretrained checkpoint's own `checkpoint=` field | was a hardcoded URL | **FIXED (blocking issue)**: `model.init_weights()` would have loaded from this URL, completely independent of whatever local file `record_run_provenance.py` was separately hashing. `make_config()` now REQUIRES a local `pretrained_checkpoint_path` (resolved to an absolute path before being embedded, so the generated config is not sensitive to the working directory it was generated from) and embeds THAT path as `init_cfg.checkpoint`, so the file that gets loaded and the file that gets hashed/diffed are, by construction, the same file. |
+| `--max-epochs`/`--val-interval` CLI flags | claimed to exist (the `max_epochs=420` row above already said "adjustable via `--max-epochs`"), but the argparse block never actually defined them | **FIXED (real, self-caught discrepancy, 2026-08-07)**: `make_config()` always accepted `max_epochs`/`val_interval` as Python keyword arguments with defaults, but the CLI (`if __name__ == "__main__":` block) never exposed a flag for either -- meaning `run_rtmpose_canary.sh`'s own `$MAX_EPOCHS` shell variable was silently ignored, and every invocation actually generated a 200-epoch config regardless of that variable's value. Found while wiring up `run_smoke_test.sh`, which genuinely needs `--max-epochs 1 --val-interval 1` to take effect. Both flags now exist and are wired through. |
+| Warmup/cosine overlap for very short `max_epochs` | the round-5 warmup formula (`min(5, max(1, max_epochs//20))` epochs) always warms up for >=1 epoch, but `cosine_begin_epoch = max_epochs//2` is 0 or 1 for `max_epochs<4` -- mathematically guaranteed to overlap and trip the existing `SystemExit` guard | **HANDLED, not "fixed" (2026-08-07)**: unreachable for any real config in this project (every real run uses `max_epochs>=20`, comfortably satisfying `warmup_epochs<=5 < max_epochs//2`), so this is not a methodology bug in any existing result. Only reachable when a run genuinely wants `max_epochs<5` (`run_smoke_test.sh`'s `MAX_EPOCHS=1`) -- for that case only, warmup is disabled entirely (`warmup_end_iters=0`, with a loud `WARNING:` printed) rather than erroring, since LR-schedule shape is irrelevant to a smoke test's actual purpose. The generated config's own embedded assert was updated to tolerate `warmup_end_iters==0` as this deliberate degenerate case, not silently pass over a real overlap. |
 """
 
 from __future__ import annotations
@@ -448,7 +450,12 @@ optim_wrapper = dict(
 # proportion (1000 of ~193,200 total iterations ~= 0.5%).
 warmup_end_iters = {warmup_end_iters}
 cosine_begin_epoch = {max_epochs} // 2
-assert warmup_end_iters < cosine_begin_epoch * {iters_per_epoch}, (
+# warmup_end_iters == 0 means make_config.py itself already determined no
+# warmup fits before cosine begins (only possible for a very short
+# max_epochs, e.g. an engineering smoke test) and disabled it -- that is a
+# deliberate, already-validated degenerate case, not a schedule overlap to
+# re-check here.
+assert warmup_end_iters == 0 or warmup_end_iters < cosine_begin_epoch * {iters_per_epoch}, (
     "LinearLR warmup would still be running when CosineAnnealingLR begins -- "
     "recompute warmup_end_iters/cosine_begin_epoch for this dataset size."
 )
@@ -571,14 +578,40 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
     warmup_epochs = min(5, max(1, max_epochs // 20))
     warmup_end_iters = warmup_epochs * iters_per_epoch
     if warmup_end_iters >= cosine_begin_iters:
-        raise SystemExit(
-            f"ERROR: computed warmup_end_iters ({warmup_end_iters}) >= "
-            f"cosine_begin_iters ({cosine_begin_iters}) for n_train_images="
-            f"{n_train_images}, batch_size={batch_size}, max_epochs={max_epochs} "
-            f"-- the LinearLR warmup would still be running when "
-            f"CosineAnnealingLR begins. Adjust batch_size/max_epochs or "
-            f"revisit this formula, do not generate an overlapping schedule."
-        )
+        # Every REAL config this project generates uses max_epochs >= 20
+        # (this project's own established minimum -- see make_config.py's
+        # module docstring table), for which this branch is mathematically
+        # unreachable: warmup_epochs <= 5 < max_epochs // 2 always holds.
+        # This branch is only reachable for a deliberately very short run
+        # (max_epochs < ~5, e.g. run_smoke_test.sh's MAX_EPOCHS=1), where
+        # there is no room for both a warmup phase and a cosine phase --
+        # disable warmup entirely rather than error, since LR-schedule
+        # SHAPE is irrelevant to a smoke test's actual purpose (verifying
+        # the Runner/Hook/checkpoint machinery integrates, not
+        # convergence). NEVER silently rely on this for a real result --
+        # max_epochs is always this project's own explicit choice, and a
+        # loud warning is printed so a real short-schedule experiment
+        # would not go unnoticed.
+        if max_epochs < 5:
+            print(
+                f"WARNING: max_epochs={max_epochs} is too short for the normal "
+                f"warmup(<=5 epochs)/cosine(begins at max_epochs//2) schedule "
+                f"(cosine would begin at iteration {cosine_begin_iters}) -- "
+                f"disabling warmup entirely (warmup_end_iters=0) for this run. "
+                f"Only appropriate for a short engineering smoke test "
+                f"(run_smoke_test.sh); NEVER for a real ablation/formal result."
+            )
+            warmup_epochs = 0
+            warmup_end_iters = 0
+        else:
+            raise SystemExit(
+                f"ERROR: computed warmup_end_iters ({warmup_end_iters}) >= "
+                f"cosine_begin_iters ({cosine_begin_iters}) for n_train_images="
+                f"{n_train_images}, batch_size={batch_size}, max_epochs={max_epochs} "
+                f"-- the LinearLR warmup would still be running when "
+                f"CosineAnnealingLR begins. Adjust batch_size/max_epochs or "
+                f"revisit this formula, do not generate an overlapping schedule."
+            )
 
     text = TEMPLATE.format(
         dataset=dataset, task=task, seed=seed,
@@ -622,9 +655,24 @@ if __name__ == "__main__":
                               "hashes are guaranteed to be the same file.")
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument("--max-epochs", type=int, default=200,
+                         help="NOTE: run_rtmpose_canary.sh's own $MAX_EPOCHS shell variable "
+                              "was NOT actually wired to this flag before this was added -- "
+                              "the generated config silently used the default (200) regardless "
+                              "of that env var. Always pass --max-epochs explicitly if you need "
+                              "anything other than the default; do not rely on the shell "
+                              "variable alone to control it.")
+    parser.add_argument("--val-interval", type=int, default=5,
+                         help="CheckpointHook and InternalFixedChannelNMEHook both save/log at "
+                              "this interval (epochs). Must be <= --max-epochs or no checkpoint "
+                              "will ever be written -- e.g. a 1-epoch smoke run REQUIRES "
+                              "--val-interval 1, not the default 5.")
     args = parser.parse_args()
     path = make_config(args.dataset, args.task, args.seed, args.data_root,
                         args.images_dir, args.internal_train_ann, args.internal_val_ann,
                         args.test_ann, args.pretrained_checkpoint_path,
-                        args.work_dir, args.out)
+                        args.work_dir, args.out,
+                        batch_size=args.batch_size, max_epochs=args.max_epochs,
+                        val_interval=args.val_interval)
     print(f"[OK] wrote {path}")

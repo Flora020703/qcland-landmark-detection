@@ -99,7 +99,14 @@ echo "=== [4/6] generate the canary config ==="
   --test-ann "$GT_TEST_JSON" \
   --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
   --work-dir "$WORK_DIR" \
+  --max-epochs "$MAX_EPOCHS" \
   --out "$CONFIG_PATH"
+# CORRECTED 2026-08-07: --max-epochs was not previously passed here at all
+# -- this script's own $MAX_EPOCHS shell variable was silently ignored by
+# make_config.py (which has no CLI flag for it until this fix), so every
+# invocation of this script actually generated a 200-epoch config
+# regardless of $MAX_EPOCHS. Found while wiring up run_smoke_test.sh, which
+# genuinely needs MAX_EPOCHS=1 to take effect.
 
 echo "=== [4b/6] record + VERIFY pretrained-weight provenance (fails loudly on any key/value mismatch) + actual parameter counts ==="
 "$PY" record_run_provenance.py \
@@ -131,16 +138,16 @@ echo "=== [4c/6] MANDATORY live preflight gate -- refuses to proceed to training
 # PREFLIGHT_ONLY=0 to actually proceed to training.
 if [ "${PREFLIGHT_ONLY:-1}" = "1" ]; then
   echo "=== PREFLIGHT COMPLETE -- PREFLIGHT_ONLY=1 (default), training NOT started ==="
-  echo "Recommended before the real 200-epoch run (review suggestion, not automated"
-  echo "here -- live_preflight.py's fake-Runner Hook test is not a substitute for this):"
-  echo "  run one independent 1-EPOCH smoke run in its own separate work_dir, e.g.:"
-  echo "    MAX_EPOCHS=1 PREFLIGHT_ONLY=0 WORK_DIR_SUFFIX=_smoketest bash run_rtmpose_canary.sh"
-  echo "  (not wired as a flag here -- regenerate a config with --work-dir pointed at a"
-  echo "  throwaway directory and max_epochs=1, run it manually) to confirm optimizer,"
-  echo "  scheduler, InternalFixedChannelNMEHook, and checkpoint saving all genuinely"
-  echo "  work together through Runner.from_cfg()'s real training loop, which the"
-  echo "  fake-Runner Hook test above does not exercise. Delete that work_dir afterward"
-  echo "  -- it is not a result, just an integration smoke test."
+  echo "Recommended before the real 200-epoch run: run_smoke_test.sh (2026-08-07,"
+  echo "genuinely automated -- the manual steps previously suggested here relied on"
+  echo "a --max-epochs flag that did not actually exist in make_config.py yet):"
+  echo "    PY=\$PY PRETRAINED_CKPT_PATH=\$PRETRAINED_CKPT_PATH MMPOSE_TRAIN_TOOL=\$MMPOSE_TRAIN_TOOL bash run_smoke_test.sh"
+  echo "  Exercises the REAL Runner.from_cfg() training loop (optimizer, scheduler,"
+  echo "  InternalFixedChannelNMEHook, CheckpointHook) for exactly 1 epoch in its own"
+  echo "  throwaway work_dir, NEVER touching the Test set -- something live_preflight.py's"
+  echo "  fake-Runner Hook test above does not exercise. It is an engineering check"
+  echo "  only; it prints its own result, never a formal one, and cleans up nothing"
+  echo "  automatically -- delete its work_dir yourself when satisfied."
   echo "Re-run with PREFLIGHT_ONLY=0 to actually start the seed-42 canary."
   exit 0
 fi

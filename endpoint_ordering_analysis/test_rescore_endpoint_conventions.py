@@ -54,6 +54,8 @@ from geometry import to_image_space, to_model_space  # noqa: E402
 from rescore_endpoint_conventions import (
     EOMT_HEATMAP_SIZE,
     EOMT_MODEL_INPUT_SIZE,
+    GT_CONSISTENCY_FAIL_THRESHOLD_PX,
+    GT_CONSISTENCY_WARN_THRESHOLD_PX,
     LoadError,
     _ImageSizeCache,
     _heatmap_dump_to_model_input_space,
@@ -520,6 +522,44 @@ def test_cross_method_gt_consistency_check_tolerates_channel_order_convention_di
     print("[PASS] test_cross_method_gt_consistency_check_tolerates_channel_order_convention_difference")
 
 
+def test_gt_consistency_threshold_tiers():
+    """Regression test for the tightened thresholds (2026-08-07, round 10):
+    below GT_CONSISTENCY_WARN_THRESHOLD_PX -> no warning at all; between
+    warn and GT_CONSISTENCY_FAIL_THRESHOLD_PX -> warning, not severe; above
+    the fail threshold -> warning, severe=true (main() must exit non-zero
+    on any severe warning, checked separately by inspection of main()'s own
+    logic since this test targets the pure function)."""
+    assert GT_CONSISTENCY_WARN_THRESHOLD_PX < GT_CONSISTENCY_FAIL_THRESHOLD_PX
+
+    def _cell(dx):
+        p0, p1 = (10.0, 10.0), (90.0, 10.0)
+        return {
+            "gt_by_filename": {"x.jpg": (p0, p1)},
+            "disagree_by_filename": {"x.jpg": False},
+        }, {
+            "gt_by_filename": {"x.jpg": ((p0[0] + dx, p0[1]), p1)},
+            "disagree_by_filename": {"x.jpg": False},
+        }
+
+    below_a, below_b = _cell(GT_CONSISTENCY_WARN_THRESHOLD_PX / 2.0)
+    warnings = cross_method_gt_consistency_check("UCL", "bpd", {"hrnet": below_a, "eomt_dinov2": below_b})
+    assert warnings == [], f"expected no warning below the warn threshold, got {warnings}"
+
+    mid_dx = (GT_CONSISTENCY_WARN_THRESHOLD_PX + GT_CONSISTENCY_FAIL_THRESHOLD_PX) / 2.0
+    mid_a, mid_b = _cell(mid_dx)
+    warnings = cross_method_gt_consistency_check("UCL", "bpd", {"hrnet": mid_a, "eomt_dinov2": mid_b})
+    assert len(warnings) == 1 and warnings[0]["severe"] == "false", (
+        f"expected exactly one non-severe warning between thresholds, got {warnings}"
+    )
+
+    above_a, above_b = _cell(GT_CONSISTENCY_FAIL_THRESHOLD_PX * 2.0)
+    warnings = cross_method_gt_consistency_check("UCL", "bpd", {"hrnet": above_a, "eomt_dinov2": above_b})
+    assert len(warnings) == 1 and warnings[0]["severe"] == "true", (
+        f"expected exactly one SEVERE warning above the fail threshold, got {warnings}"
+    )
+    print("[PASS] test_gt_consistency_threshold_tiers")
+
+
 def test_min_paired_max_abs_diff_picks_closer_pairing():
     """Direct unit test of the pairing-robust comparison helper itself."""
     bg0, bg1 = (10.0, 10.0), (90.0, 10.0)
@@ -539,6 +579,7 @@ def main():
     test_native_sanity_check_detects_corrupted_stored_nme()
     test_cross_method_gt_consistency_check_detects_mismatch()
     test_cross_method_gt_consistency_check_tolerates_channel_order_convention_difference()
+    test_gt_consistency_threshold_tiers()
     test_min_paired_max_abs_diff_picks_closer_pairing()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()

@@ -141,7 +141,13 @@ number if these fail):
     two conventions legitimately disagree on which physical point is
     "channel 0" for some images -- comparing index-to-index directly would
     conflate that expected convention difference with an actual
-    coordinate-recovery bug.
+    coordinate-recovery bug. Thresholded (round 10, tightened from an
+    original single 5.0px cutoff): > 0.1px (GT_CONSISTENCY_WARN_THRESHOLD_PX)
+    is written to `cross_method_gt_consistency_warnings.tsv` as a warning;
+    > 1.0px (GT_CONSISTENCY_FAIL_THRESHOLD_PX) is a HARD FAILURE -- the run
+    exits non-zero and that (dataset, task)'s results must not be used. The
+    actual max error is always printed for every comparison made, whether
+    or not it crosses either threshold.
   - Cross-method GT disagreement-rate consistency: the x-sort-vs-DOD
     disagreement rate on GT alone should be (near-)IDENTICAL whether
     computed from HRNet's GT or EoMT's (inverted) GT for the same
@@ -199,6 +205,17 @@ EOMT_HEATMAP_SIZE = 64  # verified via grep: every matched-protocol landmark con
 # a large relative (but tiny absolute) discrepancy.
 NATIVE_SANITY_RTOL = 1e-4
 NATIVE_SANITY_ATOL = 5e-8
+
+# Cross-method GT consistency thresholds (2026-08-07, round 10, tightened
+# from an original single "> 5.0 -> warn" threshold that was judged too
+# loose to safely gate a supervisor-facing result on): a small residual
+# max_gt_coord_diff_px is expected even for a fully correct pipeline (e.g.
+# `round()`-to-int image-size handling, PIL resize rounding) -- WARN above
+# that, but only HARD-FAIL the run above a threshold large enough that it
+# can no longer plausibly be rounding noise and must reflect an actual
+# coordinate-recovery or sample-matching bug for that (dataset, task).
+GT_CONSISTENCY_WARN_THRESHOLD_PX = 0.1
+GT_CONSISTENCY_FAIL_THRESHOLD_PX = 1.0
 
 
 def _heatmap_dump_to_model_input_space(dumped_x: float, dumped_y: float) -> tuple[float, float]:
@@ -653,11 +670,15 @@ def cross_method_gt_consistency_check(dataset: str, task: str, rescored_by_metho
 
         base_rate = np.mean([base["disagree_by_filename"][fn] for fn in common])
         other_rate = np.mean([other["disagree_by_filename"][fn] for fn in common])
+        # Always printed, regardless of whether it crosses any threshold --
+        # the actual max error must be visible for every comparison made,
+        # not only when it happens to trip a warning.
         print(f"  [cross-method GT check] {dataset}/{task}: {base_method} vs {other_method}, "
-              f"n_common={len(common)}, max_gt_coord_diff_px={max_gt_coord_diff:.3f}, "
+              f"n_common={len(common)}, max_gt_coord_diff_px={max_gt_coord_diff:.4f}, "
               f"disagreement_rate {base_method}={base_rate:.4f} vs {other_method}={other_rate:.4f}, "
               f"per-image mismatches={disagreement_mismatches}")
-        if max_gt_coord_diff > 5.0 or disagreement_mismatches > 0:
+        if max_gt_coord_diff > GT_CONSISTENCY_WARN_THRESHOLD_PX or disagreement_mismatches > 0:
+            severe = max_gt_coord_diff > GT_CONSISTENCY_FAIL_THRESHOLD_PX
             warnings.append({
                 "dataset": dataset, "task": task,
                 "method_a": base_method, "method_b": other_method,
@@ -666,6 +687,7 @@ def cross_method_gt_consistency_check(dataset: str, task: str, rescored_by_metho
                 "disagreement_rate_a": f"{base_rate:.6f}",
                 "disagreement_rate_b": f"{other_rate:.6f}",
                 "per_image_disagreement_mismatches": disagreement_mismatches,
+                "severe": "true" if severe else "false",
             })
     return warnings
 
@@ -782,7 +804,7 @@ def main():
     with consistency_path.open("w", newline="", encoding="utf-8") as handle:
         fields = ["dataset", "task", "method_a", "method_b", "n_common",
                    "max_gt_coord_diff_px", "disagreement_rate_a", "disagreement_rate_b",
-                   "per_image_disagreement_mismatches"]
+                   "per_image_disagreement_mismatches", "severe"]
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         writer.writerows(gt_consistency_warnings)
@@ -808,6 +830,19 @@ def main():
     print("for those specific (dataset, task) combinations, this analysis provides NO evidence")
     print("about endpoint-ordering sensitivity; state this explicitly, do not extrapolate from")
     print("other tasks. UCL BPD/EoMT is expected to be among these (checkpoints already gone).")
+
+    severe_warnings = [w for w in gt_consistency_warnings if w["severe"] == "true"]
+    if severe_warnings:
+        print(f"\n*** HARD FAILURE: {len(severe_warnings)} (dataset, task) cross-method GT "
+              f"comparison(s) exceed {GT_CONSISTENCY_FAIL_THRESHOLD_PX}px "
+              f"(max_gt_coord_diff_px) -- too large to be resize/rounding noise, and must "
+              f"reflect an actual coordinate-recovery or sample-matching bug. ***")
+        for w in severe_warnings:
+            print(f"  UNUSABLE: {w['dataset']}/{w['task']} ({w['method_a']} vs {w['method_b']}): "
+                  f"max_gt_coord_diff_px={w['max_gt_coord_diff_px']}")
+        print(f"Do NOT use these tasks' unified-convention results for anything -- see "
+              f"{consistency_path}. Exiting non-zero.")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
