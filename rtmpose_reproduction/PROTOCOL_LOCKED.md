@@ -94,18 +94,32 @@ and near-vertical endpoint pairs and prove that:
 3. fixed-channel NME is never smaller than swap-min NME for the same sample;
 4. flip plus inverse flip preserves the canonical endpoint identities.
 
-**Update, 2026-08-06**: item 4 above was audited with real code and real
-data (`audit_flip_order_stability.py`) before the canary, per this
-project's own review process, and the FIRST implementation of this gate
-failed it -- a static `flip_indices` setting silently mislabelled ~100% of
-UCL OFD/APAD/FL training samples under flip (0.0-0.2% for BPD/TAD, whose
-DOD direction happens to be near-vertical). Fixed via
-`fetal_augment.sequential_train_augment` / `transforms.FetalTrainAugment`,
-which re-derives the DOD projection after every accepted flip/rotation
-instead of assuming a fixed swap/no-swap rule. Full writeup:
-`PROTOCOL_AUDIT.md`. This is the concrete lesson behind this file's own
+**Update, 2026-08-06 (two rounds; see PROTOCOL_AUDIT.md for the full
+writeup, kept there rather than duplicated at length here)**: item 4 above
+was audited with real code and real data before the canary. Round 1 found
+a real instability (a static `flip_indices` design mislabels ~100% of UCL
+OFD/APAD/FL training samples under flip, 0.0-0.2% for BPD/TAD) but
+misdiagnosed the fix -- it assumed HRNet meaningfully re-transforms its
+`d_vect` through each sample's center/scale/rotation, and built
+`fetal_augment.py`'s first version to match that assumption. Round 2 proved
+directly from HRNet's real `get_transform` formula (algebraically and via
+400/400 matching numerical reproduction) that `center`/`scale`/`rotation`
+all CANCEL for HRNet's ordering decision -- the real, verified fact is that
+HRNet's own flip handling genuinely has this exact instability for
+near-horizontal-`d_vect` tasks; it is a property of the reference method,
+not an adapter bug to fix relative to it. `fetal_augment.py`/`transforms.py`
+were rewritten accordingly (`resolve_channel_order_after_flip`, evaluated in
+ORIGINAL image space using the STATIC `d_vect`, running before the
+anisotropic pixel-centre resize). Round 2 also found and fixed four
+additional blocking issues (Test-set-as-validation leakage, `run_inference.py`
+bypassing the model's data preprocessor, non-deterministic final-checkpoint
+selection, and unverified pretrained-weight loading) and named the
+EoMT-vs-HRNet/RTMPose endpoint-ordering convention mismatch as an explicit,
+still-open decision for the supervisor -- not something this session
+resolved unilaterally. This is the concrete lesson behind this file's own
 instruction above ("must be audited... before any training") -- audit
-against real code and real data, not by name/analogy alone.
+against real code and real data, not by name/analogy alone, and be
+prepared to have a first audit pass itself be wrong.
 
 ## Mandatory canary
 

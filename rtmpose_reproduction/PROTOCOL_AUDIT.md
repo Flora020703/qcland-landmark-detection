@@ -1,224 +1,317 @@
-# Code-level protocol audit, before canary training (2026-08-06)
+# Code-level protocol audit, before canary training
 
-Requested explicitly before starting the UCL BPD/seed-42 canary, given the
-supervisor's approval email listed two items that needed verifying against
-actual code rather than assumed identical by name: (1) "same augmentation
-strategy" across EoMT/HRNet/RTMPose, itemised; (2) endpoint ordering and
-flip convention, verified through code, not just a `flip_indices` setting.
-Both are covered below, against the real source of all three methods (this
-repo's `datasets/landmark_dataset.py` and `ablation/ensemble_test.py` for
-EoMT; the audited upstream `lib/datasets/fetal.py`/`lib/utils/transforms.py`
-for HRNet; this adapter's own code for RTMPose), not from memory or
-docstrings alone.
+Two review rounds on 2026-08-06. The first round covered the two items the
+supervisor explicitly flagged (augmentation-strategy parity, endpoint
+ordering/flip convention) and found a real bug, but with an INCORRECT root
+cause. A second, independent review of that first round's own work caught
+the error with a rigorous mathematical argument, checked directly against
+the audited upstream HRNet's actual source, and additionally found four
+more blocking implementation issues the first round missed entirely. This
+document keeps both rounds' history rather than silently overwriting it,
+per this project's own established norm of marking superseded findings
+`SUPERSEDED`, not deleting them.
 
-## 1. Augmentation, item by item
+## SUPERSEDED: first-round "100% flip-order bug" framing was mathematically wrong
 
-| Item | EoMT (`datasets/landmark_dataset.py`) | HRNet (`lib/datasets/fetal.py`, `lib/utils/transforms.py`) | RTMPose (this adapter, after today's fix) |
+**What the first round claimed**: `audit_flip_order_stability.py` measured
+that a static `flip_indices=[0,1]` design (mirror points on flip, never
+re-derive channel order) disagreed with a fresh DOD projection on 100% of
+UCL OFD/APAD/FL training images, and concluded this was a genuine bug
+because it assumed HRNet's own `_transform_pixel_float(d_vect, center,
+scale, output_size, rot)` "re-derives the projection after every
+augmentation draw" by meaningfully transforming `d_vect` through the
+sample's own center/scale/rotation. The fix applied (`fetal_augment.py`'s
+first version) transformed `d_vect` through flip AND rotation before
+re-projecting, in already-512-space.
+
+**Why this was wrong, verified against the real HRNet source (`lib/utils/
+transforms.py`'s `get_transform`, `lib/datasets/fetal.py`'s DOD
+reassignment block)**:
+
+`get_transform(center, scale, output_size, rot)` produces an affine map of
+the form `new = L(rot, scale) @ (point - center) + output_size/2`, where
+`L` (a rotation composed with an isotropic scale) does NOT depend on
+`center`. A sample's own keypoints AND the frozen `d_vect` prototype points
+are both passed through this SAME map with the SAME (center, scale, rot)
+for a given sample. Two direct consequences, both proven algebraically and
+confirmed empirically by literally re-implementing HRNet's exact formula
+and testing it against 400 randomised (center, scale, rotation) draws with
+ZERO mismatches (script: `verify_hrnet_dvect_cancellation.py`, run
+2026-08-06, not checked into the repo -- a scratch verification, kept only
+in this document as its written record):
+
+1. `center` cancels EXACTLY in any pairwise comparison (`proj_i - proj_j`),
+   because it enters as an additive term shared by both points of a pair.
+   This means the "mirrored center" HRNet builds when a sample is flipped
+   has **zero effect** on the derived projection direction.
+2. `L` is a similarity transform (orthogonal times a positive scalar), so
+   the dot product of two vectors both passed through the same `L` changes
+   only by a positive scalar factor -- meaning `scale` and `rot` ALSO
+   cancel for the ordering decision specifically (they still matter for
+   the actual heatmap-target coordinates, just not for which point is
+   called channel 0).
+
+**The real, verified fact**: HRNet's own per-sample DOD ordering decision
+reduces EXACTLY to comparing the sample's raw, ORIGINAL-image-space
+keypoints -- flip-mirrored if a flip was drawn that epoch, untouched
+otherwise -- against the STATIC, NEVER-TRANSFORMED original `d_vect`. This
+is precisely what `audit_flip_order_stability.py` computed as its
+"counterfactual" -- meaning the measured 100%/0% pattern IS an accurate
+description of HRNet's OWN real training-time behaviour, not a divergence
+from it. **HRNet's own flip handling has exactly this instability** for
+near-horizontal-`d_vect` tasks (OFD/APAD/FL): a training sample's
+channel-0/1 assignment genuinely depends on that epoch's own flip draw.
+This is a real, pre-existing property of the audited upstream reference
+implementation, not something introduced by this adapter, and not
+something to "fix" relative to HRNet's own convention -- it is the
+convention.
+
+**Consequence**: the first round's "fix" (transforming `d_vect` through
+flip AND rotation, done in already-resized 512-space) was itself a NEW
+divergence from HRNet's real behaviour, compounded by a second, separate
+error: doing this comparison in already-resized 512-space uses this
+project's own ANISOTROPIC pixel-centre resize, which does not preserve the
+sign of a dot-product-based order comparison for a non-square source image
+the way HRNet's isotropic crop-scale does. Both errors are corrected below.
+
+## Corrected design (second pass, `fetal_augment.py`/`transforms.py` rewritten)
+
+- `resolve_channel_order_after_flip` (`fetal_augment.py`): the ONLY
+  function that touches `d_vect`. Runs on ORIGINAL image-pixel-space
+  points, mirrors them if a flip is drawn, and compares against the
+  STATIC, un-transformed `d_vect` -- exactly reproducing HRNet's real,
+  verified behaviour. Must run BEFORE the anisotropic pixel-centre resize
+  (new transform `transforms.FetalRandomFlipAndCanonicalize`, now FIRST in
+  the train pipeline, before `PixelCentreResize`).
+- `sequential_rotate_scale` (`fetal_augment.py`): rotation/scale as pure
+  position updates in already-512-space, no `d_vect` involved at all
+  (proven to have zero effect on the ordering decision) -- retains EoMT's
+  own independent per-stage accept/reject-if-out-of-canvas policy purely
+  to keep points on-canvas, not for ordering. Runs in the new
+  `transforms.FetalRotateScaleColorJitter`, AFTER `PixelCentreResize`.
+- 7 tests in `test_fetal_augment.py`, rewritten to test the corrected
+  functions (including a re-derivation-consistent regression test for the
+  real UCL OFD case and a 500-case randomised property test of the
+  "same original point always wins channel 0" invariant that DOES hold
+  under this corrected design, unlike the abandoned flip-transforms-d_vect
+  approach). All pass.
+
+**Practical upshot for the adapter's own results (not HRNet's)**: since the
+static-direction design is being kept (not "fixed") for BPD/TAD (whose
+`d_vect` is near-vertical, ~0% affected) and OFD/APAD/FL (whose `d_vect` is
+near-horizontal, ~100% affected), RTMPose's OWN training targets for
+OFD/APAD/FL will have the SAME per-epoch channel-identity instability
+HRNet's real training data has. This is disclosed, not hidden, and is now
+understood to be a property of the shared method (both HRNet and RTMPose,
+by faithful replication), not an adapter-specific defect.
+
+## Still not fully unified: EoMT uses a THIRD, different convention
+
+Re-confirmed via source (`datasets/landmark_dataset.py` line 274-277,
+`ablation/ensemble_test.py`'s `dod_sort`): EoMT uses a per-sample
+**ascending-x-coordinate sort**, recomputed fresh at every access, AFTER
+all geometric augmentation -- equivalent to projecting onto a fixed PURELY
+HORIZONTAL direction, not a learned direction at all, and NOT subject to
+the same "stale frozen order" concern HRNet/RTMPose have (it is always
+freshly recomputed, so it cannot go stale) -- but it IS a different rule
+from HRNet/RTMPose's learned-direction convention.
+
+Quantified disagreement between EoMT's x-sort and HRNet's DOD, on real UCL/
+Multicentre training data:
+
+| Dataset | Task | d_vect axis | EoMT-x-sort vs HRNet-DOD disagreement |
+|---|---|---|---:|
+| UCL | BPD | near-vertical | 45.5% |
+| UCL | OFD | near-horizontal | 100.0% |
+| UCL | APAD | near-horizontal | 0.0% |
+| UCL | TAD | near-vertical | 42.6% |
+| UCL | FL | near-horizontal | 0.0% |
+| Multicentre | BPD | near-vertical | 48.3% |
+| Multicentre | TAD | near-vertical | 41.5% |
+
+**This is a genuinely unresolved item, not something this session can close
+by itself.** The supervisor's instruction was "use the same
+endpoint-ordering and horizontal-flip conventions across RTMPose, HRNet and
+EoMT." As implemented: RTMPose and HRNet share an identical, code-verified
+convention (learned `d_vect` direction). EoMT uses its own, different,
+already-locked convention (x-sort) that cannot be changed without
+retraining EoMT's already-reported 5-seed results. Two honest paths
+forward, neither of which this session can decide unilaterally:
+
+1. **Accept "method-native training ordering + common external evaluation
+   ordering"**: each method keeps its own training-time convention (since
+   EoMT can't be retrained), but the EXTERNAL fixed-channel/swap-min
+   evaluator is what actually gets compared in the thesis, and that
+   evaluator is identical code (`evaluate_hrnet_fixed.py`/
+   `evaluate_rtmpose_fixed.py`, same formula) applied to each method's own
+   already-decided GT channel assignment. This is the status quo (already
+   true for EoMT-vs-HRNet before RTMPose existed) and is already partially
+   disclosed in the thesis's "correspondence gap"/endpoint-canonicalisation
+   limitation discussion.
+2. **Re-canonicalise all three methods' raw predictions offline, post hoc,
+   under one single shared rule** (e.g. always use HRNet's `d_vect`
+   convention as the arbiter for every method's predictions AND ground
+   truth, recomputed at evaluation time only): this would make the
+   EXTERNAL comparison genuinely apples-to-apples on ordering, at the cost
+   of being a new analysis step not yet implemented for any of the three
+   methods' historical results, and would still not make EoMT's OWN
+   TRAINING targets consistent with this rule (EoMT was trained under
+   x-sort supervision; its predictions' channel identity reflects that,
+   not a retrained-under-DOD identity).
+
+This must go back to the supervisor as an explicit, named open question --
+not silently treated as resolved. Do not write in the thesis or canary
+report that all three methods now share one endpoint-ordering convention;
+they do not.
+
+## Second-round review: four additional blocking issues, all fixed
+
+### 1. Test set was being used as validation (real data leakage, not a soft violation)
+
+`make_config.py`'s original `val_dataloader` pointed at the released Test
+annotation file, with `test_dataloader = val_dataloader`, PCK computed on
+it every `val_interval` epochs, and `default_hooks.checkpoint`'s
+`save_best="PCK"` selecting a checkpoint from that same Test-derived
+metric. This is a genuine leak regardless of the fact that the REPORTED
+result was always going to be the final checkpoint -- the official Test
+set must never be read during training at all, not just never used for
+final selection.
+
+**Fixed**: new `make_internal_val_split.py` builds a Train-only internal
+validation split, REUSING EoMT's own exact subject-grouping/shuffle/split
+algorithm (`datasets/landmark_dataset.py`'s `_subject_id`/
+`_split_by_subject`, ported verbatim: `re.match(r"^(\d+)", filename)`
+subject extraction, `np.random.default_rng(val_split_seed=42)` shuffle,
+`ceil(N_subjects * val_fraction=0.1)` held out) rather than an
+independently invented split. Run against the real UCL BPD Train CSV: 100
+internal-train / 10 internal-val (of 110 total Train rows) -- this exact
+100/10 figure independently matches a split size already referenced
+elsewhere in this project's own records for UCL's internal validation,
+which is a strong external check that the ported algorithm is correct, not
+just internally self-consistent. `convert_csv_to_coco.py` gained a
+`--internal-split-json`/`--internal-split-part` option to materialise this
+split as two separate COCO jsons from the SAME Train CSV.
+`make_config.py`'s `val_dataloader` now points at the internal-val json;
+`test_dataloader` is a SEPARATE dataloader over the real Test set, touched
+only once, after training, by `run_inference.py` -- nothing in the
+training loop reads it. `default_hooks.checkpoint` no longer uses
+`save_best` at all (removed entirely, not just repointed at the
+now-legitimate internal metric) -- `save_last=True` guarantees the true
+final-epoch checkpoint always exists, matching PROTOCOL_LOCKED.md's
+"final/last" primary convention without ambiguity.
+
+### 2. `run_inference.py` bypassed the model's data preprocessor
+
+The original script called `model.extract_feat(inputs)` directly on the
+raw tensor from the dataset pipeline (`LoadImage -> PixelCentreResize ->
+PackPoseInputs`), never calling `model.data_preprocessor` (mean/std
+normalisation, BGR->RGB if configured). The pipeline transforms do not
+apply this normalisation themselves -- it happens at model-forward time,
+which is how the model was trained. Feeding un-normalised pixel values
+would run without error but make every exported coordinate meaningless.
+
+**Fixed**: `run_inference.py` now calls `model.data_preprocessor({"inputs":
+[data["inputs"]], "data_samples": [data_sample]}, False)` before
+`extract_feat`, while still deliberately stopping short of
+`model.test_step()`/`predict()` (which would additionally invoke MMPose's
+stock bbox-based inverse transform this project must avoid). The exact
+call contract for a single manually-collated sample is flagged in
+`ENVIRONMENT.md`'s checklist as needing live confirmation, same tier as
+the rest of this file's MMPose-dependent assumptions.
+
+### 3. Final-checkpoint selection was neither deterministic nor guaranteed final
+
+`run_rtmpose_canary.sh` selected the checkpoint via `find ... -name
+"best_PCK_epoch_*.pth" -o -name "epoch_*.pth" | sort | tail -1` --
+lexicographic sort is wrong for numeric epoch counts (`epoch_95.pth` sorts
+after `epoch_200.pth`), and the glob could pick up a "best" checkpoint file
+over the true final one. PROTOCOL_LOCKED.md requires the true final/last
+checkpoint as the primary result.
+
+**Fixed**: the script now reads MMEngine's own `last_checkpoint` pointer
+file (written by the Runner every time `CheckpointHook` saves, standard
+MMEngine behaviour -- flagged for live confirmation of the exact
+filename/format) and explicitly asserts its filename is `epoch_
+{MAX_EPOCHS}.pth`, failing loudly rather than falling back to any other
+checkpoint if this doesn't hold. Combined with fix #1's `save_best`
+removal, there is no longer any "best" checkpoint file for a bug to
+silently prefer.
+
+### 4. `record_run_provenance.py` never actually verified checkpoint loading
+
+The original script only called `MODELS.build(cfg.model)` and assumed the
+backbone's `init_cfg=dict(type='Pretrained', ...)` had already taken
+effect -- in MMEngine's convention, `init_cfg` only declares HOW to
+initialise; actual loading happens when `model.init_weights()` runs, which
+building alone does not guarantee. The script also documented recording
+"which keys loaded" without ever actually checking, and
+`run_rtmpose_canary.sh` never passed `--pretrained-checkpoint-path`, so the
+recorded SHA-256 would always have been `null`.
+
+**Fixed**: `model.init_weights()` is now called explicitly;
+`--pretrained-checkpoint-path` is a required argument; the checkpoint's own
+state dict is independently loaded and diffed by key name against
+`model.backbone.state_dict()` (after stripping the configured `prefix`),
+AND the loaded keys' actual tensor VALUES are compared before/after
+`init_weights()` to confirm they genuinely changed (catching the case where
+key names match but loading silently no-ops). The script now raises loudly
+if zero keys match or if every matched key's value is unchanged.
+`ENVIRONMENT.md` gained an explicit download step for the checkpoint file
+and a required `PRETRAINED_CKPT_PATH` environment variable in the canary
+driver.
+
+## Augmentation, item by item (first-round finding, re-confirmed still accurate after the pipeline restructuring above)
+
+| Item | EoMT (`datasets/landmark_dataset.py`) | HRNet (`lib/datasets/fetal.py`, `lib/utils/transforms.py`) | RTMPose (this adapter) |
 |---|---|---|---|
 | Horizontal flip probability | 0.5 | 0.5 | 0.5 (matched) |
-| Rotation range | U(-30, 30) deg, applied at p=0.6 | U(-ROT_FACTOR, ROT_FACTOR), ROT_FACTOR=30, p=0.6 (confirmed identical across every `experiments/fetal/fetal_landmark_hrnet_w18_*.yaml`) | U(-30, 30) deg, p=0.6 (matched) |
-| Scale range | U(0.75, 1.25), unconditional (no probability gate) | U(1-SCALE_FACTOR, 1+SCALE_FACTOR), SCALE_FACTOR=0.25 -> U(0.75,1.25), unconditional (matched exactly) | U(0.75, 1.25), unconditional (matched) |
-| Translation | none | none | none (matched: none of the three do random translation) |
-| Interpolation | PIL `Image.BILINEAR` (resize, rotate, and the scale-zoom's resize+paste) | `cv2.INTER_LINEAR` everywhere (`crop_v2`/`crop`) | `cv2.INTER_LINEAR` (PixelCentreResize + FetalTrainAugment's warpAffine calls) |
-| Order of operations | resize to 512 FIRST, then flip, then rotate (in-place, own centre), then scale (in-place zoom), then DOD x-sort, then color jitter | ONE combined affine (`crop()`, built from center/scale/rot) applied to the ORIGINAL (un-resized) image in a single warp; flip happens separately beforehand via `np.fliplr` on the raw array | resize to 512 first (`PixelCentreResize`), then flip, then rotate (separate warpAffine), then scale (separate warpAffine), then DOD reorder, then color jitter -- **matches EoMT's staged order, not HRNet's single-combined-affine order** (deliberate: EoMT's own numbers are already locked/non-retrainable, so RTMPose was built to match EoMT's mechanics where the two diverge from HRNet) |
-| Out-of-bounds policy | reject (skip) rotation/scale independently if any landmark would leave the canvas; never clamp | none needed -- HRNet's crop/warp always samples a fixed-size output region by construction, points can't leave the canvas | reject (skip) rotation/scale independently, same policy as EoMT (`fetal_augment.sequential_train_augment`) |
-| Colour jitter | brightness/contrast/saturation, U(-0.2,0.2)/U(-0.2,0.2)/U(-0.1,0.1), each p=0.5, via `torchvision.transforms.functional` | **none** (confirmed via `grep -n "bright\|contrast\|satur\|hue\|jitter" lib/datasets/fetal.py` -> zero matches) | matches EoMT exactly (same torchvision calls, same ranges/probabilities) -- **this means RTMPose's colour jitter matches EoMT but NOT HRNet; HRNet has no colour augmentation to match** |
-| Random crop | none (whole image, no separate crop step) | the affine warp itself acts as a crop around `center`/`scale`, but there is no ADDITIONAL random-crop step beyond that single warp | none (matches EoMT structurally: no separate crop step) |
-| RandomHalfBody / person-specific transforms | never had any (not a person-keypoint task) | never had any | explicitly removed from the RTMPose config per the supervisor's instruction (not present in `make_config.py`'s train_pipeline) |
+| Rotation range | U(-30, 30) deg, p=0.6 | U(-ROT_FACTOR, ROT_FACTOR), ROT_FACTOR=30, p=0.6 (confirmed identical across every `experiments/fetal/fetal_landmark_hrnet_w18_*.yaml`) | U(-30, 30) deg, p=0.6 (matched) |
+| Scale range | U(0.75, 1.25), unconditional | U(1-SCALE_FACTOR, 1+SCALE_FACTOR), SCALE_FACTOR=0.25, unconditional (matched exactly) | U(0.75, 1.25), unconditional (matched) |
+| Translation | none | none | none (matched) |
+| Interpolation | PIL `Image.BILINEAR` | `cv2.INTER_LINEAR` everywhere | `cv2.INTER_LINEAR` |
+| Order of operations | resize to 512 FIRST, then flip/rotate/scale in the fixed canvas | ONE combined affine on the ORIGINAL (un-resized) image; flip via `np.fliplr` beforehand | flip decided/applied in ORIGINAL space first (channel-order correctness requirement, see above), THEN resize to 512, THEN rotate/scale in the resized canvas -- matches EoMT's staged structure more than HRNet's single-combined-affine structure, a disclosed, deliberate choice since EoMT's numbers are already locked |
+| Out-of-bounds policy | reject (skip) rotation/scale independently if any landmark would leave the canvas | none needed (fixed-size output region by construction) | reject (skip) rotation/scale independently, same policy as EoMT |
+| Colour jitter | brightness/contrast/saturation, U(-0.2,0.2)/U(-0.2,0.2)/U(-0.1,0.1), each p=0.5 | **none** (confirmed via grep, zero matches) | matches EoMT's exact torchvision calls/ranges; explicit BGR<->RGB channel-order handling added since MMCV's `LoadImage` conventionally produces BGR and torchvision's jitter assumes RGB semantics -- flagged for live confirmation |
+| Random crop | none | the affine warp itself acts as an implicit crop, no additional step | none |
+| RandomHalfBody | never had any | never had any | explicitly removed per supervisor instruction |
 
-**Conclusion**: augmentation is now matched on probability/range for every
-parameter that exists in more than one method (flip, rotation, scale), and
-RTMPose additionally now HAS rotation+scale (previously deferred, see
-Section 3). It is **not bitwise-identical** across all three implementations
--- the disclosed, real differences are: (a) HRNet performs one combined
-affine warp on the un-resized image where EoMT/RTMPose perform staged
-operations on an already-512-resized canvas (a pre-existing EoMT-vs-HRNet
-difference, not something introduced today); (b) PIL vs cv2 bilinear
-resampling kernels are not guaranteed bit-identical; (c) colour jitter
-exists in EoMT and RTMPose but not in HRNet at all. None of this should be
-described in the thesis as bitwise-identical augmentation; it should be
-described as "the same augmentation family and parameter ranges, with the
-disclosed mechanical differences above."
+**Conclusion unchanged from the first round**: matched on probability/range
+for every shared parameter; NOT bitwise-identical (staged vs combined
+affine, PIL vs cv2 resampling, EoMT/RTMPose-only colour jitter). State this
+precisely in the thesis, never as bitwise-identical augmentation.
 
-## 2. Endpoint ordering / flip convention -- verified through code, not assumed
+## Status after this second-round audit
 
-### 2a. What each method's channel-0/channel-1 rule actually is
+Not yet run against a live install (still no MMPose environment available
+this session) -- what IS newly true, verified with real passing local
+tests:
 
-- **EoMT** (`datasets/landmark_dataset.py` line 274-277, `ablation/ensemble_test.py`'s `dod_sort`): a **per-sample ascending-x sort**, recomputed fresh at every access, AFTER all geometric augmentation. This is equivalent to projecting onto a fixed PURELY HORIZONTAL direction. It is not a learned direction and has no memory across samples.
-- **HRNet** (`lib/datasets/fetal.py` lines 249-289, confirmed via direct source read): a **learned direction vector `d_vect`** (two prototype points, fit once per (dataset, task) via a Gaussian mixture on the training CSV, `random_state=0`, frozen thereafter), re-projected through that sample's own center/scale/rotation transform every `__getitem__` call, tie-safe (`proj0 <= proj1` keeps order).
-- **RTMPose (this adapter)**: reuses HRNet's own frozen `d_vect`, extracted directly from real trained checkpoints (`dod_vectors.py`), verified against HRNet's own real per-image test output (`test_endpoint_order.py`). This is a deliberate choice matching `PROTOCOL_LOCKED.md`'s explicit instruction ("audited against the project's existing training-derived DOD/canonicalisation convention used for the matched HRNet fixed-channel results") -- i.e. **RTMPose is built to match HRNet's convention, not EoMT's.**
+- The flip-order finding is now mathematically correct, not just
+  internally consistent, verified both algebraically and by direct
+  numerical reproduction of HRNet's real formula (400/400 match).
+- `fetal_augment.py`/`transforms.py` implement the corrected design; 7/7
+  tests pass (rewritten from the first round's now-invalid test
+  assertions).
+- The EoMT-vs-HRNet/RTMPose convention gap is explicitly named as an open
+  decision for the supervisor, not silently treated as resolved.
+- Test-set leakage into validation/checkpoint-selection is fixed with a
+  genuine Train-only internal split reusing EoMT's own algorithm.
+- `run_inference.py` routes through the model's real preprocessing.
+- Final-checkpoint selection is deterministic and fails loudly if the
+  training run didn't actually complete `MAX_EPOCHS`.
+- Pretrained-weight loading is independently verified by value comparison,
+  not assumed from `init_cfg` alone.
+- The full non-square + SimCC-codec-level round trip remains BLOCKED on a
+  live MMPose install (see `ENVIRONMENT.md`'s checklist item 6) -- the
+  pure-Python geometry/reorder tests that DO pass are a strict subset of
+  the real pipeline and must not be read as covering codec quantisation
+  error.
 
-### 2b. EoMT and HRNet do NOT use the same rule -- quantified, not assumed
-
-Since EoMT's rule (pure horizontal-axis projection) and HRNet's rule
-(learned, task-specific direction) are mathematically different rules, they
-necessarily disagree on some images. This was measured directly (not
-theorised) using the real released UCL Train CSVs and the real frozen
-`d_vect` values:
-
-| Dataset | Task | d_vect dominant axis | EoMT-x-sort vs HRNet-DOD disagreement (pre-flip) |
-|---|---|---|---:|
-| UCL | BPD | near-vertical | 50/110 = 45.5% |
-| UCL | OFD | near-horizontal | 110/110 = 100.0% |
-| UCL | APAD | near-horizontal | 0/94 = 0.0% |
-| UCL | TAD | near-vertical | 40/94 = 42.6% |
-| UCL | FL | near-horizontal | 0/96 = 0.0% |
-| Multicentre | BPD | near-vertical | 767/1588 = 48.3% |
-| Multicentre | TAD | near-vertical | 275/662 = 41.5% |
-
-(Full script: `audit_flip_order_stability.py`; run against
-`annotations/{UCL,MULTICENTRE}/{Head,Abdomen,Femur}_Train.csv`.)
-
-This is a **direct, large, real confirmation of the mechanism already
-hypothesised** in the thesis's discussion of the EoMT-vs-HRNet
-"correspondence gap" (Chapter 6, `sec:discussion-limitations-endpoint-canon`)
--- e.g. BPD's own `d_vect` is `((545.26, 125.9), (549.10, 562.26))`, i.e.
-almost perfectly VERTICAL (x barely changes, y changes by 436px), so a
-purely-horizontal x-sort is close to arbitrary/noise-sensitive for BPD
-specifically, exactly matching the previously-measured large
-correspondence-gap finding for BPD/TAD in `final_comparison/analyse_*.py`.
-
-**Consequence for this project**: RTMPose will be internally consistent
-with HRNet's convention (verified byte-for-byte against real HRNet output)
-but will inherit the SAME pre-existing disagreement against EoMT's own
-convention that HRNet already has. This is not a new problem introduced by
-RTMPose and is not fixable without either (a) retraining EoMT under a
-different channel convention (out of scope, EoMT's results are already
-locked/reported) or (b) reprocessing EoMT's own evaluation to use HRNet's
-`d_vect` post hoc (would require re-deriving which of EoMT's two trained
-output channels corresponds to which physical endpoint per image, which
-EoMT's architecture does not support without retraining). **State this
-explicitly in the RTMPose results section**: RTMPose and HRNet share an
-identical, code-verified endpoint-ordering convention; EoMT uses a
-different, pre-existing convention of its own, already disclosed as a
-limitation elsewhere in the thesis.
-
-### 2c. A real bug found and fixed: flip-consistency was NOT "just set flip_indices and assume"
-
-The original adapter design (before today) set MMPose's `flip_indices=[0,
-1]` (no channel swap on flip) once, reasoning by analogy to HRNet's own
-`_flip_x_only` (which also doesn't swap indices on flip). **This reasoning
-was incomplete**: HRNet doesn't need to swap on flip because it RE-DERIVES
-the DOD projection fresh after every augmentation draw (including flip);
-this adapter's original design instead FROZE the canonical order once at
-CSV-conversion time and relied on the static `flip_indices` setting alone
-for every subsequent flip during training.
-
-Measuring this directly (`audit_flip_order_stability.py`, comparing the
-frozen order against what a fresh DOD projection would say post-flip):
-
-| Dataset | Task | d_vect dominant axis | Fraction of training images where flip breaks the frozen order |
-|---|---|---|---:|
-| UCL | BPD | near-vertical | 0/110 = 0.0% |
-| UCL | OFD | near-horizontal | 110/110 = **100.0%** |
-| UCL | APAD | near-horizontal | 94/94 = **100.0%** |
-| UCL | TAD | near-vertical | 0/94 = 0.0% |
-| UCL | FL | near-horizontal | 96/96 = **100.0%** |
-| Multicentre | BPD | near-vertical | 3/1588 = 0.2% |
-| Multicentre | TAD | near-vertical | 1/662 = 0.2% |
-
-The pattern is exactly what the geometry predicts: a static "never swap on
-flip" rule is correct only when `d_vect` is close to vertical (flipping x
-doesn't reverse a near-vertical projection's order) and is wrong for nearly
-every sample when `d_vect` is close to horizontal (flipping x reverses a
-near-horizontal projection's order almost every time). **This is a
-near-total training-label-corruption bug for 3 of 5 tasks (OFD, APAD, FL),
-not a rare edge case** -- though it happens to be a non-issue for the BPD
-canary specifically (0.0%/0.2% measured).
-
-**Fix applied** (`fetal_augment.py`, `transforms.py`'s new
-`FetalTrainAugment`, replacing the stock `RandomFlip` + static
-`flip_indices` entirely): the frozen `d_vect` prototype points are now
-carried through the EXACT SAME flip/rotation operations as the sample's own
-keypoints, and the final channel order is re-derived by projecting onto the
-correspondingly-transformed direction -- mirroring HRNet's own
-per-sample-transformed-direction architecture (`fetal.py` lines 249-289)
-instead of a static rule. This is provable to be correct in general (not
-just for the measured cases): a positive uniform scale about a fixed centre
-provably cannot change the projection order (proof in `fetal_augment.py`'s
-docstring); a consistent flip or rotation applied to BOTH the points and
-the direction provably preserves the projection order relative to the
-unaugmented baseline (algebraic proof in the same file, verified empirically
-by a 500-case randomised property test, `test_fetal_augment.py`). Rotation
-and scale retain EoMT's own independent per-stage accept/reject-if-
-out-of-canvas policy (a rejected rotation does not discard an already-
-accepted flip or a later accepted scale). 7/7 new unit tests pass, including
-a direct regression test reproducing the specific UCL OFD failure case
-found above and confirming it is now handled correctly.
-
-**Scope note, still disclosed, not fixed today**: `sequential_train_augment`
-re-derives the order fresh from ORIGINAL-image-space `d_vect` and the
-current sample's own draw every time it runs (i.e. every training epoch,
-per-sample) -- this is training-time only. The CSV-conversion-time
-`canonical_order()` call (`convert_csv_to_coco.py`, used to write the
-COCO-format ground truth and thus also the GT used for the reported
-fixed-channel/swap-min NME) still applies the DOD projection exactly ONCE,
-on the un-augmented original coordinates -- which is the correct, intended
-behaviour (it mirrors HRNet's own TEST-time behaviour exactly, `is_train=
-False` never augments, and this is what `test_endpoint_order.py` verifies
-against real HRNet test output). Today's fix only concerns TRAINING-time
-label consistency; it does not change what ground truth is used for
-reported metrics.
-
-## 3. Rotation/scale augmentation: no longer deferred
-
-`make_config.py`'s previous version deliberately shipped RTMPose with flip
-only, explicitly deferring rotation/scale as a documented scope decision
-"for the canary and initial runs." Given today's audit needed to resolve
-the augmentation-parity question precisely anyway, rotation (`ROT_FACTOR=
-30`, p=0.6) and scale (`SCALE_FACTOR=0.25`, unconditional) have now been
-added (`transforms.FetalTrainAugment`, wired into `make_config.py`'s
-`train_pipeline`), matching EoMT/HRNet's actual parameters exactly (Section
-1's table). This closes the augmentation-parity gap before any training
-happens, rather than leaving it for a later, harder-to-notice fix once
-OFD/APAD/FL checkpoints already existed under the old (flip-only, and
-separately, flip-broken) design.
-
-## 4. Pretrained-weight provenance and parameter counts: now a required, recorded artifact
-
-`PROTOCOL_LOCKED.md`'s "Required outputs" list did not previously name
-parameter counts or a structured provenance record as their own artifact
-(only "environment audit"). `record_run_provenance.py` (new) is now wired
-into `run_rtmpose_canary.sh` as step 3b, run right after config generation,
-and records, as a JSON file saved alongside the canary's other outputs:
-
-- official base config name and the generated config's own path;
-- pretrained checkpoint URL, load prefix (`backbone.`), and local SHA-256
-  (if the file is available locally to hash);
-- source dataset (COCO + AI Challenger, from the official checkpoint's own
-  filename) and pretraining task (256x192 17-keypoint human pose --
-  explicitly NOT this project's own task);
-- backbone vs head parameter counts and a sample of which keys belong to
-  each (confirming the head is freshly initialised, not loaded);
-- **actual** total/trainable/frozen parameter counts for THIS project's
-  real out_channels=2, 512x512 config, measured by building the model, not
-  assumed;
-- an explicit note not to cite the official RTMPose-s paper's ~5.47M-
-  parameter figure (a different config: COCO 256x192, 17 keypoints) as this
-  project's own number.
-
-This has not been run against a live install (needs MMPose, same tier as
-`run_inference.py`); it is syntax-checked only (`py_compile`) in this
-session, same disclosure level as every other MMPose-dependent file.
-
-## Status after this audit
-
-Not yet run: no live MMPose environment exists in this session, so none of
-today's fixes (`FetalTrainAugment`, `record_run_provenance.py`) have been
-exercised end-to-end. What IS newly true, verified with real passing local
-tests (12 new/updated pure-Python tests across `test_fetal_augment.py`,
-plus the pre-existing 4 suites, 22 tests total, all passing):
-
-- augmentation parameters are now matched item-by-item against real EoMT/
-  HRNet source, with every remaining difference named explicitly (Section 1);
-- the flip-order bug is fixed and proven correct by an algebraic invariant
-  plus a 500-case randomised property test AND a direct regression test on
-  the real measured UCL OFD failure case (Section 2c);
-- rotation/scale augmentation is implemented, not deferred (Section 3);
-- pretrained-weight provenance and actual parameter counts are a required,
-  automatically-recorded artifact, not a manual afterthought (Section 4).
-
-Next step, unchanged from before this audit: install MMPose on the server
-per `ENVIRONMENT.md`'s checklist, then run `run_rtmpose_canary.sh` (UCL BPD
-seed 42 only), including its new step 3b, then do the mandatory visual-
-overlay audit before sharing canary numbers with the supervisor.
+Next step, unchanged in kind, more precisely scoped now: install MMPose on
+the server per `ENVIRONMENT.md`'s full checklist (including the now-6
+numbered items, the checkpoint download, and the still-blocked codec
+round-trip test), then run `run_rtmpose_canary.sh`, then the mandatory
+visual-overlay audit, before sharing canary numbers with the supervisor --
+and separately, raise the EoMT-vs-HRNet/RTMPose ordering-convention
+decision with the supervisor explicitly, since this session cannot resolve
+it alone.

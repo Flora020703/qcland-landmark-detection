@@ -6,40 +6,65 @@ IT PRODUCES ***
 
 MMPose's high-level convenience APIs (`mmpose.apis.inference_topdown`,
 `model.test_step()` via the standard test loop) are DELIBERATELY NOT used
-here. Those APIs are written for the stock top-down pipeline and typically
-map a model's decoded keypoints back to "original image" coordinates using
-the SAME bbox_center/bbox_scale-based inverse transform that
-GetBBoxCenterScale/TopdownAffine populated on the way in -- exactly the
-padded, aspect-ratio-preserving convention PROTOCOL_LOCKED.md requires this
-project to avoid. Because this project's own PixelCentreResize transform
-does not populate `bbox_center`/`bbox_scale` in the stock format, it is
-unverified (without a live MMPose install) whether the high-level API would
-(a) error out loudly, (b) silently fall back to some default region, or
-(c) do something else entirely -- none of which is safe to assume.
+for the FINAL coordinate mapping. Those APIs are written for the stock
+top-down pipeline and typically map a model's decoded keypoints back to
+"original image" coordinates using the SAME bbox_center/bbox_scale-based
+inverse transform that GetBBoxCenterScale/TopdownAffine populated on the
+way in -- exactly the padded, aspect-ratio-preserving convention
+PROTOCOL_LOCKED.md requires this project to avoid. Because this project's
+own PixelCentreResize transform does not populate `bbox_center`/
+`bbox_scale` in the stock format, it is unverified (without a live MMPose
+install) whether the high-level API would (a) error out loudly, (b)
+silently fall back to some default region, or (c) do something else
+entirely -- none of which is safe to assume.
 
 Instead, this script decodes each sample as low-level as MMPose's public API
 allows: run the backbone+head forward pass directly, call the SimCC codec's
 own `decode()` method (which operates purely in the codec's own
-`input_size` == 512x512 space, with NO bbox/original-image concept at all),
-and then perform the ORIGINAL-image recovery exclusively via
+`input_size` space, with NO bbox/original-image concept at all), and then
+perform the ORIGINAL-image recovery exclusively via
 geometry.to_image_space() -- the same function test_geometry.py already
 verifies exhaustively. This avoids the ambiguity above by construction,
 provided the assumptions below hold.
 
+CORRECTED 2026-08-06 (review finding, must-fix, blocking): the FIRST
+version of this script called `model.extract_feat(inputs)` directly on the
+raw tensor produced by the dataset's own pipeline (LoadImage ->
+PixelCentreResize -> PackPoseInputs), completely bypassing
+`model.data_preprocessor` (`PoseDataPreprocessor`: mean/std normalisation,
+BGR->RGB if `bgr_to_rgb=True`, batching). The pipeline transforms
+themselves do NOT apply this normalisation -- it is applied by the
+preprocessor at model-forward time, which is how the model was trained
+(every training step goes through `model.forward`, which always calls
+`model.data_preprocessor` first). Feeding un-normalised pixel values
+directly to `extract_feat` would silently give the network an input
+distribution it was never trained on, making every exported coordinate
+meaningless even though the script would run without error. Fixed below by
+explicitly calling `model.data_preprocessor(...)` before `extract_feat`,
+while still stopping short of `model.test_step()`/`predict()` so the stock
+bbox-inverse transform is never invoked.
+
 ASSUMPTIONS THAT MUST BE CONFIRMED AGAINST THE ACTUALLY-INSTALLED MMPOSE
 VERSION BEFORE THE CANARY IS TRUSTED (this project has no live MMPose
 environment to check this from):
-  1. `model.head.decode(head_output)` (or the codec's own `.decode()`
+  1. `model.data_preprocessor({"inputs": [...], "data_samples": [...]}, False)`
+     is the correct call signature/contract for a single, manually-collated
+     sample (not run through a DataLoader's default collate_fn) -- confirm
+     against the installed `PoseDataPreprocessor`/`BaseDataPreprocessor`
+     source; the exact dict keys and whether `inputs` must be a list of
+     per-sample tensors vs. an already-stacked batch tensor may differ by
+     version.
+  2. `model.head.decode(head_output)` (or the codec's own `.decode()`
      called on the head's raw simcc_x/simcc_y outputs) returns keypoint
      coordinates in the codec's `input_size` space (512x512), not already
      mapped to any other space.
-  2. The val/test dataloader built from make_config.py's `val_pipeline`
-     (LoadImage -> PixelCentreResize -> PackPoseInputs) feeds the model
+  3. The val/test dataloader built from make_config.py's `val_pipeline`
+     (LoadImage -> PixelCentreResize -> PackPoseInputs) feeds this script
      images resized exactly the way PixelCentreResize computed them, with
      `data_sample.gt_instances.keypoints` (if used for any sanity check)
      also already in that same 512-space, not re-transformed by
      PackPoseInputs.
-  3. `ori_shape`/`img_id` (or an equivalent identifier) survives being
+  4. `ori_shape`/`img_id` (or an equivalent identifier) survives being
      packed into `data_sample` so predictions can be matched back to the
      correct filename.
 Do not proceed past the canary if any assumption above does not hold; fix
@@ -98,7 +123,17 @@ def main():
             image_info = images_by_id[img_id]
             width, height = image_info["width"], image_info["height"]
 
-            inputs = data["inputs"].unsqueeze(0).float().to(args.device)
+            # CORRECTED 2026-08-06: route through model.data_preprocessor
+            # (mean/std normalisation, BGR->RGB if configured, batching)
+            # BEFORE extract_feat -- see this file's own module docstring.
+            # Deliberately still NOT model.test_step()/predict(), which
+            # would additionally invoke MMPose's stock bbox-based inverse
+            # transform this project must avoid (see PROTOCOL_LOCKED.md).
+            batch = model.data_preprocessor(
+                {"inputs": [data["inputs"]], "data_samples": [data_sample]},
+                False,
+            )
+            inputs = batch["inputs"].to(args.device)
             feats = model.extract_feat(inputs)
             head_output = model.head.forward(feats)  # (simcc_x, simcc_y) or similar
             # NOTE (must confirm against the installed mmpose version): some

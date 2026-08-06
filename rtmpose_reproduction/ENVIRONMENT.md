@@ -29,6 +29,21 @@ freeze it: `git checkout <that commit hash>` in future invocations, and
 record the hash next to every result (mirrors the HRNet driver's own
 `EXPECTED_COMMIT` hard-check pattern in `run_hrnet_512_fixed_5seed.sh`).
 
+## Download the pretrained backbone checkpoint locally (required)
+
+`record_run_provenance.py` now REQUIRES a local file path (not just the
+URL baked into the generated config) to hash and diff against, since a
+2026-08-06 review found the original version of that script never actually
+verified the checkpoint loaded at all -- it only assumed `init_cfg` had
+taken effect. Download it explicitly, set `PRETRAINED_CKPT_PATH` before
+running the canary:
+
+```bash
+curl -L -o /root/cspnext-s_udp-aic-coco_210e-256x192-92f5a029_20230130.pth \
+  https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/cspnext-s_udp-aic-coco_210e-256x192-92f5a029_20230130.pth
+export PRETRAINED_CKPT_PATH=/root/cspnext-s_udp-aic-coco_210e-256x192-92f5a029_20230130.pth
+```
+
 ## What must be verified once this is installed, before the canary
 
 This project has no live MMPose environment to check these from; they were
@@ -37,10 +52,11 @@ config, not from running the actual installed package. Do not skip this
 step:
 
 1. `python -c "import mmcv, mmengine, mmpose; print(mmcv.__version__, mmengine.__version__, mmpose.__version__)"` succeeds.
-2. `rtmpose_reproduction/transforms.py` imports cleanly (`from mmcv.transforms import BaseTransform`, `from mmpose.registry import TRANSFORMS` — these exact import paths may have moved between mmpose/mmcv versions; fix imports here, not by downgrading to whatever version happens to match a stale example).
-3. `make_config.py`'s generated config actually builds via `Config.fromfile()` + `MODELS.build(cfg.model)` without error, and the backbone log shows the CSPNeXt-s checkpoint's `backbone.`-prefixed keys were loaded (not silently skipped) — mirrors how the HRNet driver's `check_checkout()` confirms a patch actually applied rather than assuming it.
-4. `run_inference.py`'s central assumption (`model.head.decode(...)` or the codec's own `.decode()` returns 512-space coordinates, not already bbox-inverse-transformed) — read this project's own installed `mmpose/models/heads/coord_cls_heads/rtmcc_head.py` (or wherever RTMCCHead lives in the installed version) and confirm directly, do not assume from this repo's comments alone.
-5. Pretrained backbone checksum, load-scope, and actual (not published) parameter counts: run `record_run_provenance.py` right after `make_config.py` generates the config (already wired into `run_rtmpose_canary.sh`'s step 3b) -- it records the checkpoint URL, local SHA-256, source dataset/pretraining task, which backbone keys were loaded, and the REAL total/trainable/frozen parameter counts for this project's actual out_channels=2, 512x512 config (NOT the official RTMPose-s paper's ~5.47M figure, which is for the COCO 256x192, 17-keypoint config and must never be cited as this project's own number).
+2. `rtmpose_reproduction/transforms.py` imports cleanly (`from mmcv.transforms import BaseTransform`, `from mmpose.registry import TRANSFORMS` — these exact import paths may have moved between mmpose/mmcv versions; fix imports here, not by downgrading to whatever version happens to match a stale example). Also confirm `results["img"]`'s actual channel order as produced by the configured `LoadImage` (BGR is the OpenMMLab default, but `FetalRotateScaleColorJitter._color_jitter`'s `assume_bgr=True` default must match reality or colour jitter silently uses the wrong channel-to-luminance mapping — see that class's own docstring caveat).
+3. `make_config.py`'s generated config actually builds via `Config.fromfile()` + `MODELS.build(cfg.model)` without error. Do NOT rely on log inspection alone for "was the backbone checkpoint actually loaded" — `record_run_provenance.py` (item 5 below) independently diffs the checkpoint's own state dict against the built model and asserts the loaded values actually changed from their random-init state; treat that JSON's `verified_pretrained_load_actually_happened` field as the authority, not eyeballed logs.
+4. `run_inference.py`'s two central assumptions must BOTH be confirmed against the installed source, not assumed: (a) `model.data_preprocessor({"inputs": [...], "data_samples": [...]}, False)` is the correct call contract for a single manually-collated sample (read the installed `PoseDataPreprocessor`/`BaseDataPreprocessor` source — the exact dict keys and whether `inputs` should be a list of per-sample tensors or an already-stacked batch may differ by version); (b) `model.head.decode(...)` or the codec's own `.decode()` returns 512-space coordinates, not already bbox-inverse-transformed — read `mmpose/models/heads/coord_cls_heads/rtmcc_head.py` (or wherever RTMCCHead lives in the installed version) directly.
+5. Pretrained backbone checksum, load-scope, and actual (not published) parameter counts: run `record_run_provenance.py` right after `make_config.py` generates the config (already wired into `run_rtmpose_canary.sh`'s step 4b, with `PRETRAINED_CKPT_PATH` set per the download step above) -- it records the checkpoint URL, local SHA-256, source dataset/pretraining task, which backbone keys were loaded (independently verified by diffing state-dict values, not just key names), and the REAL total/trainable/frozen parameter counts for this project's actual out_channels=2, 512x512 config (NOT the official RTMPose-s paper's ~5.47M figure, which is for the COCO 256x192, 17-keypoint config and must never be cited as this project's own number).
+6. **Full non-square, codec-level round trip (still blocked, no live MMPose to run it against yet)**: `test_geometry.py`/`test_fetal_augment.py` only test the pure-Python geometry/reorder logic; they do NOT exercise MMPose's own SimCC codec `encode()`/`decode()` round trip. Before trusting the canary's exported coordinates, run an end-to-end check with a real (or synthetic) non-square image: CSV row -> `convert_csv_to_coco.py` -> MMPose dataset -> `PixelCentreResize` -> `GenerateTarget` (SimCC encode) -> a forward pass through the actual codec's `decode()` -> `geometry.to_image_space()` -> compare against the original CSV coordinates, and record the max absolute pixel error. Separate this into two numbers: the PURE geometric round-trip error (already ~0, proven by `test_geometry.py`) and the SimCC quantisation error introduced by the 1024-bin discretisation (expected to be small but non-zero, and currently entirely unmeasured). Do not skip this just because the pure-geometry tests pass — they test a strict subset of the real pipeline.
 
 ## Seed control
 

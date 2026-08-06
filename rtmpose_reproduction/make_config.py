@@ -31,18 +31,35 @@ official recipe was copied carelessly:
     flip-test would silently reintroduce the exact failure mode already
     documented and avoided for EoMT.
   - Rotation/scale/flip augmentation (RandomBBoxTransform/RandomFlip) is
-    NOT delegated to MMPose's stock transforms; a custom FetalTrainAugment
-    (transforms.py) replaces all three. CORRECTED 2026-08-06 after
-    audit_flip_order_stability.py measured that a static flip_indices
-    setting (this file's earlier version) is silently wrong for 100% of
-    UCL OFD/APAD/FL training images (see fetal_augment.py's module
-    docstring and PROTOCOL_AUDIT.md) -- FetalTrainAugment re-derives the
-    DOD-canonical order after every accepted flip/rotation, matching the
-    audited upstream HRNet's own per-sample re-projection architecture,
-    and also adds the rotation (ROT_FACTOR=30, p=0.6) + scale
-    (SCALE_FACTOR=0.25, unconditional) augmentation this file's previous
-    version deferred entirely -- see PROTOCOL_AUDIT.md's augmentation
-    item-by-item table for what does/doesn't match EoMT/HRNet exactly.
+    NOT delegated to MMPose's stock transforms; two custom transforms
+    (transforms.FetalRandomFlipAndCanonicalize, transforms.
+    FetalRotateScaleColorJitter) replace them. Two review passes on
+    2026-08-06: the first found that a static flip_indices setting (this
+    file's original version) is silently wrong whenever a task's DOD
+    direction is near-horizontal; the SECOND pass then found that the
+    first pass's own "fix" (transforming d_vect through flip+rotation
+    before reprojecting, done in already-resized 512-space) was ITSELF
+    mathematically wrong -- verified directly against HRNet's real
+    get_transform/_transform_pixel_float formulas that HRNet's actual
+    per-sample decision is invariant to center/scale/rotation and depends
+    ONLY on flip, evaluated via the STATIC original d_vect in ORIGINAL
+    (pre-resize) image space. See fetal_augment.py's module docstring for
+    the full derivation (verified both algebraically and by direct
+    numerical reproduction of HRNet's exact formula) and PROTOCOL_AUDIT.md
+    for the complete history of both passes. Rotation (ROT_FACTOR=30,
+    p=0.6) and scale (SCALE_FACTOR=0.25, unconditional) augmentation
+    (previously deferred entirely) are now implemented as pure position
+    updates with no channel-order involvement, since they are proven to
+    have no effect on the ordering decision.
+  - val_dataloader points at a Train-only internal validation split
+    (make_internal_val_split.py, reusing EoMT's own exact subject-based
+    split algorithm), NOT the released Test set -- CORRECTED 2026-08-06,
+    review finding: the original version pointed val_dataloader directly
+    at Test with test_dataloader=val_dataloader and save_best="PCK",
+    meaning the official Test set was read every val_interval epochs
+    during training and used for checkpoint selection, a genuine leak.
+    test_dataloader is now a separate dataloader over the real Test set,
+    touched only once, after training, by run_inference.py.
   - Backbone-only pretrained init via prefix='backbone.'; RTMCCHead fully
     randomly initialised (matches the OFFICIAL recipe's own convention,
     confirmed against the real config -- not a compromise specific to this
@@ -76,9 +93,9 @@ from fetal_dataset_info import FETAL_DATASET_INFO  # noqa: E402
 from dod_vectors import get_d_vect  # noqa: E402
 
 # Frozen DOD prototype vector for this (dataset, task), reused verbatim from
-# the audited upstream HRNet reproduction (dod_vectors.py) -- FetalTrainAugment
-# uses this to re-derive the canonical channel order after every accepted
-# flip/rotation, replacing the old static-flip_indices design (see
+# the audited upstream HRNet reproduction (dod_vectors.py) -- FetalRandomFlipAndCanonicalize
+# uses this to re-derive the canonical channel order after every flip draw,
+# in ORIGINAL image space, replacing the old static-flip_indices design (see
 # fetal_augment.py's module docstring and PROTOCOL_AUDIT.md).
 d_vect = get_d_vect({dataset!r}, {task!r})
 
@@ -151,15 +168,19 @@ data_mode = "topdown"
 
 train_pipeline = [
     dict(type="LoadImage"),
+    # Channel identity MUST be decided in ORIGINAL image space, before the
+    # anisotropic 512x512 resize -- see transforms.FetalRandomFlipAndCanonicalize's
+    # own docstring and fetal_augment.py's module docstring for why (verified
+    # against HRNet's real per-sample transform formula, not assumed).
+    dict(type="FetalRandomFlipAndCanonicalize", d_vect=d_vect, flip_prob=0.5),
     # RandomHalfBody deliberately removed (supervisor instruction).
     dict(type="PixelCentreResize", input_size=512),
-    # Replaces RandomFlip + RandomBBoxTransform: flip (p=0.5), rotation
-    # (+-30 deg, p=0.6), scale (0.75-1.25, unconditional), colour jitter,
-    # ALL with DOD-consistent re-canonicalisation after every accepted
-    # geometric draw. See transforms.FetalTrainAugment's own docstring and
-    # PROTOCOL_AUDIT.md for what this fixes and what remains disclosed as
-    # non-bit-identical to EoMT/HRNet.
-    dict(type="FetalTrainAugment", d_vect=d_vect, input_size=512),
+    # Rotation (+-30 deg, p=0.6), scale (0.75-1.25, unconditional), colour
+    # jitter -- position-only, no re-canonicalisation needed here (proven to
+    # have no effect on channel order). See PROTOCOL_AUDIT.md's augmentation
+    # item-by-item table for what remains disclosed as non-bit-identical to
+    # EoMT/HRNet.
+    dict(type="FetalRotateScaleColorJitter", input_size=512),
     dict(type="GenerateTarget", encoder=codec),
     dict(type="PackPoseInputs"),
 ]
@@ -179,14 +200,44 @@ train_dataloader = dict(
         type=dataset_type,
         data_root={data_root!r},
         data_mode=data_mode,
-        ann_file={train_ann!r},
+        ann_file={internal_train_ann!r},
         data_prefix=dict(img={images_dir!r}),
         metainfo=FETAL_DATASET_INFO,
         pipeline=train_pipeline,
     ),
 )
 
+# CORRECTED 2026-08-06 (review finding): this used to point at the released
+# Test annotation file, with test_dataloader = val_dataloader, so the
+# official Test set was read every val_interval epochs during training and
+# fed into save_best="PCK" checkpoint selection -- a genuine data leak, not
+# just a soft protocol violation, regardless of the fact that the REPORTED
+# result was always going to be the final checkpoint. val_dataloader now
+# points at a Train-only internal validation split
+# (make_internal_val_split.py, reusing EoMT's own exact subject-grouping/
+# shuffle/split algorithm from datasets/landmark_dataset.py so the held-out
+# subjects match EoMT's own internal validation). test_dataloader is now a
+# SEPARATE dataloader pointing at the real released Test set, and nothing
+# in this config ever runs it automatically -- run_inference.py is the only
+# thing that reads it, once, after training is completely finished.
 val_dataloader = dict(
+    batch_size={batch_size},
+    num_workers=4,
+    persistent_workers=True,
+    drop_last=False,
+    sampler=dict(type="DefaultSampler", shuffle=False),
+    dataset=dict(
+        type=dataset_type,
+        data_root={data_root!r},
+        data_mode=data_mode,
+        ann_file={internal_val_ann!r},
+        data_prefix=dict(img={images_dir!r}),
+        metainfo=FETAL_DATASET_INFO,
+        pipeline=val_pipeline,
+        test_mode=True,
+    ),
+)
+test_dataloader = dict(
     batch_size={batch_size},
     num_workers=4,
     persistent_workers=True,
@@ -203,12 +254,14 @@ val_dataloader = dict(
         test_mode=True,
     ),
 )
-test_dataloader = val_dataloader
 
-# Internal training-time sanity metric ONLY -- NOT the reported number.
-# The authoritative fixed-channel/swap-min NME comes from
-# evaluate_rtmpose_fixed.py run on run_inference.py's exported, original-
-# image-space predictions, using the identical formula as HRNet's evaluator.
+# Internal training-time sanity metric ONLY, computed on the Train-only
+# internal-val split above -- NOT the reported number, and no longer
+# computed from the released Test set at all. The authoritative
+# fixed-channel/swap-min NME comes from evaluate_rtmpose_fixed.py run on
+# run_inference.py's exported, original-image-space TEST predictions
+# (produced exactly once, after training), using the identical formula as
+# HRNet's evaluator.
 val_evaluator = dict(type="PCKAccuracy", thr=0.05)
 test_evaluator = val_evaluator
 
@@ -226,10 +279,18 @@ param_scheduler = [
          T_max={max_epochs}, by_epoch=True, convert_to_iter_based=True),
 ]
 
+# CORRECTED 2026-08-06 (review finding): save_best="PCK" removed entirely --
+# PROTOCOL_LOCKED.md's primary checkpoint convention is final/last, and
+# selecting-by-best (even on the now-legitimate Train-only internal val
+# metric, not the Test set) risks the canary driver silently picking up a
+# "best" checkpoint file instead of the true final one. save_last=True
+# guarantees the true final-epoch checkpoint is always kept regardless of
+# max_keep_ckpts, and run_rtmpose_canary.sh now reads MMEngine's own
+# last_checkpoint pointer file rather than glob-sorting filenames.
 default_hooks = dict(
     checkpoint=dict(
-        type="CheckpointHook", interval={val_interval}, save_best="PCK",
-        rule="greater", max_keep_ckpts=1,
+        type="CheckpointHook", interval={val_interval},
+        save_last=True, max_keep_ckpts=1,
     ),
     logger=dict(type="LoggerHook", interval=10),
 )
@@ -239,16 +300,23 @@ work_dir = {work_dir!r}
 
 
 def make_config(dataset: str, task: str, seed: int, data_root: str,
-                 images_dir: str, train_ann: str, test_ann: str,
-                 work_dir: str, out_path: Path,
+                 images_dir: str, internal_train_ann: str, internal_val_ann: str,
+                 test_ann: str, work_dir: str, out_path: Path,
                  batch_size: int = 16, max_epochs: int = 200,
                  val_interval: int = 5, repo_root: str | None = None) -> Path:
+    """`internal_train_ann`/`internal_val_ann` are the two COCO jsons
+    produced by converting the Train CSV twice, restricted to
+    make_internal_val_split.py's two filename lists (see that script's own
+    docstring) -- NEVER pass the released Test CSV/json as either of these.
+    `test_ann` is the real released Test set, used only by run_inference.py
+    after training; nothing in the generated config's training loop reads it."""
     text = TEMPLATE.format(
         dataset=dataset, task=task, seed=seed,
         repo_root=repo_root or str(Path(__file__).resolve().parent),
         backbone_checkpoint=OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT,
         data_root=data_root, images_dir=images_dir,
-        train_ann=train_ann, test_ann=test_ann,
+        internal_train_ann=internal_train_ann, internal_val_ann=internal_val_ann,
+        test_ann=test_ann,
         batch_size=batch_size, max_epochs=max_epochs, val_interval=val_interval,
         work_dir=work_dir,
     )
@@ -265,12 +333,19 @@ if __name__ == "__main__":
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--data-root", required=True)
     parser.add_argument("--images-dir", required=True)
-    parser.add_argument("--train-ann", required=True)
-    parser.add_argument("--test-ann", required=True)
+    parser.add_argument("--internal-train-ann", required=True,
+                         help="COCO json converted from Train CSV, internal_train filenames only "
+                              "(make_internal_val_split.py + convert_csv_to_coco.py --internal-split-part internal_train)")
+    parser.add_argument("--internal-val-ann", required=True,
+                         help="COCO json converted from Train CSV, internal_val filenames only "
+                              "(make_internal_val_split.py + convert_csv_to_coco.py --internal-split-part internal_val)")
+    parser.add_argument("--test-ann", required=True,
+                         help="COCO json converted from the REAL released Test CSV -- "
+                              "never read during training, only by run_inference.py afterward")
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
     path = make_config(args.dataset, args.task, args.seed, args.data_root,
-                        args.images_dir, args.train_ann, args.test_ann,
-                        args.work_dir, args.out)
+                        args.images_dir, args.internal_train_ann, args.internal_val_ann,
+                        args.test_ann, args.work_dir, args.out)
     print(f"[OK] wrote {path}")

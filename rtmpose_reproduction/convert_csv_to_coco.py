@@ -78,7 +78,15 @@ def _to_float_or_none(value: str):
 
 
 def convert(csv_path: Path, images_dir: Path, dataset: str, task: str,
-            out_json: Path, excluded_log: Path) -> dict:
+            out_json: Path, excluded_log: Path,
+            filename_subset: set[str] | None = None) -> dict:
+    """`filename_subset`, if given, restricts the output to rows whose
+    image_name is in this set (added 2026-08-06 so make_internal_val_split.py's
+    Train-only internal validation split can be materialised as its own COCO
+    json from the SAME Train CSV, without a second, differently-filtered
+    converter implementation -- rows outside the subset are recorded in
+    `excluded_log` with reason "not in internal split", not silently
+    dropped)."""
     with open(csv_path, newline="", encoding="utf-8-sig") as handle:
         reader = csv.reader(handle)
         header = next(reader)
@@ -98,6 +106,10 @@ def convert(csv_path: Path, images_dir: Path, dataset: str, task: str,
         image_name = row[0]
         if image_name is None or image_name.strip() == "":
             excluded.append({"image_name": image_name, "reason": "missing image_name"})
+            continue
+
+        if filename_subset is not None and image_name not in filename_subset:
+            excluded.append({"image_name": image_name, "reason": "not in internal split"})
             continue
 
         landmark_vals = [_to_float_or_none(v) for v in row[start_col:end_col]]
@@ -175,13 +187,26 @@ def main():
     parser.add_argument("--task", required=True, choices=["BPD", "OFD", "APAD", "TAD", "FL"])
     parser.add_argument("--out-json", required=True, type=Path)
     parser.add_argument("--excluded-log", required=True, type=Path)
+    parser.add_argument("--internal-split-json", type=Path, default=None,
+                         help="make_internal_val_split.py's output; if given, "
+                              "--internal-split-part selects which half to convert")
+    parser.add_argument("--internal-split-part", choices=["internal_train", "internal_val"],
+                         default=None)
     args = parser.parse_args()
 
     if Image is None:
         raise SystemExit("ERROR: Pillow (PIL) is required for real conversion; pip install pillow")
 
+    filename_subset = None
+    if args.internal_split_json is not None:
+        if args.internal_split_part is None:
+            raise SystemExit("ERROR: --internal-split-part is required when "
+                              "--internal-split-json is given")
+        manifest = json.loads(args.internal_split_json.read_text(encoding="utf-8"))
+        filename_subset = set(manifest[f"{args.internal_split_part}_filenames"])
+
     summary = convert(args.csv, args.images_dir, args.dataset, args.task,
-                       args.out_json, args.excluded_log)
+                       args.out_json, args.excluded_log, filename_subset=filename_subset)
     print(f"[OK] {args.dataset} {args.task}: {summary}")
 
 
