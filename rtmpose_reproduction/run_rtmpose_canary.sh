@@ -119,6 +119,20 @@ echo "=== [4c/6] MANDATORY live preflight gate -- refuses to proceed to training
 "$PY" live_preflight.py --config "$CONFIG_PATH" \
   || { echo "ERROR: live_preflight.py failed -- refusing to start training. See ENVIRONMENT.md's checklist and PROTOCOL_AUDIT.md for what to fix." >&2; exit 1; }
 
+# PREFLIGHT_ONLY (round 6, review request): lets this script be run on the
+# server to install/build/preflight-verify everything WITHOUT also
+# auto-starting the 200-epoch canary in the same invocation -- e.g. to run
+# preflight the night before, then start the actual canary the next
+# morning only after the supervisor's endpoint-ordering reply arrives
+# (see README.md "Still genuinely open"). Defaults to 1 (stop after
+# preflight) so the safer behaviour is the default; explicitly set
+# PREFLIGHT_ONLY=0 to actually proceed to training.
+if [ "${PREFLIGHT_ONLY:-1}" = "1" ]; then
+  echo "=== PREFLIGHT COMPLETE -- PREFLIGHT_ONLY=1 (default), training NOT started ==="
+  echo "Re-run with PREFLIGHT_ONLY=0 to actually start the seed-42 canary."
+  exit 0
+fi
+
 echo "=== [5/6] train (this is the canary -- one run, watched, not backgrounded) ==="
 MMPOSE_TRAIN_TOOL="${MMPOSE_TRAIN_TOOL:?set MMPOSE_TRAIN_TOOL to the installed mmpose repo tools/train.py path}"
 "$PY" "$MMPOSE_TRAIN_TOOL" "$CONFIG_PATH" --work-dir "$WORK_DIR"

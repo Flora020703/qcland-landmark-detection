@@ -152,6 +152,21 @@ default_scope = "mmpose"
 randomness = dict(seed={seed}, deterministic=True)
 
 # --- import custom transforms/hooks so their @*.register_module() run ---
+# BOTH mechanisms used deliberately (round 6, review request for a more
+# robust registration path than a bare top-level `import`): the plain
+# imports below already work for this project's existing custom transforms
+# (this is the same pattern `transforms.py`'s own TRANSFORMS registration
+# has used since round 1 -- MMEngine's Config.fromfile() genuinely imports
+# a Python-format config as a real module, executing top-level imports with
+# real side effects, not a restricted AST-only variable extraction).
+# `custom_imports` is ADDITIONALLY declared as MMEngine's own officially
+# documented mechanism for this, in case some installed version's config-
+# loading path is more restrictive than assumed -- belt and suspenders,
+# not a sign the plain imports were known to be broken.
+custom_imports = dict(
+    imports=["transforms", "internal_val_hook"],
+    allow_failed_imports=False,
+)
 import transforms  # noqa: F401,E402
 import internal_val_hook  # noqa: F401,E402
 from fetal_dataset_info import FETAL_DATASET_INFO  # noqa: E402
@@ -295,15 +310,25 @@ train_dataloader = dict(
 # official Test set was read every val_interval epochs during training and
 # fed into save_best="PCK" checkpoint selection -- a genuine data leak, not
 # just a soft protocol violation, regardless of the fact that the REPORTED
-# result was always going to be the final checkpoint. val_dataloader now
-# points at a Train-only internal validation split
-# (make_internal_val_split.py, reusing EoMT's own exact subject-grouping/
-# shuffle/split algorithm from datasets/landmark_dataset.py so the held-out
-# subjects match EoMT's own internal validation). test_dataloader is now a
-# SEPARATE dataloader pointing at the real released Test set, and nothing
-# in this config ever runs it automatically -- run_inference.py is the only
-# thing that reads it, once, after training is completely finished.
-val_dataloader = dict(
+# result was always going to be the final checkpoint.
+#
+# CORRECTED AGAIN, round 6 (review finding, VERIFIED against MMEngine's real
+# Runner source -- this is a genuine, confirmed crash, not a hypothetical):
+# MMEngine's Runner.__init__ enforces `val_dataloader, val_cfg, val_evaluator
+# should be either all None or not None`, raising ValueError otherwise. The
+# round-5 design (val_cfg=None while val_dataloader/val_evaluator were still
+# populated dicts, so InternalFixedChannelNMEHook could read
+# `runner.cfg.val_dataloader`) would have made Runner construction itself
+# fail immediately, before a single training step ever ran. Fixed: the
+# Train-only internal validation split now lives under a NON-standard name,
+# `internal_val_dataloader`, that Runner's own from_cfg() never reads at
+# all (so it cannot participate in the all-or-nothing check); `val_dataloader`
+# and `val_evaluator` are both explicitly `None` alongside `val_cfg=None`,
+# satisfying Runner's constraint by being genuinely, consistently absent.
+# InternalFixedChannelNMEHook and live_preflight.py both read
+# `runner.cfg.internal_val_dataloader` / `cfg.internal_val_dataloader`
+# instead of `val_dataloader`.
+internal_val_dataloader = dict(
     batch_size={batch_size},
     num_workers=4,
     persistent_workers=True,
@@ -320,6 +345,25 @@ val_dataloader = dict(
         test_mode=True,
     ),
 )
+val_dataloader = None
+val_evaluator = None
+
+# test_dataloader/test_cfg/test_evaluator remain a consistent (all
+# non-None) trio -- required both by Runner's own all-or-nothing check AND
+# because run_inference.py directly reads `cfg.test_dataloader["dataset"]`
+# as a standalone dataset build, never through Runner.test(). NOTHING in
+# this project's own driver (run_rtmpose_canary.sh) ever calls
+# `tools/test.py` or `runner.test()` against this config.
+#
+# *** DO NOT RUN `tools/test.py` AGAINST THIS CONFIG ***: test_evaluator
+# below is PCKAccuracy, which has the EXACT SAME unverified bbox-metadata
+# risk against model.predict() that motivated replacing the periodic val
+# loop with InternalFixedChannelNMEHook (see val_cfg's own comment below).
+# It is kept defined ONLY because Runner's constructor requires
+# test_dataloader/test_cfg/test_evaluator to be a consistent trio, not
+# because it is safe to actually invoke. The ONLY authoritative evaluation
+# path is run_inference.py (bypasses predict() entirely) followed by
+# evaluate_rtmpose_fixed.py -- never this evaluator, never `tools/test.py`.
 test_dataloader = dict(
     batch_size={batch_size},
     num_workers=4,
@@ -337,13 +381,7 @@ test_dataloader = dict(
         test_mode=True,
     ),
 )
-
-# val_evaluator/test_evaluator kept defined for compatibility (e.g. if
-# `tools/test.py` is ever run manually as a separate, deliberate step) but
-# is NOT the source of periodic internal monitoring during training -- see
-# val_cfg=None below and InternalFixedChannelNMEHook in custom_hooks.
-val_evaluator = dict(type="PCKAccuracy", thr=0.05)
-test_evaluator = val_evaluator
+test_evaluator = dict(type="PCKAccuracy", thr=0.05)
 
 train_cfg = dict(by_epoch=True, max_epochs={max_epochs})
 # CORRECTED round 5 (review finding, real crash/silent-wrong-number risk,

@@ -532,15 +532,31 @@ image count (produced by `convert_csv_to_coco.py` before `make_config.py`
 runs in `run_rtmpose_canary.sh`), computes the real `iterations_per_epoch`,
 and sets `warmup_end_iters = min(1000, cosine_begin_iters // 2)`. The
 generated config embeds an explicit `assert warmup_end_iters <
-cosine_begin_epoch * iters_per_epoch` that runs at config-load time (before
-any GPU work), and `make_config()` itself also raises loudly at generation
-time if the computed values would violate this -- two independent points
-where an overlapping schedule cannot silently pass through. Verified by
-generating a config against a realistic 100-image internal-train json:
-`iters_per_epoch=7`, `cosine_begin_iters=700`, `warmup_end_iters=350`,
-assertion holds; the generated config was executed directly (not just
-`py_compile`d) and the assertion passed before hitting the expected
-`cv2`/`mmcv` import boundary.
+cosine_begin_epoch * iters_per_epoch` that would run at config-load time
+(before any GPU work), and `make_config()` itself ALSO raises loudly at
+generation time if the computed values would violate this -- two
+independent points where an overlapping schedule cannot silently pass
+through. Verified by generating a config against a realistic 100-image
+internal-train json (`iters_per_epoch=7`, `cosine_begin_iters=700`,
+`warmup_end_iters=350`): `make_config()`'s OWN Python-level check (which
+runs for real, immediately, every time the config is generated) did not
+raise.
+
+**CORRECTION (round 6, self-caught overclaim, not a reviewer finding)**:
+this section previously also claimed "the generated config was executed
+directly ... and the assertion passed before hitting the expected
+cv2/mmcv import boundary" -- this was WRONG. The `import transforms` line
+sits NEAR THE TOP of the generated config template (before the
+`warmup_end_iters`/`training_recipe_summary` definitions, which come much
+later), so every local execution of the generated `.py` file has always
+failed at that early import, LONG before reaching the embedded assert --
+the assert's line was never actually run in any local test. The embedded
+assert is real, correctly placed relative to the values it checks, and
+will genuinely execute once MMPose/cv2 are installed (at which point
+`live_preflight.py`'s own `check_provenance_fields_present` independently
+re-verifies the same relationship using `training_recipe_summary`'s own
+values) -- but claiming this session had already "executed and passed" it
+was inaccurate, and is corrected here rather than left standing.
 
 ### 4. Provenance-verification precision gaps (round 3's own claims didn't fully match its own code)
 
@@ -739,12 +755,163 @@ this session). Newly true:
 - `record_run_provenance.py`'s own claims about what it verifies are now
   precisely worded.
 
-Given five review rounds have each found real, distinct issues the
-previous round missed or introduced, the remaining honest path forward is:
-run `live_preflight.py` for real on the server (it will very likely
-surface at least one of its own flagged live-only assumptions as wrong,
-e.g. the SimCC codec's exact `encode()`/`decode()` dict keys), fix whatever
-it finds, THEN run the actual seed-42 canary -- and separately, send the
-already-drafted endpoint-ordering question to the supervisor now rather
-than waiting for a sixth code-review round, since that question cannot be
-resolved by further code review at all.
+## Sixth-round review: the preflight script written to catch config bugs had its own real bugs
+
+A sixth reviewer confirmed the warmup fix was reasonable, then found four
+real problems IN `live_preflight.py`/`make_config.py`'s round-5 val-loop
+design itself -- the tool built to catch mistakes needed the same scrutiny
+as everything else.
+
+### 1. `val_cfg=None` alongside populated `val_dataloader`/`val_evaluator` -- VERIFIED against the real MMEngine Runner source to be a genuine, immediate crash
+
+Round 5's design set `val_cfg=None` but left `val_dataloader`/`val_evaluator`
+as real dicts (so `InternalFixedChannelNMEHook` could read
+`runner.cfg.val_dataloader`). Checked directly against MMEngine's actual
+`Runner.__init__` source: it contains an explicit check --
+`val_related = [val_dataloader, val_cfg, val_evaluator]`; if these are not
+either all `None` or all not-`None`, it raises `ValueError` immediately.
+This is not a hypothetical risk; Runner construction itself would have
+failed before a single training step ran.
+
+**Fixed**: the Train-only internal validation dataloader now lives under a
+non-standard config key, `internal_val_dataloader`, which `Runner.from_cfg()`
+never reads at all (confirmed against the same source: `from_cfg` only
+ever reads `cfg.get('val_dataloader')`, not arbitrary keys), so it cannot
+participate in the all-or-nothing check. `val_dataloader` and
+`val_evaluator` are both explicitly `None` alongside `val_cfg=None`.
+`internal_val_hook.py` and `live_preflight.py` both updated to read
+`cfg.internal_val_dataloader` instead of the now-`None` `cfg.val_dataloader`.
+`test_dataloader`/`test_cfg`/`test_evaluator` remain a consistent
+non-`None` trio (required both by the same Runner constraint applied to
+the test-side triple, and because `run_inference.py` reads
+`cfg.test_dataloader["dataset"]` directly) -- with an explicit, loud
+`*** DO NOT RUN tools/test.py AGAINST THIS CONFIG ***` comment at
+`test_evaluator`'s own definition, since `PCKAccuracy` there has the
+identical unverified-bbox-metadata risk that motivated replacing the val
+loop, and nothing about keeping the trio consistent makes it safe to
+actually invoke.
+
+### 2. `custom_hooks`' registration relied on a bare `import`, no `custom_imports` fallback
+
+The generated config's `import internal_val_hook` statement (matching the
+pre-existing `import transforms` pattern used since round 1) is very
+likely sufficient -- MMEngine's `Config.fromfile()` genuinely imports a
+Python-format config as a real module with real import side effects, not
+a restricted AST-only extraction. Re-checking the actual committed file at
+the reviewed commit confirmed the import statement WAS already present
+(the reviewer's specific claim of a missing import did not match the
+committed code) -- but added MMEngine's own officially-documented
+`custom_imports = dict(imports=[...], allow_failed_imports=False)`
+mechanism as a belt-and-suspenders safeguard regardless, since it is the
+more version-robust of the two mechanisms, and because `live_preflight.py`
+now genuinely registry-builds the Hook (`HOOKS.build()`, see item 4 below)
+rather than assuming registration worked.
+
+### 3. The preflight's own geometric round-trip test used the AUGMENTED train pipeline, not a deterministic one
+
+`check_geometric_round_trip` built its dataset from `cfg.train_dataloader["dataset"]`,
+whose pipeline includes `FetalRandomFlipAndCanonicalize`/
+`FetalRotateScaleColorJitter` (random flip/rotation/scale/colour jitter) --
+then compared the decoded coordinates against the ORIGINAL, un-augmented
+synthetic `p0`/`p1`. The function's own comments claimed a "deterministic
+val_pipeline," directly contradicting what the code actually did; the test
+would fail unpredictably whenever augmentation happened to trigger, and
+even when it passed, the result would not actually isolate SimCC
+quantisation error the way the module docstring claimed.
+
+**Fixed**: both `check_geometric_round_trip` and `check_decode_path` (renamed
+from `check_decode_and_internal_val_path`) now build from
+`cfg.internal_val_dataloader["dataset"]` -- `LoadImage -> PixelCentreResize
+-> PackPoseInputs` only, no augmentation stage at all, matching what the
+comments always claimed.
+
+### 4. The preflight never actually built or invoked the Hook -- and never used pretrained weights
+
+The original `live_preflight.py` only exercised the shared
+`low_level_decode` functions the Hook depends on, never `HOOKS.build()`
+itself or the Hook's own `after_train_epoch` lifecycle method -- meaning
+neither of the two bugs above (missing registration, wrong dataloader
+reference) would actually have been CAUGHT by this preflight, only
+theoretically avoided by inspection. Separately, `check_train_forward_backward`
+built the model without calling `model.init_weights()`, so the "real"
+smoke test forward/backward pass actually ran on a randomly-initialised
+backbone, not the pretrained one the canary will use.
+
+**Fixed**: new `check_hook_registry_and_lifecycle` genuinely builds
+`InternalFixedChannelNMEHook` via `HOOKS.build()`, asserts the returned
+class name, constructs a minimal duck-typed fake Runner (exposing exactly
+`model`/`cfg`/`epoch`/`logger`/a REAL `mmengine.logging.MessageHub`
+instance, not a full `mmengine.Runner` which would need a complete working
+optimizer/scheduler just to construct), and calls `after_train_epoch` once
+-- asserting the logged NME is finite, the message hub actually received
+the scalar, and `model.training` is correctly restored afterward.
+`check_train_forward_backward` and `check_decode_path` both now call
+`model.init_weights()` before use. Also added `check_bgr_rgb_channel_order`
+(previously claimed as covered, never actually implemented): writes a
+synthetic image with a KNOWN top-left pixel value and compares what the
+pipeline's own array shows against `FetalRotateScaleColorJitter`'s
+`assume_bgr=True` default, failing loudly if they disagree. `internal_val_hook.py`'s
+hardcoded `device="cuda:0"` default was also changed to `None`, resolved
+dynamically via `next(model.parameters()).device` at call time, so it does
+not silently break under a future non-`cuda:0` device.
+
+### Self-caught correction (not a reviewer finding): an earlier "verified by execution" claim was wrong
+
+While fixing the above, re-checked this document's own round-4 claim that
+"the generated config was executed directly ... and the assertion passed
+before hitting the expected cv2/mmcv import boundary" for the warmup/cosine
+assert. This was WRONG: `import transforms` sits near the top of the
+generated config template, well BEFORE the `warmup_end_iters`/
+`training_recipe_summary` definitions -- every local execution of the
+generated file has always failed at that early import, long before
+reaching the embedded assert. The assert is real and correctly placed, and
+`make_config()`'s OWN Python-level check (which runs immediately, for
+real, every time a config is generated, independent of the template
+string) DID genuinely execute and pass -- but the specific claim about the
+EMBEDDED assert having been executed was inaccurate and is corrected in
+round 4's own section above rather than left standing. Worth naming
+explicitly: this session's own verification claims need the same scrutiny
+applied to reviewers' claims, not just when a reviewer happens to catch it.
+
+### Added: `PREFLIGHT_ONLY` safety flag
+
+Per this round's explicit request: `run_rtmpose_canary.sh` now defaults to
+`PREFLIGHT_ONLY=1`, stopping immediately after `live_preflight.py` passes
+and printing a clear message rather than continuing into the 200-epoch
+canary in the same invocation. Set `PREFLIGHT_ONLY=0` explicitly to
+actually start training -- intended workflow: run preflight on the server
+tonight, review its output, get the supervisor's endpoint-ordering reply,
+THEN re-run with `PREFLIGHT_ONLY=0` the next morning.
+
+## Status after the sixth round
+
+Not yet run against a live install (still no MMPose environment available
+this session). Newly true:
+
+- The val-loop redesign (round 5) is now actually constructible by
+  MMEngine's Runner -- verified against the real constraint in Runner's
+  own source, not assumed.
+- `live_preflight.py` can actually catch the two structural bugs above
+  (it now builds the Hook for real and calls its real lifecycle method),
+  not just the shared functions underneath them.
+- The geometric round-trip test is deterministic, matching what it always
+  claimed to be.
+- BGR/RGB channel order has a real, automated check instead of a claimed-
+  but-missing one.
+- The forward/backward and decode smoke tests use the pretrained backbone,
+  not a randomly-initialised one.
+- `PREFLIGHT_ONLY=1` is the default, so running this script cannot
+  accidentally start the 200-epoch canary before the supervisor's
+  endpoint-ordering reply arrives.
+
+Given six review rounds have each found real, distinct issues -- three of
+them (rounds 2, 4, 5) in code that was ITSELF written to fix or verify a
+previous round's finding -- the honest status remains: still not run
+against live MMPose. The next real step is unchanged: run
+`live_preflight.py` for real on the server tonight (`PREFLIGHT_ONLY=1`,
+the default), fix whatever it finds (very likely at least one of its own
+flagged live-only assumptions, e.g. the SimCC codec's exact
+`encode()`/`decode()` dict keys), and send the already-drafted
+endpoint-ordering question to the supervisor now -- that question cannot
+be resolved by further code review at all, and should not wait for a
+seventh round.

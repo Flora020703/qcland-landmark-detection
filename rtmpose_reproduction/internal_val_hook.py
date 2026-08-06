@@ -64,20 +64,34 @@ class InternalFixedChannelNMEHook(Hook):
     `runner.message_hub` (so it appears in the standard training log
     alongside loss, without depending on PCKAccuracy/val_evaluator at all).
 
-    This does NOT replace `val_dataloader`/`val_evaluator` in the generated
-    config (kept for introspection/compatibility, e.g. dataset-length
-    checks elsewhere) -- but `train_cfg`'s own `val_interval` mechanism
-    should be effectively disabled (see make_config.py's own comment on
-    this) so MMEngine's default val loop, and therefore `model.predict()`,
-    never actually runs during training; this Hook is the sole source of
-    periodic internal monitoring.
+    `val_dataloader`/`val_evaluator` in the generated config are both
+    `None` (round 6 fix -- MMEngine's Runner requires `val_dataloader`,
+    `val_cfg`, `val_evaluator` to be either all `None` or all non-`None`,
+    verified against the real Runner source; a `val_cfg=None` alongside
+    still-populated `val_dataloader`/`val_evaluator` dicts, this class's
+    own round-5 design, would have made Runner construction itself raise
+    `ValueError` before a single training step ran). The Train-only
+    internal validation split instead lives under the NON-standard config
+    key `internal_val_dataloader`, which Runner's own `from_cfg()` never
+    reads at all, so it cannot participate in that all-or-nothing check.
+    This Hook reads `runner.cfg.internal_val_dataloader["dataset"]`, not
+    `runner.cfg.val_dataloader`.
+
+    This Hook is the SOLE source of periodic internal monitoring --
+    `val_cfg=None` disables MMEngine's own default val loop, and therefore
+    `model.predict()`, entirely during training.
     """
 
     def __init__(self, internal_val_ann: str, images_dir: str,
-                 interval: int = 5, device: str = "cuda:0"):
+                 interval: int = 5, device: str | None = None):
         self.internal_val_ann = internal_val_ann
         self.images_dir = images_dir
         self.interval = interval
+        # `device=None` resolves to the model's own actual device at call
+        # time (round 6 fix, review request) rather than a hardcoded
+        # "cuda:0" -- correct on any single device the model happens to be
+        # on, and does not silently break under a future DDP/multi-GPU
+        # setup the way a hardcoded string would.
         self.device = device
         self._gt_by_id = None
         self._dataset = None
@@ -94,7 +108,7 @@ class InternalFixedChannelNMEHook(Hook):
             ann_by_image[ann["image_id"]] = ann
         self._ann_by_image = ann_by_image
 
-        dataset_cfg = dict(runner.cfg.val_dataloader["dataset"])
+        dataset_cfg = dict(runner.cfg.internal_val_dataloader["dataset"])
         dataset_cfg["ann_file"] = self.internal_val_ann
         self._dataset = DATASETS.build(dataset_cfg)
 
@@ -106,6 +120,7 @@ class InternalFixedChannelNMEHook(Hook):
         import torch
 
         model = runner.model
+        device = self.device or str(next(model.parameters()).device)
         was_training = model.training
         model.eval()
         nmes = []
@@ -119,7 +134,7 @@ class InternalFixedChannelNMEHook(Hook):
                 ann = self._ann_by_image[img_id]
                 gt_kpts = np.asarray(ann["keypoints"], dtype=np.float64).reshape(2, 3)[:, :2]
 
-                model_space_coords = decode_batch_low_level(model, data, self.device)
+                model_space_coords = decode_batch_low_level(model, data, device)
                 pred = to_original_image_space(model_space_coords, width, height)
                 nmes.append(fixed_channel_nme(pred, gt_kpts))
         if was_training:

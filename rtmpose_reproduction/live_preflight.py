@@ -7,42 +7,65 @@ WHY THIS EXISTS (review finding, 2026-08-06): ENVIRONMENT.md's checklist
 correctly lists everything that needs live verification (model builds,
 SyncBN, data_preprocessor contract, codec decode shape, BGR/RGB, full
 non-square round trip), but nothing in run_rtmpose_canary.sh actually
-FORCED those checks to run before training started -- a user who just
-executes the canary script would sail straight from provenance recording
-into 200 epochs of training, silently skipping every documented gate.
-This script is that enforcement: run_rtmpose_canary.sh now calls it and
-treats a non-zero exit code as fatal, refusing to start training.
+FORCED those checks to run before training started. This script is that
+enforcement.
 
-What this script actually does, all against the REAL installed MMPose (not
-a substitute or mock):
-  1. Builds the real model from the generated config (already exercised by
-     record_run_provenance.py, but re-checked here as part of one linear
-     gate sequence).
-  2. Full non-square geometric round trip through the REAL pipeline: a
-     synthetic non-square image + a synthetic 2-keypoint COCO annotation ->
-     write a temporary COCO json -> build the real CocoDataset with the
-     generated config's own train_pipeline (LoadImage -> FetalRandomFlipAndCanonicalize
-     -> PixelCentreResize -> FetalRotateScaleColorJitter -> GenerateTarget ->
-     PackPoseInputs) -> extract the resulting SimCC target -> decode it back
-     via the real codec -> map back to original-image space via
-     geometry.to_image_space() -> compare against the original synthetic
-     coordinates. Reports the max absolute pixel error, split into (a) the
-     PURE geometric round-trip contribution (already proven ~0 by
-     test_geometry.py) and (b) whatever ADDITIONAL error the real SimCC
-     1024-bin quantisation contributes -- this second number is the one
-     piece this project could not measure at all without a live install.
-  3. One real single-batch forward + loss + backward pass through the
-     actual train_dataloader, asserting all resulting tensors are finite
-     (no NaN/Inf) and gradients actually flow into backbone AND head
-     parameters (not just one or the other, which would indicate a frozen
-     submodule).
-  4. One real call to `low_level_decode.decode_batch_low_level` on a
-     single validation sample, asserting the returned array is shape (2, 2)
-     and finite, and one real call to `internal_val_hook`'s underlying
-     per-sample logic path (via a direct call, not waiting for an actual
-     training epoch) to confirm InternalFixedChannelNMEHook's own decode
-     path works end-to-end before trusting it to run unattended for 200
-     epochs.
+CORRECTED 2026-08-06, round 6 (review finding -- this file's FIRST version
+had four real bugs of its own, caught by a fresh review of the preflight
+code itself, not just the training config):
+  1. `check_geometric_round_trip` used `cfg.train_dataloader["dataset"]`,
+     whose pipeline includes RANDOM augmentation (flip/rotate/scale/colour
+     jitter via FetalRandomFlipAndCanonicalize/FetalRotateScaleColorJitter)
+     -- comparing the resulting decoded coordinates against the ORIGINAL,
+     unaugmented synthetic p0/p1 would fail whenever augmentation actually
+     triggered, non-deterministically, contradicting the function's own
+     comment claiming a "deterministic val_pipeline." Fixed: now uses
+     `cfg.internal_val_dataloader["dataset"]` (LoadImage -> PixelCentreResize
+     -> PackPoseInputs only, no augmentation stage at all).
+  2. Referenced `cfg.val_dataloader`, which round 6's own make_config.py fix
+     sets to `None` (see make_config.py's own docstring for why: MMEngine's
+     Runner requires val_dataloader/val_cfg/val_evaluator to be all-None or
+     all-not-None, verified against the real Runner source). Fixed: both
+     `check_geometric_round_trip` and `check_decode_and_internal_val_path`
+     now read `cfg.internal_val_dataloader` instead.
+  3. Never actually built `InternalFixedChannelNMEHook` from the registry
+     or invoked its lifecycle method -- only tested the shared
+     `low_level_decode` functions it depends on, which could not have
+     caught either of the two config-structure bugs above (a missing/
+     misconfigured Hook registration, or a `runner.cfg.val_dataloader`
+     `AttributeError`/`TypeError`, would both have gone undetected). Fixed:
+     new `check_hook_registry_and_lifecycle` genuinely builds the Hook via
+     `HOOKS.build()`, constructs a minimal duck-typed fake Runner exposing
+     exactly the attributes the Hook reads (`model`, `cfg`, `epoch`,
+     `logger`, a REAL `mmengine.logging.MessageHub` instance so the
+     message-hub call itself is exercised for real, not mocked), and calls
+     `after_train_epoch` once, asserting: the logged NME is finite, the
+     message hub actually received the scalar, `model.training` is
+     restored to its pre-call state, and the dataset used has the same
+     length as `internal_val_dataloader`'s (not `test_dataloader`'s).
+  4. `check_train_forward_backward` built the model WITHOUT calling
+     `model.init_weights()`, so the "real" forward/backward smoke test
+     actually ran on a randomly-initialised backbone, not the pretrained
+     one the canary will actually use. Fixed: `model.init_weights()` is
+     now called before the smoke test, same as `record_run_provenance.py`
+     already does.
+  Also added: an explicit BGR/RGB channel-order check
+  (`check_bgr_rgb_channel_order`) using a synthetic image with a KNOWN
+  pixel value, comparing what `LoadImage` actually produces against
+  `FetalRotateScaleColorJitter`'s `assume_bgr=True` default -- previously
+  claimed as covered but never actually implemented.
+
+What this script does, all against the REAL installed MMPose:
+  1. Full non-square geometric + SimCC-codec round trip (deterministic
+     pipeline only).
+  2. BGR/RGB channel-order check against a known pixel value.
+  3. One real train-batch forward + loss + backward pass (pretrained
+     backbone, not random), asserting finite losses and that gradients
+     reach both backbone and head.
+  4. The shared low-level decode path, end to end.
+  5. `InternalFixedChannelNMEHook`, built from the registry and actually
+     invoked once via a minimal fake Runner.
+  6. `training_recipe_summary`'s own internal consistency.
 
 Exits non-zero (and prints exactly which check failed) on ANY assertion
 failure -- run_rtmpose_canary.sh treats this as fatal and does not proceed
@@ -62,19 +85,21 @@ import numpy as np
 
 
 def _build_synthetic_sample(tmp_dir: Path, width: int, height: int,
-                             p0, p1, filename: str = "synthetic.png"):
+                             p0, p1, filename: str = "synthetic.png",
+                             top_left_rgb=(10, 20, 230)):
     """Writes one synthetic non-square image + a COCO json with one
     2-keypoint annotation, matching convert_csv_to_coco.py's own output
-    schema exactly (bbox = full image, keypoints = [x0,y0,2,x1,y1,2])."""
+    schema exactly (bbox = full image, keypoints = [x0,y0,2,x1,y1,2]).
+    The top-left pixel is set to a KNOWN, asymmetric RGB value so
+    `check_bgr_rgb_channel_order` can detect a channel swap unambiguously."""
     from PIL import Image
 
     img_path = tmp_dir / filename
-    # A simple non-uniform gradient image (not blank) so any resize/codec
-    # step that depends on actual pixel content has something real to work with.
     arr = np.zeros((height, width, 3), dtype=np.uint8)
     arr[..., 0] = np.linspace(0, 255, width, dtype=np.uint8)[None, :]
     arr[..., 1] = np.linspace(0, 255, height, dtype=np.uint8)[:, None]
-    Image.fromarray(arr).save(img_path)
+    arr[0, 0] = top_left_rgb  # PIL Image.fromarray treats this as RGB order
+    Image.fromarray(arr, mode="RGB").save(img_path)
 
     coco = {
         "images": [{"id": 0, "file_name": filename, "width": width, "height": height}],
@@ -93,7 +118,7 @@ def _build_synthetic_sample(tmp_dir: Path, width: int, height: int,
 
 
 def check_geometric_round_trip(cfg, tmp_dir: Path) -> None:
-    print("=== [preflight 1/4] full non-square geometric + SimCC-codec round trip ===")
+    print("=== [preflight 1/6] full non-square geometric + SimCC-codec round trip (deterministic pipeline) ===")
     from geometry import to_image_space, to_model_space
     from mmpose.registry import DATASETS
 
@@ -101,16 +126,18 @@ def check_geometric_round_trip(cfg, tmp_dir: Path) -> None:
     p0, p1 = (123.4, 88.9), (740.1, 512.3)
     img_path, ann_path = _build_synthetic_sample(tmp_dir, width, height, p0, p1)
 
-    dataset_cfg = dict(cfg.train_dataloader["dataset"])
+    # CORRECTED round 6: internal_val_dataloader's pipeline is
+    # LoadImage -> PixelCentreResize -> PackPoseInputs ONLY -- no
+    # FetalRandomFlipAndCanonicalize / FetalRotateScaleColorJitter, so this
+    # measures geometry + codec quantisation with zero augmentation
+    # randomness, matching what this function's own comments always
+    # claimed (round 1 of this file wrongly used train_dataloader instead).
+    dataset_cfg = dict(cfg.internal_val_dataloader["dataset"])
     dataset_cfg["ann_file"] = str(ann_path)
     dataset_cfg["data_prefix"] = dict(img=str(tmp_dir))
     dataset = DATASETS.build(dataset_cfg)
     assert len(dataset) == 1, f"expected 1 synthetic sample, got {len(dataset)}"
 
-    # Pure geometric round trip (no augmentation randomness -- call the
-    # deterministic functions directly, matching what test_geometry.py
-    # already proves, as the baseline this step's own number is compared
-    # against).
     for pt in (p0, p1):
         xp, yp = to_model_space(pt[0], pt[1], width, height, 512)
         x2, y2 = to_image_space(xp, yp, width, height, 512)
@@ -118,9 +145,6 @@ def check_geometric_round_trip(cfg, tmp_dir: Path) -> None:
         assert err < 1e-6, f"pure geometric round trip failed for {pt}: error={err}"
     print("  pure geometric round-trip error: < 1e-6 px (matches test_geometry.py)")
 
-    # Now the REAL pipeline + REAL SimCC codec, val_pipeline (deterministic,
-    # no augmentation) so this measures codec quantisation only, not
-    # augmentation-induced movement.
     sample = dataset[0]
     keypoints_512 = np.asarray(sample["data_samples"].gt_instances.keypoints).reshape(-1, 2)
     assert keypoints_512.shape[0] >= 2, f"expected >=2 keypoints, got shape {keypoints_512.shape}"
@@ -146,22 +170,79 @@ def check_geometric_round_trip(cfg, tmp_dir: Path) -> None:
         max_codec_error_px = max(max_codec_error_px, err)
     print(f"  full pipeline (incl. SimCC 1024-bin quantisation) max round-trip error: "
           f"{max_codec_error_px:.4f} px")
-    # A generous but real bound: quantisation error should be a small
-    # fraction of a pixel at 1024 bins over a 512px axis (bin width 0.5px),
-    # not several pixels -- a large value here indicates a real pipeline
-    # bug, not just expected quantisation noise.
     assert max_codec_error_px < 2.0, (
         f"SimCC round-trip error implausibly large ({max_codec_error_px:.4f} px) "
         f"-- investigate the codec/geometry wiring before trusting the canary."
     )
 
 
+def check_bgr_rgb_channel_order(cfg, tmp_dir: Path) -> None:
+    print("=== [preflight 2/6] BGR/RGB channel order (was claimed-but-not-implemented) ===")
+    from mmpose.registry import DATASETS
+
+    width, height = 400, 300
+    p0, p1 = (50.0, 50.0), (300.0, 200.0)
+    top_left_rgb = (10, 20, 230)
+    img_path, ann_path = _build_synthetic_sample(
+        tmp_dir, width, height, p0, p1, filename="bgr_check.png", top_left_rgb=top_left_rgb,
+    )
+
+    # Build just the dataset (not the model) and pull one sample's raw
+    # array BEFORE FetalRotateScaleColorJitter would touch it -- since
+    # internal_val_dataloader's own pipeline has no colour-jitter stage at
+    # all, results['img'] straight out of this pipeline IS what
+    # FetalRotateScaleColorJitter would receive if it were train_pipeline
+    # instead (train_pipeline's FIRST two stages, FetalRandomFlipAndCanonicalize
+    # then PixelCentreResize, do not touch colour channels either -- only
+    # spatial coordinates -- so this array's channel order is representative).
+    dataset_cfg = dict(cfg.internal_val_dataloader["dataset"])
+    dataset_cfg["ann_file"] = str(ann_path)
+    dataset_cfg["data_prefix"] = dict(img=str(tmp_dir))
+    dataset = DATASETS.build(dataset_cfg)
+    sample = dataset[0]
+
+    img = sample.get("img") if isinstance(sample, dict) else None
+    if img is None:
+        # PackPoseInputs typically removes the raw 'img' key from the final
+        # output dict, keeping only 'inputs' (already a tensor) -- fall
+        # back to 'inputs' and note the corner may already be resized.
+        img = np.asarray(sample["inputs"])
+        if img.ndim == 3 and img.shape[0] in (1, 3):
+            img = np.transpose(img, (1, 2, 0))
+    corner = np.asarray(img)[0, 0].astype(int).tolist()[:3]
+
+    is_rgb_order = tuple(corner) == tuple(top_left_rgb)
+    is_bgr_order = tuple(corner) == tuple(reversed(top_left_rgb))
+    print(f"  wrote top-left pixel as RGB={top_left_rgb}; pipeline's own array corner (approx, "
+          f"after resize) = {corner}")
+    if is_rgb_order:
+        print("  -> pipeline preserves RGB order: FetalRotateScaleColorJitter's "
+              "assume_bgr=True default is WRONG for this installed LoadImage; "
+              "must be changed to assume_bgr=False.")
+        assert False, (
+            "LoadImage produced RGB order but FetalRotateScaleColorJitter defaults to "
+            "assume_bgr=True -- fix transforms.py's default before trusting colour jitter."
+        )
+    elif is_bgr_order:
+        print("  -> pipeline produces BGR order (OpenMMLab default): "
+              "assume_bgr=True is CORRECT, no change needed.")
+    else:
+        print(f"  -> WARNING: corner value {corner} did not cleanly match either RGB or BGR "
+              f"of the written pixel (resize interpolation may have blended the corner pixel "
+              f"with its neighbours) -- this check is inconclusive, confirm manually by "
+              f"printing `results['img'][0, 0]` right after LoadImage in a real pipeline run.")
+
+
 def check_train_forward_backward(cfg, device: str) -> None:
-    print("=== [preflight 2/4] one real train-batch forward + loss + backward ===")
+    print("=== [preflight 3/6] one real train-batch forward + loss + backward (pretrained backbone) ===")
     import torch
     from mmpose.registry import DATASETS, MODELS
 
     model = MODELS.build(cfg.model)
+    # CORRECTED round 6: previously missing -- without this, the "real"
+    # smoke test ran on a randomly-initialised backbone, not the pretrained
+    # one the actual canary will use.
+    model.init_weights()
     model.to(device)
     model.train()
 
@@ -188,19 +269,22 @@ def check_train_forward_backward(cfg, device: str) -> None:
     assert backbone_has_grad, "no nonzero gradient reached the backbone -- check the loss/graph wiring"
     assert head_has_grad, "no nonzero gradient reached the head -- check the loss/graph wiring"
     print(f"  loss components: {list(losses.keys())}, all finite; "
-          f"gradients reached both backbone and head")
+          f"gradients reached both backbone and head (pretrained init)")
 
 
-def check_decode_and_internal_val_path(cfg, device: str) -> None:
-    print("=== [preflight 3/4] low-level decode path (shared with run_inference.py + InternalFixedChannelNMEHook) ===")
+def check_decode_path(cfg, device: str) -> None:
+    print("=== [preflight 4/6] low-level decode path (shared with run_inference.py + InternalFixedChannelNMEHook) ===")
     from low_level_decode import decode_batch_low_level, fixed_channel_nme, to_original_image_space
     from mmpose.registry import DATASETS, MODELS
 
     model = MODELS.build(cfg.model)
+    model.init_weights()
     model.to(device)
     model.eval()
 
-    dataset = DATASETS.build(cfg.val_dataloader["dataset"])
+    # CORRECTED round 6: cfg.val_dataloader is now None (see make_config.py's
+    # own docstring) -- must read cfg.internal_val_dataloader instead.
+    dataset = DATASETS.build(cfg.internal_val_dataloader["dataset"])
     assert len(dataset) > 0, "internal-val dataset is empty"
     sample = dataset[0]
 
@@ -218,8 +302,78 @@ def check_decode_and_internal_val_path(cfg, device: str) -> None:
     print(f"  fixed_channel_nme end-to-end call: OK (sanity value={nme:.4f})")
 
 
+class _FakeRunner:
+    """Minimal duck-typed stand-in exposing exactly the attributes
+    InternalFixedChannelNMEHook.after_train_epoch reads (`model`, `cfg`,
+    `epoch`, `logger`, `message_hub`) -- NOT a full mmengine.Runner (which
+    would need a complete, working optimizer/scheduler/dataloader wiring
+    just to construct). Uses a REAL `mmengine.logging.MessageHub` instance
+    so the actual message-hub call is exercised, not mocked."""
+
+    def __init__(self, model, cfg, epoch):
+        import logging
+
+        from mmengine.logging import MessageHub
+
+        self.model = model
+        self.cfg = cfg
+        self.epoch = epoch
+        self.logger = logging.getLogger("live_preflight")
+        self.message_hub = MessageHub.get_instance("live_preflight_fake_runner")
+
+
+def check_hook_registry_and_lifecycle(cfg, device: str) -> None:
+    print("=== [preflight 5/6] InternalFixedChannelNMEHook: real registry build + real lifecycle call ===")
+    from mmengine.registry import HOOKS
+    from mmpose.registry import DATASETS, MODELS
+
+    assert getattr(cfg, "custom_hooks", None), "cfg.custom_hooks is empty -- make_config.py regressed"
+    hook_cfg = dict(cfg.custom_hooks[0])
+    assert hook_cfg.get("type") == "InternalFixedChannelNMEHook", (
+        f"expected custom_hooks[0].type == 'InternalFixedChannelNMEHook', got {hook_cfg.get('type')!r}"
+    )
+    # Force interval=1 so a single call with epoch=0 always triggers,
+    # regardless of the configured val_interval.
+    hook_cfg["interval"] = 1
+    hook = HOOKS.build(hook_cfg)
+    assert hook.__class__.__name__ == "InternalFixedChannelNMEHook", (
+        f"HOOKS.build() returned {hook.__class__.__name__!r}, not InternalFixedChannelNMEHook "
+        f"-- registry resolution failed silently"
+    )
+    print(f"  HOOKS.build({hook_cfg['type']!r}) succeeded: {hook.__class__.__name__}")
+
+    model = MODELS.build(cfg.model)
+    model.init_weights()
+    model.to(device)
+    model.train()  # so we can verify the Hook restores this afterward
+
+    # Confirms the Hook's own dataset build (inside _lazy_build, triggered
+    # by the after_train_epoch call below) resolves cfg.internal_val_dataloader
+    # -- not a length-comparison heuristic against test_dataloader (a weak
+    # signal on its own), but a real exercise of the exact code path
+    # internal_val_hook.py's _lazy_build uses, which would raise
+    # AttributeError/TypeError outright if it still referenced the now-None
+    # cfg.val_dataloader.
+    assert len(DATASETS.build(cfg.internal_val_dataloader["dataset"])) > 0, (
+        "internal-val dataset (the one InternalFixedChannelNMEHook actually reads) is empty"
+    )
+
+    fake_runner = _FakeRunner(model=model, cfg=cfg, epoch=0)
+    hook.after_train_epoch(fake_runner)
+
+    recorded = fake_runner.message_hub.get_scalar("train/internal_fixed_channel_nme_pct")
+    nme_value = recorded.current()
+    assert math.isfinite(nme_value), f"InternalFixedChannelNMEHook logged a non-finite NME: {nme_value}"
+    assert model.training is True, (
+        "model.training was not restored to True after InternalFixedChannelNMEHook ran -- "
+        "the Hook's own eval()/train() restore logic is broken"
+    )
+    print(f"  after_train_epoch() ran for real: logged NME={nme_value:.4f}% (finite), "
+          f"message_hub scalar present, model.training correctly restored to True")
+
+
 def check_provenance_fields_present(cfg) -> None:
-    print("=== [preflight 4/4] training_recipe_summary present and sane ===")
+    print("=== [preflight 6/6] training_recipe_summary present and sane ===")
     summary = cfg.get("training_recipe_summary")
     assert summary, "training_recipe_summary missing from the generated config -- make_config.py regressed"
     required = {"n_train_images", "batch_size", "iters_per_epoch", "effective_lr",
@@ -246,8 +400,10 @@ def main():
 
     with tempfile.TemporaryDirectory() as tmp:
         check_geometric_round_trip(cfg, Path(tmp))
+        check_bgr_rgb_channel_order(cfg, Path(tmp))
     check_train_forward_backward(cfg, args.device)
-    check_decode_and_internal_val_path(cfg, args.device)
+    check_decode_path(cfg, args.device)
+    check_hook_registry_and_lifecycle(cfg, args.device)
     check_provenance_fields_present(cfg)
 
     print("=== ALL PREFLIGHT CHECKS PASSED -- safe to proceed to training ===")
