@@ -85,9 +85,11 @@ echo "=== [3/6] convert UCL BPD internal-train / internal-val CSVs to COCO json 
 
 echo "=== [4/6] generate the canary config ==="
 # `--test-ann "$GT_TEST_JSON"` below only writes that PATH STRING into the
-# generated config's test_dataloader (needed so the config text is
-# complete) -- the file itself does not exist yet and is not required to
-# exist at config-generation time; nothing reads it until step 6.
+# generated config's `inference_dataloader` (round 7: NOT `test_dataloader`,
+# which is now `None` -- see make_config.py's own comment for why) --
+# needed so the config text is complete; the file itself does not exist
+# yet and is not required to exist at config-generation time; nothing
+# reads it until step 6.
 "$PY" make_config.py \
   --dataset UCL --task BPD --seed 42 \
   --data-root "$DATA_ROOT" \
@@ -129,6 +131,16 @@ echo "=== [4c/6] MANDATORY live preflight gate -- refuses to proceed to training
 # PREFLIGHT_ONLY=0 to actually proceed to training.
 if [ "${PREFLIGHT_ONLY:-1}" = "1" ]; then
   echo "=== PREFLIGHT COMPLETE -- PREFLIGHT_ONLY=1 (default), training NOT started ==="
+  echo "Recommended before the real 200-epoch run (review suggestion, not automated"
+  echo "here -- live_preflight.py's fake-Runner Hook test is not a substitute for this):"
+  echo "  run one independent 1-EPOCH smoke run in its own separate work_dir, e.g.:"
+  echo "    MAX_EPOCHS=1 PREFLIGHT_ONLY=0 WORK_DIR_SUFFIX=_smoketest bash run_rtmpose_canary.sh"
+  echo "  (not wired as a flag here -- regenerate a config with --work-dir pointed at a"
+  echo "  throwaway directory and max_epochs=1, run it manually) to confirm optimizer,"
+  echo "  scheduler, InternalFixedChannelNMEHook, and checkpoint saving all genuinely"
+  echo "  work together through Runner.from_cfg()'s real training loop, which the"
+  echo "  fake-Runner Hook test above does not exercise. Delete that work_dir afterward"
+  echo "  -- it is not a result, just an integration smoke test."
   echo "Re-run with PREFLIGHT_ONLY=0 to actually start the seed-42 canary."
   exit 0
 fi

@@ -915,3 +915,79 @@ flagged live-only assumptions, e.g. the SimCC codec's exact
 endpoint-ordering question to the supervisor now -- that question cannot
 be resolved by further code review at all, and should not wait for a
 seventh round.
+
+## Seventh round: two small, confirmed fixes, then STOP further static review
+
+A seventh reviewer confirmed round 6's four fixes were correctly landed,
+found exactly two remaining small issues (both fixed), and explicitly
+recommended NOT continuing further architectural rewrites -- the real next
+gate is server-side execution, not another static-review pass.
+
+### 1. BGR/RGB check could be inconclusive and still PASS
+
+The round-6 check ran the FULL dataset pipeline (including
+`PixelCentreResize`'s bilinear interpolation) before inspecting the corner
+pixel, so a blended, ambiguous pixel value was possible -- and when that
+happened, the function printed a WARNING and returned normally, directly
+contradicting this whole script's premise that any unverified assumption
+should block training, not just get logged.
+
+**Fixed**: `check_bgr_rgb_channel_order` now invokes MMPose's registered
+`LoadImage` transform DIRECTLY, with no resize/interpolation involved at
+all -- the loaded array's corner pixel is checked with zero ambiguity
+against the known written value. Any outcome other than a clean RGB or
+clean BGR match is now a hard `assert False`, not a printed warning.
+
+### 2. `test_evaluator=PCKAccuracy` was structurally reachable, only discouraged by comment
+
+Round 6 kept `test_dataloader`/`test_cfg`/`test_evaluator` as a consistent
+non-`None` trio (required by Runner's own all-or-nothing constraint) with
+a loud "DO NOT RUN `tools/test.py`" comment as the only thing preventing
+`PCKAccuracy` from ever being invoked against a pipeline it was never
+verified safe for.
+
+**Fixed**: `run_inference.py`'s own dataset need now lives under a
+non-standard key, `inference_dataloader` (same technique as
+`internal_val_dataloader`), which `Runner.from_cfg()` never reads.
+`test_dataloader`, `test_cfg`, and `test_evaluator` are all now genuinely
+`None` -- a legitimate all-`None` trio Runner accepts -- eliminating any
+config-level entry point for `tools/test.py`/`runner.test()` to reach
+`PCKAccuracy` at all, structurally, not by convention.
+
+### Recommended (not automated): an independent 1-epoch smoke run
+
+This round's reviewer noted that `live_preflight.py`'s fake-Runner Hook
+test exercises the Hook directly but does not exercise
+`Runner.from_cfg()`'s real training loop (optimizer stepping, scheduler
+stepping, checkpoint saving, and the Hook, all running together for real).
+Rather than building more tooling for this now, `run_rtmpose_canary.sh`'s
+`PREFLIGHT_ONLY=1` exit message now recommends running one real 1-epoch
+smoke run in a separate, throwaway `work_dir` (`MAX_EPOCHS=1`) before the
+actual 200-epoch canary, as a manual step -- confirming the full stack
+integrates correctly without treating its output as a result, and without
+adding a seventh round of automated scaffolding for a single manual
+sanity check.
+
+## Status after the seventh round: STOP further static review, move to server execution
+
+Both this round's issues were small and are fixed. The reviewer's own
+explicit judgement, agreed with here: **do not continue indefinite static
+code review** -- the real next gate is running `live_preflight.py` against
+a live MMPose install, which will surface whatever this session's
+un-runnable assumptions actually resolve to (very likely including at
+least one of the SimCC codec's exact `encode()`/`decode()` dict keys, the
+`LoadImage` results-key contract, and `PoseDataPreprocessor`'s single-
+sample call signature). Recommended sequencing, unchanged from this
+round's own suggestion:
+
+1. Upload the current `rtmpose_reproduction/` to the server.
+2. Run `PREFLIGHT_ONLY=1 PY=... PRETRAINED_CKPT_PATH=... bash run_rtmpose_canary.sh`
+   tonight -- fix whatever `live_preflight.py` finds live.
+3. Run one independent 1-epoch smoke run in a throwaway work_dir.
+4. Separately (does not block 1-3): resolve the endpoint-ordering
+   convention with the supervisor.
+5. Only after both 3 and 4: `MAX_EPOCHS=200 PREFLIGHT_ONLY=0 bash run_rtmpose_canary.sh`
+   for the real seed-42 canary.
+6. Manually review prediction overlays, parameter counts, per-image files,
+   and NME before sharing with the supervisor -- do not auto-start the
+   remaining 49 runs.

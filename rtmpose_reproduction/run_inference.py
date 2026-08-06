@@ -86,7 +86,15 @@ def main():
     gt = json.loads(args.gt_json.read_text(encoding="utf-8"))
     images_by_id = {im["id"]: im for im in gt["images"]}
 
-    dataset_cfg = cfg.test_dataloader["dataset"]
+    # CORRECTED round 7 (review finding): reads `inference_dataloader`, not
+    # `test_dataloader` -- make_config.py now sets test_dataloader/test_cfg/
+    # test_evaluator all to None (a legitimate all-None trio for MMEngine's
+    # Runner) so there is no config-level entry point through which
+    # `tools/test.py` could ever invoke PCKAccuracy against this pipeline,
+    # eliminating that risk structurally rather than by a "don't run this"
+    # comment alone. This script's own dataset need lives under the
+    # non-standard `inference_dataloader` key instead.
+    dataset_cfg = cfg.inference_dataloader["dataset"]
     dataset = DATASETS.build(dataset_cfg)
 
     predictions = []

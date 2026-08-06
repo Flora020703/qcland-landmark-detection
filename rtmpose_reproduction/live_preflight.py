@@ -41,8 +41,11 @@ code itself, not just the training config):
      message-hub call itself is exercised for real, not mocked), and calls
      `after_train_epoch` once, asserting: the logged NME is finite, the
      message hub actually received the scalar, `model.training` is
-     restored to its pre-call state, and the dataset used has the same
-     length as `internal_val_dataloader`'s (not `test_dataloader`'s).
+     restored to its pre-call state, and the dataset built matches
+     `internal_val_dataloader`'s own dataset config (not the released
+     Test set, which as of round 7 lives under `inference_dataloader`,
+     not `test_dataloader` -- see make_config.py's own comment for why
+     `test_dataloader`/`test_cfg`/`test_evaluator` are now all `None`).
   4. `check_train_forward_backward` built the model WITHOUT calling
      `model.init_weights()`, so the "real" forward/backward smoke test
      actually ran on a randomly-initialised backbone, not the pretrained
@@ -177,60 +180,62 @@ def check_geometric_round_trip(cfg, tmp_dir: Path) -> None:
 
 
 def check_bgr_rgb_channel_order(cfg, tmp_dir: Path) -> None:
-    print("=== [preflight 2/6] BGR/RGB channel order (was claimed-but-not-implemented) ===")
-    from mmpose.registry import DATASETS
+    """CORRECTED round 7 (review finding): the first version ran the FULL
+    dataset pipeline (including PixelCentreResize's bilinear interpolation)
+    before inspecting the corner pixel, so an inconclusive blended-pixel
+    result was possible -- and when inconclusive, the function only printed
+    a WARNING and returned success, directly contradicting this whole
+    script's "any unverified assumption blocks training" premise. Fixed:
+    invokes MMPose's own registered `LoadImage` transform DIRECTLY, on its
+    own, with no resize/interpolation involved at all -- the loaded array's
+    corner pixel is checked exactly, with zero ambiguity, and ANY outcome
+    other than a clean RGB or clean BGR match is now a hard failure, not a
+    warning."""
+    print("=== [preflight 2/6] BGR/RGB channel order (direct LoadImage, no resize involved) ===")
+    from mmpose.registry import TRANSFORMS
 
     width, height = 400, 300
     p0, p1 = (50.0, 50.0), (300.0, 200.0)
     top_left_rgb = (10, 20, 230)
-    img_path, ann_path = _build_synthetic_sample(
+    img_path, _ = _build_synthetic_sample(
         tmp_dir, width, height, p0, p1, filename="bgr_check.png", top_left_rgb=top_left_rgb,
     )
 
-    # Build just the dataset (not the model) and pull one sample's raw
-    # array BEFORE FetalRotateScaleColorJitter would touch it -- since
-    # internal_val_dataloader's own pipeline has no colour-jitter stage at
-    # all, results['img'] straight out of this pipeline IS what
-    # FetalRotateScaleColorJitter would receive if it were train_pipeline
-    # instead (train_pipeline's FIRST two stages, FetalRandomFlipAndCanonicalize
-    # then PixelCentreResize, do not touch colour channels either -- only
-    # spatial coordinates -- so this array's channel order is representative).
-    dataset_cfg = dict(cfg.internal_val_dataloader["dataset"])
-    dataset_cfg["ann_file"] = str(ann_path)
-    dataset_cfg["data_prefix"] = dict(img=str(tmp_dir))
-    dataset = DATASETS.build(dataset_cfg)
-    sample = dataset[0]
+    # NOTE (needs live confirmation, same tier as the rest of this file):
+    # `results['img_path']` is the documented mmcv/mmpose LoadImage input
+    # key; if the installed version expects a different key name, this
+    # call fails loudly here, which is exactly this preflight's job.
+    load_image = TRANSFORMS.build(dict(type="LoadImage"))
+    results = load_image.transform({"img_path": str(img_path)})
+    img = np.asarray(results["img"])
+    assert img.ndim == 3 and img.shape[2] == 3, (
+        f"LoadImage output has unexpected shape {img.shape}, expected (H, W, 3)"
+    )
+    corner = tuple(int(v) for v in img[0, 0, :3])
 
-    img = sample.get("img") if isinstance(sample, dict) else None
-    if img is None:
-        # PackPoseInputs typically removes the raw 'img' key from the final
-        # output dict, keeping only 'inputs' (already a tensor) -- fall
-        # back to 'inputs' and note the corner may already be resized.
-        img = np.asarray(sample["inputs"])
-        if img.ndim == 3 and img.shape[0] in (1, 3):
-            img = np.transpose(img, (1, 2, 0))
-    corner = np.asarray(img)[0, 0].astype(int).tolist()[:3]
+    is_rgb_order = corner == tuple(top_left_rgb)
+    is_bgr_order = corner == tuple(reversed(top_left_rgb))
+    print(f"  wrote top-left pixel as RGB={top_left_rgb}; raw LoadImage output corner = {corner}")
 
-    is_rgb_order = tuple(corner) == tuple(top_left_rgb)
-    is_bgr_order = tuple(corner) == tuple(reversed(top_left_rgb))
-    print(f"  wrote top-left pixel as RGB={top_left_rgb}; pipeline's own array corner (approx, "
-          f"after resize) = {corner}")
+    assert is_rgb_order or is_bgr_order, (
+        f"LoadImage's corner pixel {corner} matches NEITHER the written RGB value "
+        f"{tuple(top_left_rgb)} NOR its BGR reversal {tuple(reversed(top_left_rgb))} -- "
+        f"cannot determine channel order at all (unexpected colour conversion, alpha "
+        f"channel, or a different LoadImage than assumed). Do not proceed until this is "
+        f"understood; a silent, unverified channel-order assumption is exactly what this "
+        f"check exists to eliminate."
+    )
+
     if is_rgb_order:
-        print("  -> pipeline preserves RGB order: FetalRotateScaleColorJitter's "
-              "assume_bgr=True default is WRONG for this installed LoadImage; "
-              "must be changed to assume_bgr=False.")
+        print("  -> LoadImage preserves RGB order.")
         assert False, (
-            "LoadImage produced RGB order but FetalRotateScaleColorJitter defaults to "
-            "assume_bgr=True -- fix transforms.py's default before trusting colour jitter."
+            "LoadImage produces RGB order, but transforms.FetalRotateScaleColorJitter "
+            "defaults to assume_bgr=True -- this MUST be changed to assume_bgr=False "
+            "(or explicitly passed as such in make_config.py's generated pipeline entry) "
+            "before colour jitter's saturation/contrast maths are correct."
         )
-    elif is_bgr_order:
-        print("  -> pipeline produces BGR order (OpenMMLab default): "
-              "assume_bgr=True is CORRECT, no change needed.")
-    else:
-        print(f"  -> WARNING: corner value {corner} did not cleanly match either RGB or BGR "
-              f"of the written pixel (resize interpolation may have blended the corner pixel "
-              f"with its neighbours) -- this check is inconclusive, confirm manually by "
-              f"printing `results['img'][0, 0]` right after LoadImage in a real pipeline run.")
+    print("  -> LoadImage produces BGR order (OpenMMLab default): "
+          "FetalRotateScaleColorJitter's assume_bgr=True default is CORRECT, no change needed.")
 
 
 def check_train_forward_backward(cfg, device: str) -> None:

@@ -348,23 +348,25 @@ internal_val_dataloader = dict(
 val_dataloader = None
 val_evaluator = None
 
-# test_dataloader/test_cfg/test_evaluator remain a consistent (all
-# non-None) trio -- required both by Runner's own all-or-nothing check AND
-# because run_inference.py directly reads `cfg.test_dataloader["dataset"]`
-# as a standalone dataset build, never through Runner.test(). NOTHING in
-# this project's own driver (run_rtmpose_canary.sh) ever calls
-# `tools/test.py` or `runner.test()` against this config.
-#
-# *** DO NOT RUN `tools/test.py` AGAINST THIS CONFIG ***: test_evaluator
-# below is PCKAccuracy, which has the EXACT SAME unverified bbox-metadata
-# risk against model.predict() that motivated replacing the periodic val
-# loop with InternalFixedChannelNMEHook (see val_cfg's own comment below).
-# It is kept defined ONLY because Runner's constructor requires
-# test_dataloader/test_cfg/test_evaluator to be a consistent trio, not
-# because it is safe to actually invoke. The ONLY authoritative evaluation
-# path is run_inference.py (bypasses predict() entirely) followed by
-# evaluate_rtmpose_fixed.py -- never this evaluator, never `tools/test.py`.
-test_dataloader = dict(
+# CORRECTED round 7 (review finding): round 6 kept test_dataloader/
+# test_cfg/test_evaluator as a consistent non-None trio (required by
+# Runner's own all-or-nothing constraint, verified against the same
+# Runner source that governs val_dataloader/val_cfg/val_evaluator -- see
+# val_cfg's own comment below) purely so run_inference.py could read
+# `cfg.test_dataloader["dataset"]` directly, relying on a loud comment
+# ("DO NOT RUN tools/test.py") to prevent PCKAccuracy from ever actually
+# being invoked against a pipeline it was never verified safe for. A
+# comment is not a structural guarantee. Fixed: the dataset this project's
+# own inference step actually needs now lives under a non-standard key,
+# `inference_dataloader`, that Runner.from_cfg() never reads at all (same
+# technique as `internal_val_dataloader` above) -- test_dataloader,
+# test_cfg, and test_evaluator are all now genuinely `None`, a legitimate
+# all-None trio Runner accepts without complaint, and there is no longer
+# any config-level entry point through which `tools/test.py`/`runner.test()`
+# could invoke PCKAccuracy against this pipeline at all -- eliminated
+# structurally, not just discouraged by comment. run_inference.py updated
+# to read `cfg.inference_dataloader["dataset"]`.
+inference_dataloader = dict(
     batch_size={batch_size},
     num_workers=4,
     persistent_workers=True,
@@ -381,7 +383,8 @@ test_dataloader = dict(
         test_mode=True,
     ),
 )
-test_evaluator = dict(type="PCKAccuracy", thr=0.05)
+test_dataloader = None
+test_evaluator = None
 
 train_cfg = dict(by_epoch=True, max_epochs={max_epochs})
 # CORRECTED round 5 (review finding, real crash/silent-wrong-number risk,
@@ -398,8 +401,10 @@ train_cfg = dict(by_epoch=True, max_epochs={max_epochs})
 # low-level decode path and computes the SAME fixed-channel NME formula as
 # the final, authoritative evaluation -- directly comparable numbers, not
 # PCKAccuracy's different metric computed a different way.
+# test_cfg=None alongside test_dataloader=None/test_evaluator=None above --
+# see the inference_dataloader comment for why (round 7 fix).
 val_cfg = None
-test_cfg = dict()
+test_cfg = None
 
 optim_wrapper = dict(
     type="OptimWrapper",
