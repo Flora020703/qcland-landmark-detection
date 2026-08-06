@@ -12,21 +12,35 @@ that number is for a DIFFERENT head configuration (out_channels=2 vs 17,
 different in_featuremap_size) and was never measured for this adapter's
 actual config. This script measures the real, as-built number instead.
 
-CORRECTED 2026-08-06 (review finding): the first version of this script
-only called `MODELS.build(cfg.model)` and assumed the backbone's
+CORRECTED 2026-08-06, round 2: the first version of this script only
+called `MODELS.build(cfg.model)` and assumed the backbone's
 `init_cfg=dict(type='Pretrained', ...)` had already been applied -- but in
 MMEngine's convention, `init_cfg` only DECLARES how to initialise; the
-actual weight loading happens when `model.init_weights()` (or the
-Runner's own setup, which calls it) actually runs. Simply building the
-model does NOT guarantee the pretrained checkpoint was loaded at all, and
-the first version never checked for missing/unexpected keys despite
-documenting that it does. Fixed below: `model.init_weights()` is called
-explicitly, AND the checkpoint's own state dict is independently loaded
-and diffed against `model.backbone.state_dict()` by key name (not by
-trusting MMEngine's internal logging), so "backbone keys were loaded" is a
-verified fact, not an assumption. `--pretrained-checkpoint-path` is now a
-REQUIRED argument (previously optional, defaulting to a null SHA-256 in
-practice because run_rtmpose_canary.sh never passed it).
+actual weight loading happens when `model.init_weights()` runs. Fixed:
+`model.init_weights()` is called explicitly, and `--pretrained-checkpoint-path`
+became a required argument.
+
+CORRECTED 2026-08-06, round 3 (review finding -- this closes a real gap
+round 2 left open): round 2's "verification" hashed/diffed a LOCAL file by
+key name, while the generated config's `init_cfg.checkpoint` was still a
+hardcoded URL -- meaning `model.init_weights()` actually loaded from the
+URL, completely independent of whichever local file this script was
+separately hashing. Two files could differ in content while having
+identical key names/shapes, and the script would still report success.
+Round 2 also only checked that loaded values differed from their
+PRE-init-weights (random) state, not that they matched the checkpoint's
+OWN values -- a weaker claim than "the checkpoint was correctly loaded."
+
+Fixed now: (a) `make_config.py` was changed to embed the LOCAL checkpoint
+path directly as `init_cfg.checkpoint` (see that file's own docstring), so
+this script can assert `cfg.model["backbone"]["init_cfg"]["checkpoint"] ==
+str(args.pretrained_checkpoint_path)` and fail loudly if they ever diverge
+-- the file that gets loaded and the file that gets hashed are now
+guaranteed the same file, checked, not assumed; (b) every expected backbone
+key's post-`init_weights()` VALUE is now compared for exact equality
+against the checkpoint's OWN tensor (not just "changed from random init"),
+and EVERY key must match (missing, unexpected, or value-mismatched keys
+are ALL now fatal, not just "zero keys matched").
 
 NEEDS LIVE MMPOSE (same tier as transforms.py/make_config.py) -- writes a
 JSON artifact, not just a printed report, so it becomes part of the
@@ -77,12 +91,28 @@ def main():
     init_default_scope("mmpose")
     cfg = Config.fromfile(str(args.config))
 
-    model = MODELS.build(cfg.model)
-
     backbone_cfg = cfg.model["backbone"]
     init_cfg = backbone_cfg.get("init_cfg", {})
-    checkpoint_url = init_cfg.get("checkpoint")
+    checkpoint_path_in_config = init_cfg.get("checkpoint")
     prefix = init_cfg.get("prefix")
+
+    # CLOSES THE ROUND-2 GAP: the config's own init_cfg.checkpoint (what
+    # model.init_weights() will actually load) must be the EXACT SAME file
+    # as --pretrained-checkpoint-path (what this script hashes/diffs) --
+    # checked, not assumed. If make_config.py or the config were ever
+    # hand-edited to point elsewhere, this must fail loudly here rather
+    # than silently record provenance for the wrong file.
+    if str(Path(checkpoint_path_in_config).resolve()) != str(args.pretrained_checkpoint_path.resolve()):
+        raise SystemExit(
+            f"ERROR: config's backbone.init_cfg.checkpoint "
+            f"({checkpoint_path_in_config!r}) does not match "
+            f"--pretrained-checkpoint-path ({args.pretrained_checkpoint_path!r}) "
+            f"-- model.init_weights() would load a DIFFERENT file than the "
+            f"one this script is about to hash and diff. Refusing to record "
+            f"provenance that would not actually describe the loaded weights."
+        )
+
+    model = MODELS.build(cfg.model)
 
     # Snapshot backbone weights BEFORE init_weights(), so we can also confirm
     # by direct comparison that values actually changed (not just that keys
@@ -101,38 +131,57 @@ def main():
     raw_ckpt = torch.load(str(args.pretrained_checkpoint_path), map_location="cpu")
     ckpt_state = raw_ckpt.get("state_dict", raw_ckpt)
     if prefix:
-        ckpt_backbone_keys = {
-            k[len(prefix):] for k in ckpt_state if k.startswith(prefix)
+        ckpt_backbone_state = {
+            k[len(prefix):]: v for k, v in ckpt_state.items() if k.startswith(prefix)
         }
     else:
-        ckpt_backbone_keys = set(ckpt_state.keys())
+        ckpt_backbone_state = dict(ckpt_state)
 
     backbone_param_keys = set(post_init_backbone_state.keys())
+    ckpt_backbone_keys = set(ckpt_backbone_state.keys())
     loaded_keys = sorted(backbone_param_keys & ckpt_backbone_keys)
     missing_from_checkpoint = sorted(backbone_param_keys - ckpt_backbone_keys)
     unexpected_in_checkpoint = sorted(ckpt_backbone_keys - backbone_param_keys)
 
-    # Confirm at least the loaded keys' VALUES actually changed from their
-    # pre-init_weights() (randomly-initialised) state -- a name-only match
-    # with unchanged values would mean init_weights() silently did nothing.
-    unchanged_despite_match = [
+    # CLOSES THE ROUND-2 GAP: compare the loaded VALUES against the
+    # checkpoint's OWN tensors for exact equality (not merely "differs from
+    # the pre-init random state", which only proves *something* loaded, not
+    # that the CORRECT thing loaded). Since round 3's fix above guarantees
+    # the config's checkpoint path and this script's checkpoint path are the
+    # same file, an exact match here is the real, closed-loop verification.
+    value_mismatches = [
+        k for k in loaded_keys
+        if post_init_backbone_state[k].shape != ckpt_backbone_state[k].shape
+        or not torch.allclose(post_init_backbone_state[k].float(),
+                               ckpt_backbone_state[k].float(), atol=1e-6)
+    ]
+    unchanged_from_random_init = [
         k for k in loaded_keys
         if torch.equal(pre_init_backbone_state[k], post_init_backbone_state[k])
     ]
 
-    if not loaded_keys:
+    if missing_from_checkpoint:
         raise SystemExit(
-            "ERROR: zero backbone parameter names matched between the model "
-            "and the checkpoint (after stripping prefix "
-            f"{prefix!r}) -- pretrained loading did not happen. Do not "
-            "proceed to training with an unverified/failed backbone init."
+            f"ERROR: {len(missing_from_checkpoint)} backbone parameter(s) have "
+            f"no matching key in the checkpoint (after stripping prefix "
+            f"{prefix!r}): {missing_from_checkpoint[:10]}{'...' if len(missing_from_checkpoint) > 10 else ''} "
+            f"-- refusing to proceed with a partially-initialised backbone."
         )
-    if len(unchanged_despite_match) == len(loaded_keys):
+    if value_mismatches:
         raise SystemExit(
-            "ERROR: every matched backbone key's VALUE is unchanged from its "
-            "pre-init_weights() state -- names matched but init_weights() "
-            "did not actually load the checkpoint. Do not proceed to "
-            "training with an unverified/failed backbone init."
+            f"ERROR: {len(value_mismatches)} backbone parameter(s) do not "
+            f"exactly match the checkpoint's own values after init_weights() "
+            f"(shape mismatch or numerical difference > 1e-6): "
+            f"{value_mismatches[:10]}{'...' if len(value_mismatches) > 10 else ''} "
+            f"-- init_weights() did not load this checkpoint correctly."
+        )
+    if unchanged_from_random_init:
+        raise SystemExit(
+            f"ERROR: {len(unchanged_from_random_init)} backbone parameter(s) "
+            f"are unchanged from their pre-init_weights() random state despite "
+            f"matching the checkpoint by name and value (a checkpoint whose "
+            f"values happen to equal a fresh random init is implausible for a "
+            f"real pretrained CSPNeXt-s) -- investigate before trusting this run."
         )
 
     head_param_keys = {k for k, _ in model.head.named_parameters()}
@@ -150,8 +199,9 @@ def main():
     record = {
         "official_config_name": "rtmpose-s_8xb256-420e_coco-256x192 (adapted, see make_config.py)",
         "generated_config_path": str(args.config),
-        "pretrained_checkpoint_url": checkpoint_url,
+        "pretrained_checkpoint_path_in_config": checkpoint_path_in_config,
         "pretrained_checkpoint_local_path": str(args.pretrained_checkpoint_path),
+        "config_and_local_checkpoint_path_match": True,  # would have raised above otherwise
         "pretrained_checkpoint_load_prefix": prefix,
         "pretrained_checkpoint_source_dataset": "COCO + AI Challenger (per the official RTMPose-s "
                                                  "checkpoint filename: cspnext-s_udp-aic-coco_...)",
@@ -166,10 +216,15 @@ def main():
         "backbone_keys_loaded_count": len(loaded_keys),
         "backbone_keys_missing_from_checkpoint": missing_from_checkpoint,
         "backbone_keys_unexpected_in_checkpoint": unexpected_in_checkpoint,
-        "backbone_keys_matched_but_value_unchanged": unchanged_despite_match,
+        "backbone_keys_value_mismatch_vs_checkpoint": value_mismatches,
+        "backbone_keys_unchanged_from_random_init": unchanged_from_random_init,
         "verified_pretrained_load_actually_happened": (
-            len(loaded_keys) > 0 and len(unchanged_despite_match) < len(loaded_keys)
-        ),
+            len(loaded_keys) > 0
+            and not missing_from_checkpoint
+            and not value_mismatches
+            and not unchanged_from_random_init
+        ),  # would have raised above if False -- this field documents the
+            # closed-loop check, not just an assumption
         "head_keys_unexpectedly_found_in_checkpoint": head_keys_present_in_checkpoint,
         "head_is_freshly_initialised": len(head_keys_present_in_checkpoint) == 0,
         "backbone_param_count": sum(p.numel() for p in model.backbone.parameters()),

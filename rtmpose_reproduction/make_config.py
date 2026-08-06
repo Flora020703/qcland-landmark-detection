@@ -64,16 +64,46 @@ official recipe was copied carelessly:
     randomly initialised (matches the OFFICIAL recipe's own convention,
     confirmed against the real config -- not a compromise specific to this
     adaptation).
+
+THIRD REVIEW ROUND (2026-08-06): the official
+rtmpose-s_8xb256-420e_coco-256x192.py was fetched and read VERBATIM
+(https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/
+body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py) to
+check a reviewer's claim that this generator had silently dropped several
+official settings -- confirmed true for some, NOT confirmed for one
+(the reviewer's claim of "gradient clipping" in the official optim_wrapper
+does not match the actual fetched file, which has no `clip_grad` key at
+all; not added here since it was never actually there to match). Full
+item-by-item table:
+
+| Official setting | Present here? | Disposition |
+|---|---|---|
+| `backbone._scope_='mmdet'` | was MISSING | **FIXED** -- CSPNeXt is registered under mmdet's scope; omitting this could fail to resolve the builder in a real install, a construction-correctness bug, not a style gap |
+| `backbone.expand_ratio=0.5` | was MISSING | **FIXED** -- an actual CSPNeXt architecture parameter, not cosmetic; omitting it risks the backbone's internal channel widths not matching the pretrained checkpoint's own shapes, which could silently corrupt or outright fail the weight load |
+| `backbone.norm_cfg=SyncBN` | was `BN` | **FIXED to SyncBN** to match the checkpoint's own training norm type; flagged in ENVIRONMENT.md that SyncBN may need `torch.distributed` initialised even for a single-GPU run depending on the installed MMEngine/MMCV version -- confirm live, fall back to BN with a recorded justification if SyncBN errors out single-process |
+| `backbone.act_cfg` extra `inplace=True` | present, official has none | **FIXED** -- removed for exact fidelity (does not change weight shapes, low risk, but no reason to diverge) |
+| `optim_wrapper.paramwise_cfg` (zero weight decay on norm/bias) | was MISSING | **FIXED** -- matched, no dataset-scale-dependent reason to omit it |
+| Cosine LR starting at `max_epochs // 2` | was starting at epoch 0 | **FIXED** -- now starts at `max_epochs // 2` proportionally, preserving the official recipe's warmup-then-half-cosine shape at whatever `max_epochs` this project uses |
+| `auto_scale_lr=dict(base_batch_size=1024)` | MISSING | **DELIBERATELY NOT ADDED** -- only takes effect via an explicit `--auto-scale-lr` CLI flag (not automatic from the config alone), and this project's `base_lr` was never tuned as a linear-scaling assumption from batch=1024; our batch_size (16, dataset-scale-appropriate) differs from official's 256 by design, not by oversight |
+| `custom_hooks: EMAHook` | MISSING | **DELIBERATELY NOT ADDED** -- this project's own EMA investigation for EoMT found "insufficient clean evidence either way" (thesis Ch5 ablation), so adding EMA to RTMPose alone, without it being part of the shared cross-method recipe, would be a new, unreviewed asymmetry, not a neutral fidelity fix |
+| `custom_hooks: PipelineSwitchHook` (stage-2 augmentation cooldown) | MISSING | **DELIBERATELY NOT ADDED** -- the official stage-2 switch reduces the OFFICIAL RandomBBoxTransform's own scale/rotate ranges; this project already replaces that whole augmentation with EoMT/HRNet-matched values (PROTOCOL_LOCKED.md), so there is no equivalent "official range" to cool down between two stages |
+| `max_epochs=420` | is 200 (configurable) | **KEPT at 200, documented, not silently accidental** -- 420 epochs was tuned for COCO's ~118k training images; this project's fetal datasets are 2-3 orders of magnitude smaller (Train ~100-1600 images per task), so a directly-copied epoch count has no principled basis either way. 200 is this project's own choice, adjustable via `--max-epochs`, not a claimed replication of the official schedule. |
+| Pretrained checkpoint's own `checkpoint=` field | was a hardcoded URL | **FIXED (blocking issue)**: `model.init_weights()` would have loaded from this URL, completely independent of whatever local file `record_run_provenance.py` was separately hashing -- meaning the recorded SHA-256 was never guaranteed to correspond to the actual weights loaded into the model. `make_config()` now REQUIRES a local `pretrained_checkpoint_path` and embeds THAT path as `init_cfg.checkpoint`, so the file that gets loaded and the file that gets hashed/diffed are, by construction, the same file. |
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
-OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT = (
+OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT_URL = (
     "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/"
     "cspnext-s_udp-aic-coco_210e-256x192-92f5a029_20230130.pth"
 )
+# Download-source documentation ONLY (see ENVIRONMENT.md's download step) --
+# NOT used as the generated config's own init_cfg.checkpoint value anymore
+# (see the provenance fix above); make_config() requires a local file path
+# instead, so the loaded weights and the audited/hashed weights are
+# guaranteed to be the same file, not just assumed to match by URL.
 
 TEMPLATE = '''\
 # AUTO-GENERATED by rtmpose_reproduction/make_config.py -- do not hand-edit.
@@ -122,18 +152,36 @@ model = dict(
         bgr_to_rgb=True,
     ),
     backbone=dict(
+        _scope_="mmdet",  # CSPNeXt is registered under mmdet's scope --
+                          # was missing; likely a real build-time failure
+                          # risk in a live install, not cosmetic.
         type="CSPNeXt",
         arch="P5",
+        expand_ratio=0.5,  # matches the official recipe exactly -- omitting
+                           # this real architecture parameter risked a
+                           # channel-width mismatch against the pretrained
+                           # checkpoint's own shapes.
         deepen_factor=0.33,
         widen_factor=0.5,
         out_indices=(4,),
         channel_attention=True,
-        norm_cfg=dict(type="BN"),
-        act_cfg=dict(type="SiLU", inplace=True),
+        norm_cfg=dict(type="SyncBN"),  # matches official; CONFIRM this
+                                        # builds single-GPU/non-distributed
+                                        # on the installed MMEngine/MMCV
+                                        # before trusting it (see
+                                        # ENVIRONMENT.md) -- fall back to BN
+                                        # only with a recorded justification.
+        act_cfg=dict(type="SiLU"),
         init_cfg=dict(
             type="Pretrained",
             prefix="backbone.",
-            checkpoint={backbone_checkpoint!r},
+            checkpoint={backbone_checkpoint!r},  # LOCAL FILE PATH, not a
+                                                  # URL -- see make_config()'s
+                                                  # own docstring: this
+                                                  # guarantees the weights
+                                                  # loaded here are the same
+                                                  # file record_run_provenance.py
+                                                  # hashes and diffs.
         ),
     ),
     head=dict(
@@ -272,11 +320,19 @@ test_cfg = dict()
 optim_wrapper = dict(
     type="OptimWrapper",
     optimizer=dict(type="AdamW", lr=4e-3, weight_decay=0.0),
+    # Matches the official recipe's paramwise_cfg exactly -- was missing;
+    # no dataset-scale-dependent reason to omit this.
+    paramwise_cfg=dict(norm_decay_mult=0, bias_decay_mult=0, bypass_duplicate=True),
 )
+# Cosine annealing now starts at max_epochs // 2, matching the official
+# recipe's own proportional shape (there: begin=210 of max_epochs=420) --
+# was previously starting at epoch 0, overlapping the LinearLR warmup
+# entirely and not matching the official schedule's shape at all.
+_cosine_begin = {max_epochs} // 2
 param_scheduler = [
     dict(type="LinearLR", start_factor=1e-5, by_epoch=False, begin=0, end=1000),
-    dict(type="CosineAnnealingLR", eta_min=0.0002, begin=0, end={max_epochs},
-         T_max={max_epochs}, by_epoch=True, convert_to_iter_based=True),
+    dict(type="CosineAnnealingLR", eta_min=0.0002, begin=_cosine_begin, end={max_epochs},
+         T_max={max_epochs} - _cosine_begin, by_epoch=True, convert_to_iter_based=True),
 ]
 
 # CORRECTED 2026-08-06 (review finding): save_best="PCK" removed entirely --
@@ -301,7 +357,8 @@ work_dir = {work_dir!r}
 
 def make_config(dataset: str, task: str, seed: int, data_root: str,
                  images_dir: str, internal_train_ann: str, internal_val_ann: str,
-                 test_ann: str, work_dir: str, out_path: Path,
+                 test_ann: str, pretrained_checkpoint_path: str,
+                 work_dir: str, out_path: Path,
                  batch_size: int = 16, max_epochs: int = 200,
                  val_interval: int = 5, repo_root: str | None = None) -> Path:
     """`internal_train_ann`/`internal_val_ann` are the two COCO jsons
@@ -309,11 +366,25 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
     make_internal_val_split.py's two filename lists (see that script's own
     docstring) -- NEVER pass the released Test CSV/json as either of these.
     `test_ann` is the real released Test set, used only by run_inference.py
-    after training; nothing in the generated config's training loop reads it."""
+    after training; nothing in the generated config's training loop reads it.
+
+    `pretrained_checkpoint_path` MUST be a local file path (downloaded per
+    ENVIRONMENT.md's instructions), NOT the download URL -- this is what
+    gets embedded as the backbone's `init_cfg.checkpoint`, so the weights
+    `model.init_weights()` actually loads and the file
+    `record_run_provenance.py` hashes/diffs are, by construction, the same
+    file (see this file's own module docstring for the leak this closes)."""
+    if not Path(pretrained_checkpoint_path).is_file():
+        raise SystemExit(
+            f"ERROR: --pretrained-checkpoint-path does not exist: "
+            f"{pretrained_checkpoint_path}. Download it first (see "
+            f"ENVIRONMENT.md) -- refusing to embed a checkpoint path into "
+            f"the config that init_weights() cannot actually load from."
+        )
     text = TEMPLATE.format(
         dataset=dataset, task=task, seed=seed,
         repo_root=repo_root or str(Path(__file__).resolve().parent),
-        backbone_checkpoint=OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT,
+        backbone_checkpoint=str(pretrained_checkpoint_path),
         data_root=data_root, images_dir=images_dir,
         internal_train_ann=internal_train_ann, internal_val_ann=internal_val_ann,
         test_ann=test_ann,
@@ -342,10 +413,17 @@ if __name__ == "__main__":
     parser.add_argument("--test-ann", required=True,
                          help="COCO json converted from the REAL released Test CSV -- "
                               "never read during training, only by run_inference.py afterward")
+    parser.add_argument("--pretrained-checkpoint-path", required=True,
+                         help="LOCAL file path (not a URL) to the downloaded CSPNeXt-s "
+                              "checkpoint -- see ENVIRONMENT.md's download step. Embedded "
+                              "directly as backbone.init_cfg.checkpoint so the weights "
+                              "actually loaded and the file record_run_provenance.py "
+                              "hashes are guaranteed to be the same file.")
     parser.add_argument("--work-dir", required=True)
     parser.add_argument("--out", required=True, type=Path)
     args = parser.parse_args()
     path = make_config(args.dataset, args.task, args.seed, args.data_root,
                         args.images_dir, args.internal_train_ann, args.internal_val_ann,
-                        args.test_ann, args.work_dir, args.out)
+                        args.test_ann, args.pretrained_checkpoint_path,
+                        args.work_dir, args.out)
     print(f"[OK] wrote {path}")

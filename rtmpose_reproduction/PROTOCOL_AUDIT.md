@@ -1,13 +1,18 @@
 # Code-level protocol audit, before canary training
 
-Two review rounds on 2026-08-06. The first round covered the two items the
-supervisor explicitly flagged (augmentation-strategy parity, endpoint
+Three review rounds on 2026-08-06. The first round covered the two items
+the supervisor explicitly flagged (augmentation-strategy parity, endpoint
 ordering/flip convention) and found a real bug, but with an INCORRECT root
 cause. A second, independent review of that first round's own work caught
 the error with a rigorous mathematical argument, checked directly against
 the audited upstream HRNet's actual source, and additionally found four
-more blocking implementation issues the first round missed entirely. This
-document keeps both rounds' history rather than silently overwriting it,
+more blocking implementation issues the first round missed entirely. A
+third round then re-checked round 2's own fixes and found one of them
+(pretrained-checkpoint provenance) was still incomplete, plus a real,
+verifiable architecture/recipe-fidelity gap against the official RTMPose-s
+config, plus a documentation-precision issue about when the Test set is
+first touched. This document keeps all three rounds' history rather than
+silently overwriting it,
 per this project's own established norm of marking superseded findings
 `SUPERSEDED`, not deleting them.
 
@@ -315,3 +320,146 @@ visual-overlay audit, before sharing canary numbers with the supervisor --
 and separately, raise the EoMT-vs-HRNet/RTMPose ordering-convention
 decision with the supervisor explicitly, since this session cannot resolve
 it alone.
+
+## Third-round review: round 2's own "fix" was incomplete, plus a verified official-config-fidelity gap
+
+### 1. Round 2's pretrained-checkpoint verification had a real closed-loop gap
+
+Round 2 fixed `record_run_provenance.py` to independently load a LOCAL
+checkpoint file and diff its keys/values against the built model. But the
+GENERATED CONFIG's own `backbone.init_cfg.checkpoint` was still a
+hardcoded URL (`OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT`) -- meaning
+`model.init_weights()` actually loads from the URL, completely
+independent of whichever local file the provenance script was separately
+hashing. Two files could differ in content while having identical key
+names/shapes (or the URL could silently redirect/update over time), and
+round 2's script would still report success, because it only checked "did
+the values change from a fresh random init," not "do the values match
+THIS specific audited file."
+
+**Fixed**: `make_config()` now REQUIRES a local `pretrained_checkpoint_path`
+argument and embeds that path directly as `backbone.init_cfg.checkpoint`
+in the generated config text -- the file `model.init_weights()` loads and
+the file `record_run_provenance.py` hashes are now the same file by
+construction, not by assumption. `record_run_provenance.py` additionally
+now asserts `cfg.model["backbone"]["init_cfg"]["checkpoint"] ==
+str(pretrained_checkpoint_path)` explicitly (failing loudly if a hand-edited
+config or mismatched CLI argument ever breaks this invariant), and performs
+an EXACT per-key VALUE comparison (`torch.allclose`, not just "differs from
+random init") between every backbone parameter and the checkpoint's own
+tensor for that key -- missing keys, unexpected keys, and value mismatches
+are all now individually fatal, not just "zero keys matched at all."
+
+### 2. Generated config was missing several real (verified, not assumed) official-recipe settings
+
+The reviewer's list of missing official settings was checked against the
+ACTUAL official config, fetched verbatim
+(`https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/
+body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py`), not
+accepted at face value -- one item in the reviewer's list ("gradient
+clipping") does NOT appear in the actual fetched file at all (no
+`clip_grad` key anywhere in its `optim_wrapper`), so it was NOT added here;
+citing an unverified claim back into this document would have been exactly
+the mistake this whole audit process exists to catch.
+
+Verified-real gaps, fixed:
+- `backbone._scope_="mmdet"` -- was missing; CSPNeXt is registered under
+  mmdet's scope, so omitting this risks a real build-time failure, not a
+  style gap.
+- `backbone.expand_ratio=0.5` -- was missing; a genuine CSPNeXt
+  architecture parameter (not cosmetic) that determines internal channel
+  widths -- omitting it risked the backbone's shapes not matching the
+  pretrained checkpoint's own shapes (this would now be CAUGHT by fix #1's
+  shape-mismatch assertion, but is fixed at the source instead of relying
+  on that assertion to catch it).
+- `backbone.norm_cfg` was `BN`, official is `SyncBN` -- fixed to match;
+  flagged in `ENVIRONMENT.md` as needing a live check that `SyncBN` builds
+  correctly on a single-GPU/non-distributed process (some MMEngine/MMCV
+  versions require `torch.distributed` to be initialised even for one
+  process).
+- `optim_wrapper.paramwise_cfg` (zero weight decay on norm/bias) -- was
+  missing; added, no dataset-scale-dependent reason to omit it.
+- Cosine LR schedule was starting at epoch 0 (overlapping the LinearLR
+  warmup entirely); official starts cosine at `max_epochs // 2`. Fixed to
+  the same proportional shape at whatever `max_epochs` this project uses.
+
+Verified-real gaps, DELIBERATELY left unfixed with reasons recorded (not
+silently dropped, and not blindly copied either):
+- `EMAHook` -- this project's own EMA investigation for EoMT already found
+  "insufficient clean evidence either way" (thesis Ch5); adding EMA to
+  RTMPose alone, without it being part of the shared cross-method recipe,
+  would be a new, unreviewed asymmetry.
+- `PipelineSwitchHook` (stage-2 augmentation cooldown) -- the official
+  version cools down the OFFICIAL `RandomBBoxTransform`'s own ranges; this
+  project already replaces that whole augmentation with EoMT/HRNet-matched
+  values, so there is no equivalent "official range" to cool down between.
+- `auto_scale_lr=dict(base_batch_size=1024)` -- only takes effect via an
+  explicit `--auto-scale-lr` CLI flag, and this project's `base_lr` was
+  never tuned as a linear-scaling assumption from batch=1024.
+- `max_epochs=420` -- kept at 200 (configurable); 420 was tuned for COCO's
+  ~118k training images, this project's fetal datasets are 2-3 orders of
+  magnitude smaller, so a directly-copied epoch count has no principled
+  basis either way.
+
+### 3. "Test touched only once, after training" was imprecise
+
+The canary driver converted the Test CSV to COCO json (opening every Test
+image to read its dimensions) BEFORE training started, in the same step as
+the internal-train/internal-val conversions. This never leaked any Test
+LABEL into training or checkpoint selection, but the README/PROTOCOL_AUDIT
+wording ("touched only once, after training") was imprecise about *when*
+the Test files were first read on disk.
+
+**Fixed**: `run_rtmpose_canary.sh` restructured so Test CSV/image
+conversion happens in the FINAL step, strictly after training and
+checkpoint verification are both complete -- nothing under `coco/Test*`
+exists on disk until then. Also added an explicit note that `tools/train.py`
+conventionally runs only `train`/`val` phases, never `test` (that requires
+a separate `tools/test.py` invocation this script never makes), flagged in
+`ENVIRONMENT.md` as needing direct confirmation against the actual training
+log (no "Testing" phase should appear anywhere in it).
+
+### Draft message for the supervisor (endpoint-ordering convention), as suggested by this round's reviewer
+
+Not sent by this session (no email access) -- drafted here for the user to
+send verbatim or edit:
+
+> During implementation, I confirmed that the existing EoMT pipeline
+> canonicalises endpoints by per-image x-coordinate sorting, whereas the
+> released HRNet implementation uses a training-set-derived direction
+> vector. These rules disagree for a non-trivial fraction of samples, so
+> RTMPose cannot simultaneously reproduce both training conventions. My
+> current implementation follows the HRNet direction-vector convention and
+> retains a common fixed-channel evaluator. Would you prefer this, or
+> should RTMPose instead follow EoMT's x-sorting convention?
+
+Recommended sequencing: environment setup, model construction, and the
+still-blocked synthetic/codec round-trip test (`ENVIRONMENT.md` items 1-8)
+can all proceed before this reply arrives. Do not treat a training run
+started before the reply as the official canary result to report.
+
+## Status after the third round
+
+Not yet run against a live install (still no MMPose environment available
+this session). Newly true, verified locally to the extent possible without
+one:
+
+- Pretrained-checkpoint provenance is now a real closed loop (config path
+  == audited path == loaded path, checked; exact value match required, not
+  "changed from random").
+- The generated config's backbone/optimizer/scheduler now match the real,
+  fetched official recipe wherever this project isn't deliberately
+  diverging for a stated, recorded reason -- no more silent, unreviewed
+  gaps between "should match official" and "actually does."
+- The Test set is not read on disk at all until training and checkpoint
+  verification are both complete.
+- A concrete draft message for the supervisor exists for the still-open
+  endpoint-ordering-convention question.
+
+Still blocked, unchanged: the full non-square + SimCC-codec-level round
+trip (`ENVIRONMENT.md` item 6), and confirmation that `SyncBN` builds on a
+single-GPU process (`ENVIRONMENT.md` item 3). Do not report canary NME to
+the supervisor until: (a) the environment checklist is fully green, (b)
+the visual-overlay audit passes, and (c) ideally, the supervisor's reply on
+endpoint-ordering has been received -- environment setup and dry
+construction can proceed in parallel with waiting for that reply.

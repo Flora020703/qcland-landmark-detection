@@ -7,20 +7,25 @@
 # dataset/task group the way the HRNet-512 driver's per-group safe-stop
 # works).
 #
-# CORRECTED 2026-08-06 (review findings, see PROTOCOL_AUDIT.md): this
-# script previously (a) never generated an internal validation split, so
+# CORRECTED 2026-08-06, three review rounds (see PROTOCOL_AUDIT.md):
+# round 1 -- never generated an internal validation split, so
 # make_config.py pointed straight at the released Test set for periodic
-# validation and checkpoint selection -- a real data leak, not just a soft
-# violation; (b) selected the "final" checkpoint via
-# `find ... -name "best_PCK_epoch_*.pth" -o -name "epoch_*.pth" | sort | tail -1`,
-# which is neither guaranteed to be the true final epoch (lexicographic sort
-# of "epoch_95.pth" vs "epoch_200.pth" is wrong) nor excludes the "best"
-# checkpoint from being picked over the real final one. Both are fixed below.
+# validation and checkpoint selection (a real leak); selected the "final"
+# checkpoint via a lexicographic glob+sort (wrong for numeric epochs, could
+# pick a "best" file over the true final). round 2 -- flagged that this
+# script converted the Test CSV to COCO json (opening every Test image to
+# read its dimensions) BEFORE training started, which is not technically a
+# leak (no label ever reaches the training loop) but is imprecise to
+# describe as "Test touched only once, after training." Test CSV/image
+# conversion is now deferred to AFTER training completes (step 6), so
+# nothing under `coco/Test*` exists on disk until training is fully done.
 #
 # Prerequisites this script does NOT install for you (see ENVIRONMENT.md):
 #   - a pinned MMPose/MMEngine/MMCV install in its own venv, verified importable
 #   - the local pure-Python test suite already passing -- this script
 #     re-checks that, but do not rely on it alone.
+#   - the CSPNeXt-s checkpoint downloaded locally (PRETRAINED_CKPT_PATH) --
+#     see ENVIRONMENT.md's download step.
 
 set -euo pipefail
 
@@ -36,6 +41,7 @@ GT_INTERNAL_VAL_JSON="$ARTIFACT_ROOT/coco/UCL_BPD_internal_val.json"
 GT_TEST_JSON="$ARTIFACT_ROOT/coco/UCL_BPD_test.json"
 CONFIG_PATH="$ARTIFACT_ROOT/configs/UCL_BPD_seed42_canary.py"
 PRED_JSON="$ARTIFACT_ROOT/UCL_BPD_seed42_canary_predictions.json"
+PRETRAINED_CKPT_PATH="${PRETRAINED_CKPT_PATH:?set PRETRAINED_CKPT_PATH to the locally-downloaded CSPNeXt-s checkpoint file, see ENVIRONMENT.md}"
 
 cd "$SCRIPT_DIR"
 
@@ -59,7 +65,7 @@ echo "=== [2/6] build the Train-only internal validation split (NEVER the Test s
   --task BPD \
   --out-json "$INTERNAL_SPLIT_JSON"
 
-echo "=== [3/6] convert UCL BPD internal-train / internal-val / Test CSVs to COCO json ==="
+echo "=== [3/6] convert UCL BPD internal-train / internal-val CSVs to COCO json (Test CSV NOT touched here) ==="
 "$PY" convert_csv_to_coco.py \
   --csv "$DATA_ROOT/annotations/UCL/Head_Train.csv" \
   --images-dir "$DATA_ROOT/images/UCL/Head" \
@@ -76,17 +82,11 @@ echo "=== [3/6] convert UCL BPD internal-train / internal-val / Test CSVs to COC
   --excluded-log "$ARTIFACT_ROOT/coco/UCL_BPD_internal_val_excluded.json" \
   --internal-split-json "$INTERNAL_SPLIT_JSON" --internal-split-part internal_val
 
-# The released Test CSV is converted here ONLY so run_inference.py has a
-# COCO json to read after training -- nothing above this line, and nothing
-# in the generated config's train_dataloader/val_dataloader, ever touches it.
-"$PY" convert_csv_to_coco.py \
-  --csv "$DATA_ROOT/annotations/UCL/Head_Test.csv" \
-  --images-dir "$DATA_ROOT/images/UCL/Head" \
-  --dataset UCL --task BPD \
-  --out-json "$GT_TEST_JSON" \
-  --excluded-log "$ARTIFACT_ROOT/coco/UCL_BPD_test_excluded.json"
-
 echo "=== [4/6] generate the canary config ==="
+# `--test-ann "$GT_TEST_JSON"` below only writes that PATH STRING into the
+# generated config's test_dataloader (needed so the config text is
+# complete) -- the file itself does not exist yet and is not required to
+# exist at config-generation time; nothing reads it until step 6.
 "$PY" make_config.py \
   --dataset UCL --task BPD --seed 42 \
   --data-root "$DATA_ROOT" \
@@ -94,11 +94,11 @@ echo "=== [4/6] generate the canary config ==="
   --internal-train-ann "$GT_INTERNAL_TRAIN_JSON" \
   --internal-val-ann "$GT_INTERNAL_VAL_JSON" \
   --test-ann "$GT_TEST_JSON" \
+  --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
   --work-dir "$WORK_DIR" \
   --out "$CONFIG_PATH"
 
-echo "=== [4b/6] record pretrained-weight provenance + actual parameter counts ==="
-PRETRAINED_CKPT_PATH="${PRETRAINED_CKPT_PATH:?set PRETRAINED_CKPT_PATH to the locally-downloaded CSPNeXt-s checkpoint file (see ENVIRONMENT.md)}"
+echo "=== [4b/6] record + VERIFY pretrained-weight provenance (fails loudly on any key/value mismatch) + actual parameter counts ==="
 "$PY" record_run_provenance.py \
   --config "$CONFIG_PATH" \
   --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
@@ -107,6 +107,12 @@ PRETRAINED_CKPT_PATH="${PRETRAINED_CKPT_PATH:?set PRETRAINED_CKPT_PATH to the lo
 echo "=== [5/6] train (this is the canary -- one run, watched, not backgrounded) ==="
 MMPOSE_TRAIN_TOOL="${MMPOSE_TRAIN_TOOL:?set MMPOSE_TRAIN_TOOL to the installed mmpose repo tools/train.py path}"
 "$PY" "$MMPOSE_TRAIN_TOOL" "$CONFIG_PATH" --work-dir "$WORK_DIR"
+# `tools/train.py` runs the training loop plus periodic `val` evaluation
+# (against the internal-val split above) at `val_interval` -- it does NOT
+# run a `test` loop; that only happens via a separate `tools/test.py`
+# invocation, which nothing in this script calls. Confirm this against the
+# actual training log (no "Testing" phase should appear) before trusting
+# that Test truly was not touched during this run.
 
 # CORRECTED 2026-08-06: read MMEngine's own `last_checkpoint` pointer file
 # (written by the Runner every time CheckpointHook saves, standard MMEngine
@@ -127,7 +133,17 @@ case "$(basename "$FINAL_CKPT")" in
 esac
 echo "using verified final checkpoint: $FINAL_CKPT"
 
-echo "=== [6/6] export predictions (original-image space) and score ==="
+echo "=== [6/6] NOW convert the released Test CSV, export predictions (original-image space), and score ==="
+# This is the FIRST point in this script where the Test CSV/images are
+# read at all -- training (step 5) and checkpoint selection are both
+# already fully complete by this line.
+"$PY" convert_csv_to_coco.py \
+  --csv "$DATA_ROOT/annotations/UCL/Head_Test.csv" \
+  --images-dir "$DATA_ROOT/images/UCL/Head" \
+  --dataset UCL --task BPD \
+  --out-json "$GT_TEST_JSON" \
+  --excluded-log "$ARTIFACT_ROOT/coco/UCL_BPD_test_excluded.json"
+
 "$PY" run_inference.py \
   --config "$CONFIG_PATH" \
   --checkpoint "$FINAL_CKPT" \
@@ -144,6 +160,10 @@ echo "=== CANARY COMPLETE -- do not start the remaining 49 runs yet ==="
 echo "Per PROTOCOL_LOCKED.md, review before proceeding:"
 echo "  - exact released Train/Test filenames/counts (see coco/*_excluded.json)"
 echo "  - internal validation split subjects (coco/UCL_BPD_internal_split.json) never overlap Test"
+echo "  - the training log shows no Testing phase (only Training/Validation)"
 echo "  - visual overlay of a handful of predictions vs GT on original images"
 echo "  - the printed fixed-channel/swap-min summary above for plausibility"
-echo "  - share this canary's numbers with the supervisor before the 5-seed sweep"
+echo "  - share this canary's numbers with the supervisor before the 5-seed sweep, AND"
+echo "    separately raise the EoMT-vs-HRNet/RTMPose endpoint-ordering-convention"
+echo "    question (see README.md 'Still genuinely open') before treating any"
+echo "    three-method comparison as apples-to-apples on endpoint identity"
