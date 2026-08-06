@@ -60,6 +60,16 @@ official recipe was copied carelessly:
     during training and used for checkpoint selection, a genuine leak.
     test_dataloader is now a separate dataloader over the real Test set,
     touched only once, after training, by run_inference.py.
+  - `val_cfg=None`, `PCKAccuracy` NOT used for periodic monitoring --
+    ROUND 5 fix (review finding, real crash/silent-wrong-number risk):
+    MMEngine's default val loop calls `model.predict()`, which for a stock
+    TopdownPoseEstimator typically needs bbox_center/bbox_scale metadata
+    this project's PixelCentreResize never populates; whether this crashes
+    or silently produces a meaningless number was unverified. Periodic
+    internal monitoring is now `InternalFixedChannelNMEHook`
+    (internal_val_hook.py), reusing run_inference.py's own verified-safe
+    low-level decode path and the SAME fixed-channel NME formula as the
+    final evaluation -- directly comparable numbers, not a different metric.
   - Backbone-only pretrained init via prefix='backbone.'; RTMCCHead fully
     randomly initialised (matches the OFFICIAL recipe's own convention,
     confirmed against the real config -- not a compromise specific to this
@@ -107,7 +117,7 @@ Full item-by-item table (all rows re-verified against the CORRECT
 | `optim_wrapper.clip_grad=dict(max_norm=35, norm_type=2)` | was MISSING | **FIXED in round 4** -- round 3 wrongly recorded this as not a real official setting after checking the wrong file path (see above); this is a real official optimizer setting, now matched |
 | `optim_wrapper.paramwise_cfg` (zero weight decay on norm/bias) | was MISSING | **FIXED** -- matched, no dataset-scale-dependent reason to omit it |
 | `base_lr=4e-3` used directly at `batch_size=16` | official's `4e-3` is paired with `train_batch_size=256` and `auto_scale_lr=dict(base_batch_size=1024)` (8 GPUs x 256) | **FIXED in round 4 (real methodological risk, not just a fidelity gap)**: using the official LR unscaled at a batch size 64x smaller than official's base_batch_size risked severe training instability. `base_lr` is now computed as `4e-3 * (batch_size / 1024)` -- for this project's `batch_size=16`, that is `6.25e-5`. `auto_scale_lr` is deliberately NOT also added to the generated config to avoid double-scaling if `--auto-scale-lr` is ever passed to `tools/train.py`; the scaling is applied once, explicitly, in this file, and the resulting `base_lr` is recorded in the generated config's own comment. |
-| Cosine LR starting at `max_epochs // 2` | was starting at epoch 0, AND (round 4 finding) overlapped the 1000-iteration LinearLR warmup for this project's tiny datasets | **FIXED in round 4**: for a ~100-image internal-train split at `batch_size=16` (~7 iterations/epoch), the official recipe's fixed `end=1000` warmup would still be running past iteration 700 (`epoch_100 * 7`), the point at which a naive proportional `max_epochs // 2` cosine-begin would already have started -- warmup and cosine would overlap, which the official recipe's own numbers (`begin=1000` iterations vs `cosine begin=210 epochs * ~460 iterations/epoch ~= 96,600` iterations) never risk. `make_config()` now reads the ACTUAL internal-train COCO json's image count, computes real `iterations_per_epoch`, and sets the LinearLR warmup to `min(1000, cosine_begin_iters // 2)` -- asserting `warmup_end_iters < cosine_begin_iters` and raising loudly if this is somehow still violated, rather than silently reusing official's fixed 1000. |
+| Cosine LR starting at `max_epochs // 2` | was starting at epoch 0, AND (round 4 finding) overlapped the 1000-iteration LinearLR warmup for this project's tiny datasets | **FIXED in round 4, warmup formula corrected again in round 5**: for a ~100-image internal-train split at `batch_size=16` (~7 iterations/epoch), the official recipe's fixed `end=1000` warmup would still be running past iteration 700 (`epoch_100 * 7`), overlapping a naive proportional `max_epochs // 2` cosine-begin. Round 4's fix (`warmup_end_iters = min(1000, cosine_begin_iters // 2)`) only guaranteed no overlap with no training-methodology basis -- for BPD's real numbers it gave 350 warmup iterations out of ~1400 total (25% of ALL training), a real underfitting risk a reviewer caught. Round 5: warmup is now a short, fixed number of EPOCHS (`min(5, max(1, max_epochs // 20))`, i.e. <=5 epochs) converted to iterations using the real image count -- ~35 iterations (2.5% of BPD's total training) instead of 350, much closer to the official recipe's own proportion (1000 of ~193,200 total iterations ~= 0.5%). Still asserts `warmup_end_iters < cosine_begin_iters`. |
 | `custom_hooks: EMAHook` | MISSING | **KEPT NOT ADDED, reframed in round 4**: round 3 justified this by citing EoMT's own EMA findings, which a reviewer correctly pointed out is not valid evidence for RTMPose (a structurally different model/training setup) -- EoMT's EMA result says nothing about whether RTMPose specifically benefits from EMA. The real, honest framing is a SCOPE decision: the canary and initial runs use the raw final checkpoint deliberately, to keep one fewer moving part while validating the adapter end-to-end; this must be described in any writeup as "RTMPose-s architecture trained under this project's common fetal protocol," NOT as "the official RTMPose-s recipe" or "an RTMPose-s reproduction," precisely because EMA (and the stage-2 switch, and the native augmentation) are official-recipe components this project does not use. Revisit EMA with a real seed-42 raw-vs-EMA diagnostic if the canary's own numbers motivate it -- do not decide this from EoMT's unrelated result. |
 | `custom_hooks: PipelineSwitchHook` (stage-2 augmentation cooldown) | MISSING | **DELIBERATELY NOT ADDED** -- the official stage-2 switch reduces the OFFICIAL RandomBBoxTransform's own scale/rotate ranges; this project already replaces that whole augmentation with EoMT/HRNet-matched values (PROTOCOL_LOCKED.md), so there is no equivalent "official range" to cool down between two stages |
 | `max_epochs=420` | is 200 (configurable) | **KEPT at 200, documented, not silently accidental** -- 420 epochs was tuned for COCO's ~118k training images; this project's fetal datasets are 2-3 orders of magnitude smaller (Train ~100-1600 images per task), so a directly-copied epoch count has no principled basis either way. 200 is this project's own choice, adjustable via `--max-epochs` -- MUST be justified by the canary's own train/val convergence curve, not asserted a priori, per a reviewer's explicit requirement. |
@@ -141,8 +151,9 @@ sys.path.insert(0, {repo_root!r})  # for transforms.py / fetal_dataset_info.py
 default_scope = "mmpose"
 randomness = dict(seed={seed}, deterministic=True)
 
-# --- import the custom transform so @TRANSFORMS.register_module() runs ---
+# --- import custom transforms/hooks so their @*.register_module() run ---
 import transforms  # noqa: F401,E402
+import internal_val_hook  # noqa: F401,E402
 from fetal_dataset_info import FETAL_DATASET_INFO  # noqa: E402
 from dod_vectors import get_d_vect  # noqa: E402
 
@@ -327,18 +338,29 @@ test_dataloader = dict(
     ),
 )
 
-# Internal training-time sanity metric ONLY, computed on the Train-only
-# internal-val split above -- NOT the reported number, and no longer
-# computed from the released Test set at all. The authoritative
-# fixed-channel/swap-min NME comes from evaluate_rtmpose_fixed.py run on
-# run_inference.py's exported, original-image-space TEST predictions
-# (produced exactly once, after training), using the identical formula as
-# HRNet's evaluator.
+# val_evaluator/test_evaluator kept defined for compatibility (e.g. if
+# `tools/test.py` is ever run manually as a separate, deliberate step) but
+# is NOT the source of periodic internal monitoring during training -- see
+# val_cfg=None below and InternalFixedChannelNMEHook in custom_hooks.
 val_evaluator = dict(type="PCKAccuracy", thr=0.05)
 test_evaluator = val_evaluator
 
-train_cfg = dict(by_epoch=True, max_epochs={max_epochs}, val_interval={val_interval})
-val_cfg = dict()
+train_cfg = dict(by_epoch=True, max_epochs={max_epochs})
+# CORRECTED round 5 (review finding, real crash/silent-wrong-number risk,
+# not just a style gap): val_cfg=None disables MMEngine's own automatic
+# periodic validation loop entirely -- that loop calls model.val_step() ->
+# model.predict(), which for a stock TopdownPoseEstimator typically needs
+# bbox_center/bbox_scale metadata that this project's own PixelCentreResize
+# deliberately never populates (same reason run_inference.py avoids
+# predict() for final inference). Whether this would crash mid-training or
+# silently produce a meaningless PCKAccuracy number was unverified without
+# a live MMPose install -- rather than gambling on it, periodic internal
+# monitoring is now done entirely by InternalFixedChannelNMEHook
+# (internal_val_hook.py), which reuses run_inference.py's own verified-safe
+# low-level decode path and computes the SAME fixed-channel NME formula as
+# the final, authoritative evaluation -- directly comparable numbers, not
+# PCKAccuracy's different metric computed a different way.
+val_cfg = None
 test_cfg = dict()
 
 optim_wrapper = dict(
@@ -372,11 +394,15 @@ optim_wrapper = dict(
 # (round 4 finding, verified against the actual internal-train image count
 # below, not assumed) -- e.g. ~100 images at batch_size=16 gives ~7
 # iterations/epoch, so cosine's epoch-100 begin converts to ~700 iterations,
-# LESS than the official recipe's fixed 1000-iteration warmup end. Fixed:
-# warmup_end_iters is capped below 1000 AND below half of cosine's actual
-# begin-iteration, computed from the real internal-train COCO json image
-# count, with an explicit assertion this project's own driver script can
-# rely on rather than silently overlapping the two schedulers.
+# LESS than the official recipe's fixed 1000-iteration warmup end.
+# CORRECTED round 5: the first fix (warmup_end_iters = min(1000,
+# cosine_begin_iters // 2)) only guaranteed no overlap, with no training-
+# methodology basis -- for BPD's real numbers it gave 350 iterations of
+# warmup out of ~1400 total (25% of all training), a real underfitting
+# risk. Now a short, fixed-EPOCH warmup (<= 5 epochs) converted to
+# iterations using the real image count -- ~35 iterations (2.5% of BPD's
+# total training) instead of 350, much closer to the official recipe's own
+# proportion (1000 of ~193,200 total iterations ~= 0.5%).
 warmup_end_iters = {warmup_end_iters}
 cosine_begin_epoch = {max_epochs} // 2
 assert warmup_end_iters < cosine_begin_epoch * {iters_per_epoch}, (
@@ -389,6 +415,21 @@ param_scheduler = [
          end={max_epochs}, T_max={max_epochs} - cosine_begin_epoch,
          by_epoch=True, convert_to_iter_based=True),
 ]
+
+# Round 5 fix: a reviewer's own recorded training-recipe fields, as a real
+# top-level config value (not just local Python variables computed at
+# generation time) so record_run_provenance.py can read them straight back
+# via Config.fromfile() -- lets the canary report exactly what training
+# setup was used, not just what make_config.py's own source claims it did.
+training_recipe_summary = dict(
+    n_train_images={n_train_images},
+    batch_size={batch_size},
+    iters_per_epoch={iters_per_epoch},
+    effective_lr={scaled_lr!r},
+    warmup_end_iters=warmup_end_iters,
+    cosine_begin_epoch=cosine_begin_epoch,
+    max_epochs={max_epochs},
+)
 
 # CORRECTED 2026-08-06 (review finding): save_best="PCK" removed entirely --
 # PROTOCOL_LOCKED.md's primary checkpoint convention is final/last, and
@@ -405,6 +446,16 @@ default_hooks = dict(
     ),
     logger=dict(type="LoggerHook", interval=10),
 )
+
+# Sole source of periodic internal monitoring now that val_cfg=None
+# disables MMEngine's own model.predict()-based val loop -- see val_cfg's
+# own comment above and internal_val_hook.py's module docstring.
+custom_hooks = [
+    dict(type="InternalFixedChannelNMEHook",
+         internal_val_ann={internal_val_ann!r},
+         images_dir={images_dir!r},
+         interval={val_interval}),
+]
 
 work_dir = {work_dir!r}
 '''
@@ -463,7 +514,19 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
     n_train_images = len(json.loads(internal_train_path.read_text(encoding="utf-8"))["images"])
     iters_per_epoch = max(1, -(-n_train_images // batch_size))  # ceil division
     cosine_begin_iters = (max_epochs // 2) * iters_per_epoch
-    warmup_end_iters = min(1000, max(1, cosine_begin_iters // 2))
+    # CORRECTED round 5 (review finding): `cosine_begin_iters // 2` only
+    # guaranteed no overlap, it had no training-methodology basis -- for
+    # UCL BPD's real numbers (100 images, batch 16, ~7 iters/epoch, 200
+    # epochs = ~1400 total iterations) it gave warmup_end_iters=350, i.e.
+    # 25% of ALL training spent in warmup, a real underfitting risk, not
+    # just a cosmetic schedule-shape mismatch. Replaced with a short,
+    # fixed-EPOCH warmup (at most 5 epochs, or max_epochs//20 for shorter
+    # runs) converted to iterations -- for BPD's numbers this gives
+    # warmup_epochs=5, warmup_end_iters=35 (2.5% of training), much closer
+    # to the official recipe's own proportion (1000 of ~193,200 total
+    # iterations ~= 0.5%) than the previous formula ever was.
+    warmup_epochs = min(5, max(1, max_epochs // 20))
+    warmup_end_iters = warmup_epochs * iters_per_epoch
     if warmup_end_iters >= cosine_begin_iters:
         raise SystemExit(
             f"ERROR: computed warmup_end_iters ({warmup_end_iters}) >= "
@@ -483,7 +546,7 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
         test_ann=test_ann,
         batch_size=batch_size, max_epochs=max_epochs, val_interval=val_interval,
         scaled_lr=scaled_lr, iters_per_epoch=iters_per_epoch,
-        warmup_end_iters=warmup_end_iters,
+        warmup_end_iters=warmup_end_iters, n_train_images=n_train_images,
         work_dir=work_dir,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)

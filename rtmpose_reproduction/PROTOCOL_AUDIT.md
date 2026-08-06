@@ -619,10 +619,132 @@ this session). Newly true:
 
 Unchanged, still blocking: install MMPose, confirm `SyncBN` builds
 single-GPU, run the full non-square + SimCC-codec round trip, resolve the
-EoMT-vs-HRNet/RTMPose endpoint-ordering question with the supervisor. Given
-four review rounds have each found real, distinct issues the previous
-round missed or introduced, a fifth pass focused specifically on the parts
-of this adapter that have NOT yet been independently re-checked (the
-augmentation item-by-item table, `convert_csv_to_coco.py`, `dod_vectors.py`)
-would be a reasonable use of time before the actual server run, though the
-core blockers this round found are now addressed.
+EoMT-vs-HRNet/RTMPose endpoint-ordering question with the supervisor.
+
+## Fifth-round review: warmup still too long, a real crash/wrong-number risk in periodic validation, and no enforced live gate
+
+A fifth reviewer confirmed rounds 1-4's fixes were correctly landed, then
+found three more real issues: the round-4 warmup fix only avoided overlap,
+not underfitting; periodic internal validation could crash or silently
+produce a meaningless number; and the checklist in `ENVIRONMENT.md` was
+still purely documentation, never actually enforced by the canary script.
+
+### 1. Warmup no longer overlaps cosine, but is now far too long
+
+Round 4's `warmup_end_iters = min(1000, cosine_begin_iters // 2)` gave
+`350` iterations of warmup out of BPD's ~1400 total training iterations --
+**25% of all training spent ramping up from a near-zero learning rate**,
+with no training-methodology basis for that specific fraction (it was
+purely "half of whatever avoids overlap"), a real underfitting risk.
+
+**Fixed**: warmup is now a short, fixed number of EPOCHS
+(`warmup_epochs = min(5, max(1, max_epochs // 20))`, i.e. at most 5 epochs)
+converted to iterations using the real image count. For BPD's numbers this
+gives `warmup_epochs=5`, `warmup_end_iters=35` (2.5% of total training),
+much closer to the official recipe's own proportion (1000 of ~193,200
+total iterations at official scale, ~0.5%) than either the original fixed
+1000 or round 4's `cosine_begin_iters // 2` ever were. Still asserts
+`warmup_end_iters < cosine_begin_iters`. Also added: `training_recipe_summary`
+as a real top-level config value (`n_train_images`, `batch_size`,
+`iters_per_epoch`, `effective_lr`, `warmup_end_iters`, `cosine_begin_epoch`,
+`max_epochs`), read back verbatim by `record_run_provenance.py` into its
+output JSON, so a canary report can state the exact training setup used
+without a reader re-deriving it from `make_config.py`'s source.
+
+### 2. Periodic internal validation depended on an unverified, possibly-crashing pathway
+
+The generated config's periodic validation used MMEngine's default val
+loop (`model.val_step()` -> `model.predict()`) with `PCKAccuracy` as
+`val_evaluator`. For a stock `TopdownPoseEstimator`, `predict()` typically
+needs `bbox_center`/`bbox_scale` metadata that `GetBBoxCenterScale`/
+`TopdownAffine` would normally populate -- this project's own
+`PixelCentreResize` deliberately never sets that metadata (the exact same
+reason `run_inference.py` avoids `predict()` for final inference, per that
+file's own long-standing docstring). Whether the default val loop would
+crash outright, silently use some default bbox and produce a meaningless
+number, or something else, was never actually addressed for the TRAINING-
+time periodic case -- only for final inference.
+
+**Fixed**: `low_level_decode.py` (new) factors `run_inference.py`'s
+verified-safe decode path (data_preprocessor -> extract_feat ->
+head.forward -> codec decode -> `geometry.to_image_space()`, bypassing
+`predict()` entirely) into a shared module. `internal_val_hook.py` (new)
+is a custom MMEngine `Hook` that uses this SAME path to compute the SAME
+fixed-channel NME formula as the final, authoritative evaluation, logged
+every `val_interval` epochs via `runner.logger`/`runner.message_hub`.
+`make_config.py`'s generated config now sets `val_cfg=None` (disabling
+MMEngine's automatic val loop and `model.predict()` entirely for training)
+and adds `InternalFixedChannelNMEHook` to `custom_hooks`. This is a
+genuinely stronger design, not just a risk-avoidance workaround: internal
+monitoring numbers are now DIRECTLY comparable to the final authoritative
+NME (identical formula, identical code path), which `PCKAccuracy`'s
+different OKS/bbox-normalised metric never was anyway.
+`run_inference.py` was refactored to call the same shared
+`low_level_decode.decode_batch_low_level`/`to_original_image_space`
+functions, so there are no longer two independently-maintained copies of
+this logic that could silently diverge. `test_low_level_decode.py` (new,
+3/3 pass) covers the pure-Python parts (`to_original_image_space`,
+`fixed_channel_nme`); `decode_batch_low_level` itself still needs a live
+model, same tier as the rest of this code.
+
+### 3. ENVIRONMENT.md's checklist was documentation only, never enforced
+
+Nothing in `run_rtmpose_canary.sh` actually forced the live-verification
+checklist to run before training started -- a plain execution of the
+script would go straight from provenance recording into 200 epochs of
+training, silently skipping every documented gate.
+
+**Fixed**: `live_preflight.py` (new) is a hard-fail gate `run_rtmpose_canary.sh`
+now calls immediately before training (step 4c) and treats as fatal on any
+failure. It runs, against the real installed MMPose: (1) the full
+non-square + SimCC-codec round trip (ENVIRONMENT.md item 6, now automated
+rather than a manual instruction); (2) one real train-batch forward + loss
++ backward pass, asserting all loss components are finite and gradients
+reach both the backbone and the head; (3) one real call to
+`decode_batch_low_level` plus the `to_original_image_space`/
+`fixed_channel_nme` chain, asserting shapes and finite values; (4) that
+`training_recipe_summary`'s own numbers are internally consistent (no
+warmup/cosine overlap). Its own `encode()`/`decode()` dict-key assumptions
+(`keypoint_x_labels`/`keypoint_y_labels`, inferred from `SimCCLabel`'s
+documented interface) are explicitly flagged as needing live confirmation
+-- if this specific step is what fails first on the server, that is this
+gate doing its job, not a defect in the gate itself.
+
+### Precision fix: "bit-exact" wording in `record_run_provenance.py`
+
+A smaller fifth-round finding: the file's own comments described the
+value check as verifying the checkpoint file's "raw bytes" are identical
+to the model's parameters. The actual, correct claim (unchanged code,
+corrected wording) is narrower: the checkpoint's tensor, AFTER being cast
+to the dtype the model actually loaded it as, is bit-for-bit identical to
+the model's own parameter -- not a claim about the original file's raw
+on-disk bytes, since a legitimate dtype upcast (e.g. stored fp16 into an
+fp32 model) changes the in-memory representation without losing
+information. Fixed in both the module docstring and the inline comment.
+
+## Status after the fifth round
+
+Not yet run against a live install (still no MMPose environment available
+this session). Newly true:
+
+- The LinearLR warmup is short and methodologically motivated (~2.5% of
+  total training for BPD), not just "whatever avoids overlap."
+- Periodic internal validation cannot depend on `model.predict()`'s
+  unverified bbox-metadata contract at all -- it uses the same low-level,
+  verified-safe path as final inference, producing directly comparable
+  numbers.
+- The full live-verification checklist has an actual enforcement
+  mechanism (`live_preflight.py`), not just documentation a user could
+  skip by running the canary script normally.
+- `record_run_provenance.py`'s own claims about what it verifies are now
+  precisely worded.
+
+Given five review rounds have each found real, distinct issues the
+previous round missed or introduced, the remaining honest path forward is:
+run `live_preflight.py` for real on the server (it will very likely
+surface at least one of its own flagged live-only assumptions as wrong,
+e.g. the SimCC codec's exact `encode()`/`decode()` dict keys), fix whatever
+it finds, THEN run the actual seed-42 canary -- and separately, send the
+already-drafted endpoint-ordering question to the supervisor now rather
+than waiting for a sixth code-review round, since that question cannot be
+resolved by further code review at all.

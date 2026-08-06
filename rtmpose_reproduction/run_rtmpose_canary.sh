@@ -51,6 +51,7 @@ echo "=== [0/6] local pure-Python test suite (no mmpose required) ==="
 "$PY" test_convert_csv_to_coco.py
 "$PY" test_evaluate_rtmpose_fixed.py
 "$PY" test_fetal_augment.py
+"$PY" test_low_level_decode.py
 
 echo "=== [1/6] verify mmpose/mmengine/mmcv import and record versions ==="
 "$PY" - <<'PY'
@@ -103,6 +104,20 @@ echo "=== [4b/6] record + VERIFY pretrained-weight provenance (fails loudly on a
   --config "$CONFIG_PATH" \
   --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
   --out-json "$ARTIFACT_ROOT/UCL_BPD_seed42_canary_provenance.json"
+
+echo "=== [4c/6] MANDATORY live preflight gate -- refuses to proceed to training on any failure ==="
+# CORRECTED 2026-08-06, round 5 (review finding): ENVIRONMENT.md's
+# checklist documented everything that needs live verification (model
+# build, full non-square+codec round trip, train forward/backward,
+# decode path, BGR/RGB) but nothing in this script actually FORCED those
+# checks before training started -- a plain run of this script would have
+# gone straight from provenance recording into 200 epochs of training,
+# silently skipping every documented gate. live_preflight.py is that
+# enforcement: a non-zero exit here is fatal, `set -e` above already stops
+# the script, but the explicit check below prints a clear final message
+# regardless.
+"$PY" live_preflight.py --config "$CONFIG_PATH" \
+  || { echo "ERROR: live_preflight.py failed -- refusing to start training. See ENVIRONMENT.md's checklist and PROTOCOL_AUDIT.md for what to fix." >&2; exit 1; }
 
 echo "=== [5/6] train (this is the canary -- one run, watched, not backgrounded) ==="
 MMPOSE_TRAIN_TOOL="${MMPOSE_TRAIN_TOOL:?set MMPOSE_TRAIN_TOOL to the installed mmpose repo tools/train.py path}"

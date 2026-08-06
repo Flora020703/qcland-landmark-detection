@@ -53,14 +53,27 @@ legitimately hold the same value under both a fresh init and a real
 checkpoint (e.g. `num_batches_tracked=0` immediately after construction),
 risking a false failure unrelated to whether loading actually worked.
 
-Fixed now: (a) exact-value comparison uses `torch.equal()` (after casting
-the checkpoint's tensor to the model parameter's own dtype, so a
-fp16-stored checkpoint loaded into an fp32 model is still compared
-correctly -- an exact upcast, not a lossy one); (b) `unexpected_in_checkpoint`
-is now genuinely fatal, not just recorded; (c) the "unchanged from random
-init" check is removed entirely -- the exact-value-vs-checkpoint check
-already fully verifies correctness on its own and does not need this
-weaker, buffer-confounded secondary check.
+Fixed now: (a) value comparison uses `torch.equal()` on the checkpoint's
+own tensor CAST to the model parameter's own dtype (not `torch.allclose`
+with a tolerance). Precise wording, per a later review's own correction of
+this file's earlier phrasing: this verifies "the checkpoint tensor, after
+being cast to the dtype the model actually loaded it as, is bit-for-bit
+identical to the model's own parameter" -- NOT "the original checkpoint
+file's raw bytes are identical to the model's parameter," since a
+legitimate dtype upcast (e.g. a stored-fp16 checkpoint into an fp32 model)
+changes the tensor's in-memory representation even though no information
+is lost; (b) `unexpected_in_checkpoint` is now genuinely fatal, not just
+recorded; (c) the "unchanged from random init" check is removed entirely
+-- the exact-value-vs-checkpoint check already fully verifies correctness
+on its own and does not need this weaker, buffer-confounded secondary
+check.
+
+CORRECTED 2026-08-06, round 5: also now records the actual training
+recipe (`n_train_images`, `batch_size`, `iters_per_epoch`, `effective_lr`,
+`warmup_end_iters`, `cosine_begin_epoch`, `max_epochs`) read directly from
+the generated config's own `training_recipe_summary` dict, so a canary
+report can state precisely what training setup was used without a reader
+having to separately inspect `make_config.py`'s source.
 
 NEEDS LIVE MMPOSE (same tier as transforms.py/make_config.py) -- writes a
 JSON artifact, not just a printed report, so it becomes part of the
@@ -211,9 +224,15 @@ def main():
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
 
+    # Round 5 addition (review request): record the actual training recipe
+    # so a canary report doesn't require separately reading make_config.py's
+    # source to explain the training setup to the supervisor.
+    training_recipe_summary = dict(cfg.get("training_recipe_summary", {}))
+
     record = {
         "official_config_name": "rtmpose-s_8xb256-420e_coco-256x192 (adapted, see make_config.py)",
         "generated_config_path": str(args.config),
+        "training_recipe_summary": training_recipe_summary,
         "pretrained_checkpoint_path_in_config": checkpoint_path_in_config,
         "pretrained_checkpoint_local_path": str(args.pretrained_checkpoint_path),
         "config_and_local_checkpoint_path_match": True,  # would have raised above otherwise
