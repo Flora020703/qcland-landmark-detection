@@ -10,60 +10,107 @@ question this answers.
 
 WHAT THIS DOES NOT DO (read before using the results): this script never
 touches a checkpoint, never re-runs inference, and never changes any
-predicted or ground-truth COORDINATE. It only re-derives, from already
--saved per-image predicted/GT coordinate pairs, which of the two points in
-each pair is labelled "channel 0" under three different rules:
-  1. NATIVE: whatever channel-identity convention that method's own
-     training/evaluation code already used when the file was written
-     (EoMT: per-image x-sort, recomputed fresh; HRNet: the frozen,
-     training-set-derived DOD direction vector). This reproduces the
-     already-reported fixed-channel NME numbers exactly, as a sanity check
-     that this script's own coordinate handling is correct.
-  2. UNIFIED X-SORT: both GT and prediction are (re-)labelled by sorting
-     the two points by ascending x (tie-break by y), IGNORING whatever
-     convention originally produced the file.
-  3. UNIFIED DOD: both GT and prediction are (re-)labelled by projecting
-     onto the SAME frozen, training-set-only direction vector (imported
-     from rtmpose_reproduction/dod_vectors.py -- the same vectors already
-     verified against real HRNet checkpoints and real HRNet per-image
-     output in that adapter's own test suite), IGNORING whatever
-     convention originally produced the file.
+predicted or ground-truth COORDINATE (beyond the coordinate-SPACE
+conversion described below, which recovers the same physical location a
+different way, not a different location). It only re-derives, from
+already-saved per-image predicted/GT coordinate pairs, which of the two
+points in each pair is labelled "channel 0" under three different rules --
+see the three-rule list further down.
+
+*** CRITICAL FIX (2026-08-06, review finding, corrects the FIRST version of
+this script) ***: EoMT's own per-image dump
+(training/landmark_detection.py's test_nme_dump_path) writes coordinates
+as `pred_coords * [img_size_w / heatmap_w, img_size_h / heatmap_h]` -- i.e.
+in EoMT's SQUARE 512x512 MODEL-INPUT space, not the original (generally
+non-square) image's own pixel space, despite that code's own comment
+calling it "image-pixel space." HRNet's per-image CSV, by contrast, really
+is in original image pixel space. The first version of this script fed
+EoMT's raw 512-space coordinates directly into `dod_sort()` together with
+`d_vect` (frozen in ORIGINAL image space) -- a coordinate-frame mismatch.
+
+Why this specifically breaks DOD but not (the ordering decision of) x-sort:
+x-sort only compares the two points' x-coordinates, and EoMT's own
+original-image -> 512-model-input resize scales x by a single positive
+per-image constant (512/original_width) applied identically to both
+points -- a positive scalar multiple preserves ordering, so x-sort's
+CHANNEL DECISION is accidentally invariant to this bug. The resulting NME
+MAGNITUDE is NOT invariant, though: Euclidean distance mixes x and y, and
+EoMT's original resize is generally ANISOTROPIC (different x/y scale
+factors when original width != height, which is essentially always true
+for these ultrasound images) -- so an NME computed on 512-space
+coordinates does not equal the NME that would be computed on the same
+points in real original-image space. DOD is broken on BOTH counts: the
+projection direction mixes x and y, so the CHANNEL DECISION itself can
+differ under anisotropic distortion, in addition to the same NME-magnitude
+distortion x-sort also has.
+
+Fixed: EoMT's dumped coordinates are now explicitly inverted back to real
+original-image pixel space before ANY unified-convention canonicalisation
+or NME computation, using the EXACT inverse of EoMT's own resize formula
+(rtmpose_reproduction/geometry.to_image_space -- the identical UDP-inspired
+pixel-centre convention EoMT's own `pixel_center_align=True` code path
+uses, already unit-tested in that adapter's own test_geometry.py). This
+requires each EoMT image's REAL original width/height, obtained by opening
+the actual image file (matching the pattern
+rtmpose_reproduction/convert_csv_to_coco.py already uses) -- see
+`--ucl-images-root`/`--multicentre-images-root` below.
+
+The three canonicalisation rules, everything now genuinely in ORIGINAL
+image pixel coordinates for BOTH methods:
+  1. NATIVE: recomputed directly from each file's OWN raw dumped
+     coordinates in whatever space that file actually stores (EoMT: 512
+     model-input space, using its own per-sample channel order as-is;
+     HRNet: already original space). This is a SANITY CHECK ONLY -- it must
+     reproduce the file's own stored NME value within floating-point
+     tolerance, or this script's own coordinate parsing has a bug. It is
+     NOT compared to the other method's "native" value (different spaces,
+     not a fair comparison) and is not used for any cross-method claim.
+  2. UNIFIED X-SORT: after converting to a COMMON original-image
+     coordinate space, both GT and prediction independently re-labelled by
+     ascending x (tie-break by y).
+  3. UNIFIED DOD: after the same conversion, both GT and prediction
+     independently re-labelled by projecting onto the SAME frozen,
+     training-set-only direction vector (rtmpose_reproduction/dod_vectors.py).
 
 Re-labelling changes which NUMBER gets called "fixed-channel NME" for a
-given image (the underlying prediction is untouched); it does NOT retrain
-either method under a common convention. A method whose TRAINING labels
-already used a different convention than the one being tested here may
-still show a large "unified" NME even where a differently-trained model
-would have done better under that convention from the start -- this
-re-scoring answers "how much does the EXTERNAL SCORING RULE alone matter,"
-not "how well would each method perform if retrained under a common rule."
-State this limitation explicitly to the supervisor alongside the results
-(also printed at the end of every run of this script).
+given image; it does NOT retrain either method under a common convention.
+A method whose TRAINING labels already used a different convention than
+the one being tested here may still show a large "unified" NME even where
+a differently-trained model would have done better under that convention
+from the start -- this re-scoring answers "how much does the EXTERNAL
+SCORING RULE alone matter," not "how well would each method perform if
+retrained under a common rule." State this limitation explicitly to the
+supervisor alongside the results (also printed at the end of every run).
 
-Canonicalisation rules, precisely, per the locked spec this implements:
-  - Everything operates in ORIGINAL image pixel coordinates (not resized/
-    heatmap space) -- matches evaluate_hrnet_fixed.py/evaluate_rtmpose_fixed.py.
-  - The SAME external rule is applied independently to the GT pair and to
-    the prediction pair for a given image (never mixed).
-  - x-sort: ascending x; exact ties broken by ascending y (deterministic,
-    matches Python's stable tuple-sort on (x, y)).
-  - DOD: the direction vector is ESTIMATED ONCE from the released Train
-    partition only (already done -- see dod_vectors.py's own provenance
-    docstring, extracted from real trained HRNet checkpoints) and reused
-    FROZEN here; this script never re-estimates it from Test GT.
-  - NME denominator is always the GT's own two-endpoint distance in
-    original-image pixels (unchanged formula, matches every other
-    evaluator in this project).
+Cross-checks this script performs and reports (do not trust any "unified"
+number if these fail):
+  - Native-reproduction sanity check: each file's own recomputed NME
+    (using its own raw coordinates, no space conversion) vs its stored
+    `nme`/`fixed_channel_nme` column, per method, per cell.
+  - Cross-method GT consistency: for a given (dataset, task), HRNet's own
+    GT and EoMT's (inverted-to-original-space) GT should describe the SAME
+    physical annotation for the SAME filename -- checked directly by
+    comparing coordinates (should match closely, small resize/round-trip
+    error only) wherever both methods have that filename.
+  - Cross-method GT disagreement-rate consistency: the x-sort-vs-DOD
+    disagreement rate on GT alone should be (near-)IDENTICAL whether
+    computed from HRNet's GT or EoMT's (inverted) GT for the same
+    (dataset, task) -- if it is not, that is a strong signal of a
+    coordinate-recovery or filename-matching bug, not a real dataset
+    property, and is reported explicitly rather than silently averaged over.
 
-Usage (run where the real per-image files actually live -- server or a
-mounted copy; this script has no dependency on rtmpose_reproduction's own
-MMPose-only code, only its pure-Python dod_vectors.py/endpoint_order.py):
+Usage (run where the real per-image files AND the real images actually
+live -- server or a mounted copy; this script has no dependency on
+rtmpose_reproduction's own MMPose-only code, only its pure-Python
+dod_vectors.py/endpoint_order.py/geometry.py):
 
     python endpoint_ordering_analysis/rescore_endpoint_conventions.py \
         --ucl-eomt-root /root/autodl-tmp/ucl_eomt_per_image \
         --ucl-hrnet-root /root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL \
+        --ucl-images-root /root/autodl-tmp/images/UCL \
         --multicentre-eomt-root /root/autodl-tmp/saved_checkpoints/multicentre_5seed \
         --multicentre-hrnet-root /root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL \
+        --multicentre-images-root /root/autodl-tmp/images/MULTICENTRE \
         --output-root endpoint_ordering_analysis/results
 """
 
@@ -80,6 +127,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "rtmpose_reproduction"))
 from dod_vectors import D_VECT, get_d_vect  # noqa: E402
 from endpoint_order import canonical_order  # noqa: E402
+from geometry import to_image_space  # noqa: E402
 
 SEEDS = (42, 0, 123, 2024, 3407)
 BACKBONES = ("dinov2", "dinov3")
@@ -89,7 +137,9 @@ HRNET_TASK_TAG = {
     "bpd": "brain_BPD", "ofd": "brain_OFD",
     "apad": "abdomen_APAD", "tad": "abdomen_TAD", "fl": "femur_FL",
 }
-MULTICENTRE_RAW_N = {"bpd": 1191, "ofd": 1191, "apad": 161, "tad": 161, "fl": 362}
+ANATOMY_BY_TASK = {"bpd": "Head", "ofd": "Head", "apad": "Abdomen", "tad": "Abdomen", "fl": "Femur"}
+EOMT_MODEL_INPUT_SIZE = 512  # matches every matched-protocol EoMT config's img_size
+NATIVE_SANITY_TOLERANCE = 1e-4  # relative; dumped values are text-formatted to 8 decimals
 
 
 def _canon_filename(value: str) -> str:
@@ -126,19 +176,49 @@ def fixed_channel_nme(pred0, pred1, gt0, gt1) -> float:
 
 class LoadError(RuntimeError):
     """Raised (and caught at the top level, per-cell) when a specific
-    (dataset, task[, backbone]) cell's real per-image files are missing or
-    lack the raw-coordinate columns this analysis needs -- e.g. UCL BPD's
-    EoMT checkpoints/per-image files are known (from this project's own
-    records) to no longer exist on the server. Reported in
+    (dataset, task[, backbone]) cell's real per-image files are missing,
+    lack the raw-coordinate columns this analysis needs, or the actual
+    image file needed to recover EoMT's original-space size cannot be
+    found -- e.g. UCL BPD's EoMT checkpoints are known (from this
+    project's own records) to no longer exist on the server. Reported in
     excluded_images.tsv / the run's own console output, not silently
     skipped without a trace."""
 
 
+class _ImageSizeCache:
+    """Opens each real image file at most once (per images_root), via PIL,
+    matching rtmpose_reproduction/convert_csv_to_coco.py's own pattern.
+    Raises LoadError with the exact missing path if an image can't be found
+    -- EoMT's coordinate-space fix depends entirely on getting a REAL width/
+    height per image, not an assumption."""
+
+    def __init__(self, images_root: Path, anatomy: str):
+        self.dir = images_root / anatomy
+        self._cache: dict[str, tuple[float, float]] = {}
+
+    def size(self, filename: str) -> tuple[float, float]:
+        if filename not in self._cache:
+            path = self.dir / filename
+            if not path.is_file():
+                raise LoadError(
+                    f"cannot recover EoMT's original image size: {path} not found "
+                    f"-- EoMT's dumped coordinates are in 512x512 model-input space "
+                    f"and MUST be inverted using the real original width/height; "
+                    f"without the actual image file this is impossible, not "
+                    f"approximable. Check --*-images-root."
+                )
+            from PIL import Image
+            with Image.open(path) as im:
+                self._cache[filename] = (float(im.size[0]), float(im.size[1]))
+        return self._cache[filename]
+
+
 def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str, dict]:
-    """Returns {filename: {"seed": {seed: (pred0, pred1, gt0, gt1, native_fixed_nme)}}}
+    """Returns {"per_seed": {seed: {filename: {...}}}, "filenames": [...]}.
     Real schema (verified against baseline_reproduction/evaluate_hrnet_fixed.py's
     own CSV writer): index,filename,pred0_x,pred0_y,pred1_x,pred1_y,gt0_x,gt0_y,
-    gt1_x,gt1_y,reference_distance,fixed_channel_nme,swap_min_nme."""
+    gt1_x,gt1_y,reference_distance,fixed_channel_nme,swap_min_nme -- already in
+    ORIGINAL image pixel space, no conversion needed."""
     tag = HRNET_TASK_TAG[task]
     per_seed: dict[int, dict[str, dict]] = {}
     for seed in SEEDS:
@@ -172,20 +252,25 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
     for seed in SEEDS[1:]:
         if set(per_seed[seed]) != keys:
             raise LoadError(f"HRNet {dataset}/{task}: filename set differs across seeds")
+
+    _check_native_sanity("HRNet", dataset, task, per_seed, already_original_space=True)
     return {"per_seed": per_seed, "filenames": sorted(keys)}
 
 
-def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str) -> dict:
-    """Returns the same shape as load_hrnet_per_image. Real schema depends
-    on training/landmark_detection.py's test_nme_dump_path feature
-    (introduced 2026-07-23/24) actually having been enabled for the run
-    that produced these files -- if the coordinate columns
-    (pred_x0/pred_y0/gt_x0/gt_y0/pred_x1/pred_y1/gt_x1/gt_y1) are absent,
-    this raises LoadError with a precise, actionable message rather than
-    silently falling back to NME-only (which cannot support this analysis
-    at all -- see this file's own module docstring)."""
+def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
+                         image_size_cache: _ImageSizeCache) -> dict:
+    """Returns the same shape as load_hrnet_per_image, but with
+    coordinates ALREADY CONVERTED to real original-image pixel space
+    (see this module's own docstring for why this conversion is required
+    and how it is done) -- callers never see EoMT's raw 512-space numbers.
+
+    Real schema depends on training/landmark_detection.py's
+    test_nme_dump_path feature (introduced 2026-07-23/24) actually having
+    been enabled for the run that produced these files -- if the
+    coordinate columns are absent, this raises LoadError with a precise,
+    actionable message rather than silently falling back to NME-only."""
     is_multicentre = dataset == "MULTICENTRE"
-    per_seed: dict[int, dict[str, dict]] = {}
+    per_seed_raw: dict[int, dict[str, dict]] = {}
     for seed in SEEDS:
         if is_multicentre:
             run = eomt_root / f"multicentre-{task}-{backbone}" / f"seed{seed}"
@@ -222,6 +307,8 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str)
         for r in nme_rows:
             idx = int(r["index"])
             by_index[idx] = {
+                # RAW, still in EoMT's 512x512 model-input space -- NOT
+                # converted yet at this point in the function.
                 "pred0": (float(r["pred_x0"]), float(r["pred_y0"])),
                 "pred1": (float(r["pred_x1"]), float(r["pred_y1"])),
                 "gt0": (float(r["gt_x0"]), float(r["gt_y0"])),
@@ -234,13 +321,70 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str)
         by_name = {order[idx]: by_index[idx] for idx in order}
         if len(by_name) != len(order):
             raise LoadError(f"duplicate joined filenames under {run}")
-        per_seed[seed] = by_name
+        per_seed_raw[seed] = by_name
 
-    keys = set(per_seed[SEEDS[0]])
+    keys = set(per_seed_raw[SEEDS[0]])
     for seed in SEEDS[1:]:
-        if set(per_seed[seed]) != keys:
+        if set(per_seed_raw[seed]) != keys:
             raise LoadError(f"EoMT {dataset}/{task}/{backbone}: filename set differs across seeds")
-    return {"per_seed": per_seed, "filenames": sorted(keys)}
+
+    # Native-reproduction sanity check BEFORE any space conversion -- this
+    # validates that this script's own parsing of the raw dumped 512-space
+    # numbers reproduces the file's own stored `nme` value exactly (EoMT's
+    # native convention is computed in ITS OWN space, with no re-sort
+    # needed since predicted/GT channels are already aligned 1:1 as trained).
+    _check_native_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw, already_original_space=False)
+
+    # *** THE FIX ***: convert every coordinate to real original-image
+    # pixel space, using each image's REAL width/height (opened once per
+    # filename, reused across all 5 seeds) and the EXACT inverse of EoMT's
+    # own resize formula.
+    filenames = sorted(keys)
+    sizes = {fn: image_size_cache.size(fn) for fn in filenames}
+    per_seed_converted: dict[int, dict[str, dict]] = {}
+    for seed, by_name in per_seed_raw.items():
+        converted = {}
+        for fn in filenames:
+            row = by_name[fn]
+            width, height = sizes[fn]
+            converted[fn] = {
+                "pred0": to_image_space(*row["pred0"], width, height, EOMT_MODEL_INPUT_SIZE),
+                "pred1": to_image_space(*row["pred1"], width, height, EOMT_MODEL_INPUT_SIZE),
+                "gt0": to_image_space(*row["gt0"], width, height, EOMT_MODEL_INPUT_SIZE),
+                "gt1": to_image_space(*row["gt1"], width, height, EOMT_MODEL_INPUT_SIZE),
+                "native_fixed_nme": row["native_fixed_nme"],
+            }
+        per_seed_converted[seed] = converted
+
+    return {"per_seed": per_seed_converted, "filenames": filenames}
+
+
+def _check_native_sanity(method_label: str, dataset: str, task: str,
+                          per_seed: dict, already_original_space: bool) -> None:
+    """Recomputes fixed_channel_nme directly from each row's OWN raw
+    coordinates (no unified re-sort, no space conversion) and asserts it
+    matches the file's own stored value -- validates this script's parsing
+    is correct, independent of the separate original-space conversion
+    (EoMT) or lack thereof (HRNet, already original space)."""
+    worst_rel_err = 0.0
+    n_checked = 0
+    for seed, by_name in per_seed.items():
+        for fn, row in by_name.items():
+            recomputed = fixed_channel_nme(row["pred0"], row["pred1"], row["gt0"], row["gt1"])
+            stored = row["native_fixed_nme"]
+            rel_err = abs(recomputed - stored) / max(abs(stored), 1e-9)
+            worst_rel_err = max(worst_rel_err, rel_err)
+            n_checked += 1
+    if worst_rel_err > NATIVE_SANITY_TOLERANCE:
+        raise LoadError(
+            f"{method_label} {dataset}/{task}: native-reproduction sanity check FAILED "
+            f"(worst relative error {worst_rel_err:.6g} across {n_checked} (seed, image) "
+            f"pairs exceeds tolerance {NATIVE_SANITY_TOLERANCE}) -- this script's own "
+            f"coordinate parsing does not reproduce the file's own stored NME; do not "
+            f"trust any unified-convention number for this cell until this is resolved."
+        )
+    print(f"  [native sanity OK] {method_label} {dataset}/{task}: "
+          f"worst relative error {worst_rel_err:.2e} over {n_checked} (seed,image) pairs")
 
 
 def bootstrap_ci(values: np.ndarray, replicates: int, rng: np.random.Generator) -> tuple[float, float]:
@@ -255,17 +399,16 @@ def bootstrap_ci(values: np.ndarray, replicates: int, rng: np.random.Generator) 
 
 
 def rescore_cell(data: dict, d_vect) -> dict:
-    """Given one method's `{"per_seed": {...}, "filenames": [...]}`, compute
-    per-seed, per-image NME under all three conventions, plus GT-level
-    x-sort-vs-DOD disagreement. Returns a dict with:
-      - "per_seed_per_image": {seed: {filename: {"native":.., "xsort":.., "dod":..}}}
-      - "gt_disagreement_rate": float (x-sort vs DOD channel-0 disagreement on GT)
-      - "n_images": int
-    """
+    """Given one method's `{"per_seed": {...}, "filenames": [...]}` -- ALL
+    coordinates already in a common ORIGINAL-image-space representation --
+    compute per-seed, per-image NME under the two unified conventions, plus
+    GT-level x-sort-vs-DOD disagreement (and the per-filename disagreement
+    flags themselves, so the caller can cross-check against another
+    method's GT for the same dataset/task)."""
     filenames = data["filenames"]
     per_seed = data["per_seed"]
     out_per_seed: dict[int, dict[str, dict]] = {}
-    disagree_flags = []
+    disagree_by_filename: dict[str, bool] = {}
 
     for seed, by_name in per_seed.items():
         out = {}
@@ -287,28 +430,27 @@ def rescore_cell(data: dict, d_vect) -> dict:
             out[fn] = {"native": native_nme, "xsort": xsort_nme, "dod": dod_nme}
 
             if seed == SEEDS[0]:
-                # GT-level disagreement only depends on GT + d_vect, not on
-                # predictions or seed -- compute it once, from the first
-                # seed's GT (GT is identical across seeds for the same image).
-                disagree_flags.append(gt_x0 != gt_d0)
+                disagree_by_filename[fn] = (gt_x0 != gt_d0)
         out_per_seed[seed] = out
 
     return {
         "per_seed_per_image": out_per_seed,
-        "gt_disagreement_rate": float(np.mean(disagree_flags)) if disagree_flags else float("nan"),
+        "disagree_by_filename": disagree_by_filename,
+        "gt_disagreement_rate": float(np.mean(list(disagree_by_filename.values())))
+                                  if disagree_by_filename else float("nan"),
         "n_images": len(filenames),
+        "gt_by_filename": {fn: (per_seed[SEEDS[0]][fn]["gt0"], per_seed[SEEDS[0]][fn]["gt1"])
+                            for fn in filenames},
     }
 
 
 def summarize_and_write(dataset: str, task: str, method_label: str,
                          rescored: dict, output_root: Path,
-                         bootstrap_reps: int, rng: np.random.Generator,
-                         per_image_dir_prefix: str) -> list[dict]:
+                         bootstrap_reps: int, rng: np.random.Generator) -> tuple[list, list]:
     per_seed = rescored["per_seed_per_image"]
     filenames = sorted(next(iter(per_seed.values())).keys())
 
     seed_rows = []
-    per_image_avg = {conv: [] for conv in ("native", "xsort", "dod")}
     for seed in SEEDS:
         for conv in ("native", "xsort", "dod"):
             values = np.array([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
@@ -318,6 +460,7 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
                 "mean_nme_pct": f"{values.mean():.8f}",
             })
 
+    per_image_avg = {}
     for conv in ("native", "xsort", "dod"):
         stacked = np.array([[per_seed[seed][fn][conv] for seed in SEEDS] for fn in filenames]) * 100.0
         per_image_avg[conv] = stacked.mean(axis=1)  # average across 5 seeds, per image
@@ -327,7 +470,7 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     diff = xsort_vals - dod_vals
     lo, hi = bootstrap_ci(diff, bootstrap_reps, rng) if len(diff) > 1 else (float("nan"), float("nan"))
 
-    per_image_path = output_root / f"{per_image_dir_prefix}_{dataset.lower()}_{task}_{method_label}_per_image.csv"
+    per_image_path = output_root / f"{dataset.lower()}_{task}_{method_label}_per_image.csv"
     with per_image_path.open("w", newline="", encoding="utf-8") as handle:
         fields = ["filename", "native_nme_pct", "xsort_nme_pct", "dod_nme_pct", "xsort_minus_dod_pp"]
         writer = csv.DictWriter(handle, fieldnames=fields)
@@ -360,15 +503,70 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     return seed_rows, [summary_row]
 
 
+def cross_method_gt_consistency_check(dataset: str, task: str, rescored_by_method: dict) -> list[dict]:
+    """Per this file's own module docstring: HRNet's GT and EoMT's
+    (inverted-to-original-space) GT should describe the SAME physical
+    annotation for the same filename, and the x-sort-vs-DOD disagreement
+    rate on GT alone should therefore be (near-)identical across methods
+    for the same (dataset, task). Returns a list of warning rows (empty if
+    everything is consistent) -- printed AND written to
+    excluded_images.tsv's sibling, not silently absorbed into an average."""
+    warnings = []
+    methods = list(rescored_by_method)
+    if len(methods) < 2:
+        return warnings
+    base_method = methods[0]
+    base = rescored_by_method[base_method]
+    for other_method in methods[1:]:
+        other = rescored_by_method[other_method]
+        common = sorted(set(base["gt_by_filename"]) & set(other["gt_by_filename"]))
+        if not common:
+            continue
+        max_gt_coord_diff = 0.0
+        disagreement_mismatches = 0
+        for fn in common:
+            (bg0, bg1) = base["gt_by_filename"][fn]
+            (og0, og1) = other["gt_by_filename"][fn]
+            d = max(abs(bg0[0] - og0[0]), abs(bg0[1] - og0[1]),
+                    abs(bg1[0] - og1[0]), abs(bg1[1] - og1[1]))
+            max_gt_coord_diff = max(max_gt_coord_diff, d)
+            if base["disagree_by_filename"][fn] != other["disagree_by_filename"][fn]:
+                disagreement_mismatches += 1
+
+        base_rate = np.mean([base["disagree_by_filename"][fn] for fn in common])
+        other_rate = np.mean([other["disagree_by_filename"][fn] for fn in common])
+        print(f"  [cross-method GT check] {dataset}/{task}: {base_method} vs {other_method}, "
+              f"n_common={len(common)}, max_gt_coord_diff_px={max_gt_coord_diff:.3f}, "
+              f"disagreement_rate {base_method}={base_rate:.4f} vs {other_method}={other_rate:.4f}, "
+              f"per-image mismatches={disagreement_mismatches}")
+        if max_gt_coord_diff > 5.0 or disagreement_mismatches > 0:
+            warnings.append({
+                "dataset": dataset, "task": task,
+                "method_a": base_method, "method_b": other_method,
+                "n_common": len(common),
+                "max_gt_coord_diff_px": f"{max_gt_coord_diff:.4f}",
+                "disagreement_rate_a": f"{base_rate:.6f}",
+                "disagreement_rate_b": f"{other_rate:.6f}",
+                "per_image_disagreement_mismatches": disagreement_mismatches,
+            })
+    return warnings
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ucl-eomt-root", type=Path, default=Path("/root/autodl-tmp/ucl_eomt_per_image"))
     parser.add_argument("--ucl-hrnet-root", type=Path,
                          default=Path("/root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL"))
+    parser.add_argument("--ucl-images-root", type=Path, required=True,
+                         help="directory containing UCL/{Head,Abdomen,Femur}/<filename> -- "
+                              "REQUIRED, EoMT's coordinate conversion cannot proceed without "
+                              "the real original image dimensions")
     parser.add_argument("--multicentre-eomt-root", type=Path,
                          default=Path("/root/autodl-tmp/saved_checkpoints/multicentre_5seed"))
     parser.add_argument("--multicentre-hrnet-root", type=Path,
                          default=Path("/root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL"))
+    parser.add_argument("--multicentre-images-root", type=Path, required=True,
+                         help="directory containing MULTICENTRE/{Head,Abdomen,Femur}/<filename>")
     parser.add_argument("--output-root", type=Path, default=Path("endpoint_ordering_analysis/results"))
     parser.add_argument("--bootstrap-replicates", type=int, default=20000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260806)
@@ -380,43 +578,60 @@ def main():
     all_seed_rows: list[dict] = []
     all_summary_rows: list[dict] = []
     excluded: list[dict] = []
+    gt_consistency_warnings: list[dict] = []
     dvect_rows = [
         {"dataset": d, "task": t, "d0_x": v[0][0], "d0_y": v[0][1], "d1_x": v[1][0], "d1_y": v[1][1]}
         for (d, t), v in D_VECT.items()
     ]
 
-    cells = []
-    for task in UCL_TASKS:
-        cells.append(("UCL", task, "hrnet", None, args.ucl_hrnet_root, None))
-        for backbone in BACKBONES:
-            cells.append(("UCL", task, "eomt", backbone, None, args.ucl_eomt_root))
-    for task in MULTICENTRE_TASKS:
-        cells.append(("MULTICENTRE", task, "hrnet", None, args.multicentre_hrnet_root, None))
-        for backbone in BACKBONES:
-            cells.append(("MULTICENTRE", task, "eomt", backbone, None, args.multicentre_eomt_root))
+    task_groups = [
+        ("UCL", UCL_TASKS, args.ucl_hrnet_root, args.ucl_eomt_root, args.ucl_images_root),
+        ("MULTICENTRE", MULTICENTRE_TASKS, args.multicentre_hrnet_root,
+         args.multicentre_eomt_root, args.multicentre_images_root),
+    ]
 
-    for dataset, task, method, backbone, hrnet_root, eomt_root in cells:
-        method_label = "hrnet" if method == "hrnet" else f"eomt_{backbone}"
-        d_vect = get_d_vect(dataset, task.upper())
-        try:
-            if method == "hrnet":
-                data = load_hrnet_per_image(hrnet_root, dataset, task)
-            else:
-                data = load_eomt_per_image(eomt_root, dataset, task, backbone)
-        except LoadError as exc:
-            excluded.append({"dataset": dataset, "task": task, "method": method_label, "reason": str(exc)})
-            print(f"[EXCLUDED] {dataset}/{task}/{method_label}: {exc}")
-            continue
+    for dataset, tasks, hrnet_root, eomt_root, images_root in task_groups:
+        for task in tasks:
+            anatomy = ANATOMY_BY_TASK[task]
+            image_cache = _ImageSizeCache(images_root, anatomy)
+            d_vect = get_d_vect(dataset, task.upper())
+            rescored_by_method: dict[str, dict] = {}
 
-        rescored = rescore_cell(data, d_vect)
-        seed_rows, summary_rows = summarize_and_write(
-            dataset, task, method_label, rescored, args.output_root,
-            args.bootstrap_replicates, rng, "per_image",
+            cell_specs = [("hrnet", None)] + [("eomt", b) for b in BACKBONES]
+            for method, backbone in cell_specs:
+                method_label = "hrnet" if method == "hrnet" else f"eomt_{backbone}"
+                try:
+                    if method == "hrnet":
+                        data = load_hrnet_per_image(hrnet_root, dataset, task)
+                    else:
+                        data = load_eomt_per_image(eomt_root, dataset, task, backbone, image_cache)
+                except LoadError as exc:
+                    excluded.append({"dataset": dataset, "task": task, "method": method_label, "reason": str(exc)})
+                    print(f"[EXCLUDED] {dataset}/{task}/{method_label}: {exc}")
+                    continue
+
+                rescored = rescore_cell(data, d_vect)
+                rescored_by_method[method_label] = rescored
+                seed_rows, summary_rows = summarize_and_write(
+                    dataset, task, method_label, rescored, args.output_root,
+                    args.bootstrap_replicates, rng,
+                )
+                all_seed_rows.extend(seed_rows)
+                all_summary_rows.extend(summary_rows)
+                print(f"[OK] {dataset}/{task}/{method_label}: n={rescored['n_images']}, "
+                      f"gt_disagreement={rescored['gt_disagreement_rate']:.4f}")
+
+            gt_consistency_warnings.extend(
+                cross_method_gt_consistency_check(dataset, task, rescored_by_method)
+            )
+
+    n_task_cells = sum(len(tasks) for _, tasks, *_ in task_groups) * (1 + len(BACKBONES))
+    if not all_summary_rows:
+        raise SystemExit(
+            f"ERROR: ZERO cells could be scored out of {n_task_cells} attempted -- every "
+            f"cell was excluded (see excluded_images.tsv reasons above). This is not a "
+            f"result to report to the supervisor; check --*-root/--*-images-root paths."
         )
-        all_seed_rows.extend(seed_rows)
-        all_summary_rows.extend(summary_rows)
-        print(f"[OK] {dataset}/{task}/{method_label}: n={rescored['n_images']}, "
-              f"gt_disagreement={rescored['gt_disagreement_rate']:.4f}")
 
     seed_summary_path = args.output_root / "endpoint_ordering_seed_summary.tsv"
     with seed_summary_path.open("w", newline="", encoding="utf-8") as handle:
@@ -445,15 +660,36 @@ def main():
         writer.writeheader()
         writer.writerows(excluded)
 
-    print(f"\n[COMPLETE] {len(all_summary_rows)} cells scored, {len(excluded)} cells excluded.")
+    consistency_path = args.output_root / "cross_method_gt_consistency_warnings.tsv"
+    with consistency_path.open("w", newline="", encoding="utf-8") as handle:
+        fields = ["dataset", "task", "method_a", "method_b", "n_common",
+                   "max_gt_coord_diff_px", "disagreement_rate_a", "disagreement_rate_b",
+                   "per_image_disagreement_mismatches"]
+        writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+        writer.writeheader()
+        writer.writerows(gt_consistency_warnings)
+
+    n_scored = len(all_summary_rows)
+    n_excluded = len(excluded)
+    print(f"\n[COMPLETE] {n_scored}/{n_task_cells} cells scored, {n_excluded}/{n_task_cells} excluded.")
+    if gt_consistency_warnings:
+        print(f"[WARNING] {len(gt_consistency_warnings)} cross-method GT consistency check(s) "
+              f"FAILED -- see {consistency_path}. Do not treat the affected (dataset, task) "
+              f"cells' 'unified' numbers as trustworthy until resolved.")
+    for row in excluded:
+        print(f"  excluded: {row['dataset']}/{row['task']}/{row['method']}")
     print(f"Wrote: {summary_path}, {seed_summary_path}, {dvect_path}, {excluded_path}, "
-          f"and {len(all_summary_rows)} per-image CSVs under {args.output_root}")
+          f"{consistency_path}, and {n_scored} per-image CSVs under {args.output_root}")
     print("\n*** LIMITATION, repeat to the supervisor alongside these numbers ***")
     print("This is a retrospective RE-SCORING of already-saved predictions under two")
     print("external conventions -- it quantifies how much the EXTERNAL SCORING RULE")
     print("alone changes each method's reported number and whether conclusions flip.")
     print("It does NOT retrain either method, and does NOT prove a method trained")
     print("under a different convention from the start would perform identically.")
+    print(f"\n{n_excluded} of {n_task_cells} cells could NOT be scored (see excluded_images.tsv) --")
+    print("for those specific (dataset, task) combinations, this analysis provides NO evidence")
+    print("about endpoint-ordering sensitivity; state this explicitly, do not extrapolate from")
+    print("other tasks. UCL BPD/EoMT is expected to be among these (checkpoints already gone).")
 
 
 if __name__ == "__main__":

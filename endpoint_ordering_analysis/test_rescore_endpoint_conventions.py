@@ -7,6 +7,19 @@ server), this is the only local verification possible, but it exercises
 the REAL loading/canonicalisation/bootstrap code paths, not a separate
 reimplementation.
 
+Includes coverage (added 2026-08-07, fixing a bug a review round found in
+the first version of this script) for the EoMT coordinate-SPACE inversion:
+EoMT's own dump is in 512x512 model-input space, and load_eomt_per_image
+must convert it to true original-image pixel space using each image's REAL
+width/height (opened from an actual file on disk, via
+rtmpose_reproduction/geometry.py's to_image_space -- the exact inverse of
+EoMT's own resize). The synthetic images written here are deliberately
+NON-SQUARE (e.g. 300x600) specifically so an un-fixed version of this
+script (feeding raw 512-space coordinates straight into dod_sort next to
+an original-space d_vect, or computing NME directly in 512-space) would
+fail these assertions -- a square synthetic image cannot expose an
+anisotropic-scaling bug.
+
 Run directly: python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
 """
 
@@ -14,12 +27,21 @@ from __future__ import annotations
 
 import csv
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "rtmpose_reproduction"))
+from geometry import to_image_space, to_model_space  # noqa: E402
 
 from rescore_endpoint_conventions import (
+    LoadError,
+    _ImageSizeCache,
+    cross_method_gt_consistency_check,
     dod_sort,
     fixed_channel_nme,
     load_eomt_per_image,
@@ -29,6 +51,7 @@ from rescore_endpoint_conventions import (
 )
 
 SEEDS = (42, 0, 123, 2024, 3407)
+EOMT_INPUT_SIZE = 512
 
 
 def _write_hrnet_synthetic(root: Path, dataset: str, task_tag: str, filenames_and_points):
@@ -57,8 +80,24 @@ def _write_hrnet_synthetic(root: Path, dataset: str, task_tag: str, filenames_an
                 })
 
 
-def _write_eomt_synthetic(root: Path, task: str, backbone: str, filenames_and_points,
-                           is_multicentre: bool = False):
+def _write_synthetic_image(images_root: Path, anatomy: str, filename: str, width: int, height: int):
+    """Writes a REAL image file of the given (possibly non-square)
+    dimensions -- load_eomt_per_image's _ImageSizeCache opens the actual
+    file via PIL, it does not accept a pre-supplied size."""
+    directory = images_root / anatomy
+    directory.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (width, height), color=(128, 128, 128)).save(directory / filename)
+
+
+def _write_eomt_synthetic(root: Path, task: str, backbone: str,
+                           filenames_points_and_sizes, is_multicentre: bool = False):
+    """filenames_points_and_sizes: list of (filename, gt0, gt1, pred0, pred1,
+    orig_width, orig_height), all points in TRUE ORIGINAL image space. This
+    helper converts to 512x512 model-input space (via to_model_space --
+    EoMT's own forward formula) before writing the CSV, exactly mirroring
+    what training/landmark_detection.py's real dump actually contains, so
+    that a correct load_eomt_per_image() has to invert it back to recover
+    the original-space points passed in here."""
     for seed in SEEDS:
         if is_multicentre:
             run_dir = root / f"multicentre-{task}-{backbone}" / f"seed{seed}"
@@ -72,7 +111,7 @@ def _write_eomt_synthetic(root: Path, task: str, backbone: str, filenames_and_po
         with order_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["index", "img_name"])
-            for i, (fn, *_rest) in enumerate(filenames_and_points):
+            for i, (fn, *_rest) in enumerate(filenames_points_and_sizes):
                 writer.writerow([i, fn])
 
         nme_path = run_dir / nme_name
@@ -81,14 +120,22 @@ def _write_eomt_synthetic(root: Path, task: str, backbone: str, filenames_and_po
         with nme_path.open("w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fields)
             writer.writeheader()
-            for i, (fn, gt0, gt1, pred0, pred1) in enumerate(filenames_and_points):
-                nme = fixed_channel_nme(pred0, pred1, gt0, gt1)
+            for i, (fn, gt0, gt1, pred0, pred1, width, height) in enumerate(filenames_points_and_sizes):
+                # EoMT's real dump writes 512-model-input-space coordinates
+                # (training/landmark_detection.py) -- its own "nme" column
+                # is therefore computed FROM the 512-space points, in
+                # 512-space, exactly as the real training code does.
+                gt0_512 = to_model_space(*gt0, width, height, EOMT_INPUT_SIZE)
+                gt1_512 = to_model_space(*gt1, width, height, EOMT_INPUT_SIZE)
+                pred0_512 = to_model_space(*pred0, width, height, EOMT_INPUT_SIZE)
+                pred1_512 = to_model_space(*pred1, width, height, EOMT_INPUT_SIZE)
+                nme = fixed_channel_nme(pred0_512, pred1_512, gt0_512, gt1_512)
                 writer.writerow({
                     "index": i, "nme": nme, "pixel_error": "",
-                    "pred_x0": pred0[0], "pred_y0": pred0[1],
-                    "gt_x0": gt0[0], "gt_y0": gt0[1],
-                    "pred_x1": pred1[0], "pred_y1": pred1[1],
-                    "gt_x1": gt1[0], "gt_y1": gt1[1],
+                    "pred_x0": pred0_512[0], "pred_y0": pred0_512[1],
+                    "gt_x0": gt0_512[0], "gt_y0": gt0_512[1],
+                    "pred_x1": pred1_512[0], "pred_y1": pred1_512[1],
+                    "gt_x1": gt1_512[0], "gt_y1": gt1_512[1],
                 })
 
 
@@ -112,20 +159,101 @@ def test_hrnet_loader_and_native_nme_matches_stored_value():
 
 
 def test_eomt_loader_joins_order_and_coords_correctly():
+    """Uses a NON-SQUARE synthetic original image (300x600) specifically so
+    this test would fail if load_eomt_per_image ever stopped converting
+    512-model-space back to original-image space (or converted using the
+    wrong width/height) -- a square image can't expose that bug since its
+    resize-to-512 is isotropic."""
     tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
     try:
+        width, height = 300.0, 600.0
         samples = [
-            ("a.jpg", (10.0, 10.0), (90.0, 10.0), (12.0, 11.0), (88.0, 9.0)),
-            ("b.jpg", (5.0, 5.0), (5.0, 95.0), (6.0, 6.0), (4.0, 94.0)),
+            ("a.jpg", (10.0, 10.0), (90.0, 10.0), (12.0, 11.0), (88.0, 9.0), width, height),
+            ("b.jpg", (5.0, 5.0), (5.0, 95.0), (6.0, 6.0), (4.0, 94.0), width, height),
         ]
         _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
-        data = load_eomt_per_image(tmp, "UCL", "bpd", "dinov2")
+        _write_synthetic_image(images_root, "Head", "a.jpg", int(width), int(height))
+        _write_synthetic_image(images_root, "Head", "b.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        data = load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
         assert data["filenames"] == ["a.jpg", "b.jpg"]
         row = data["per_seed"][42]["a.jpg"]
-        assert row["gt0"] == (10.0, 10.0) and row["gt1"] == (90.0, 10.0)
+        # After correct round-trip inversion, recovered original-space
+        # coordinates should match the ORIGINAL points passed to the
+        # synthetic writer (small float tolerance only), NOT the raw
+        # 512-space numbers actually stored in the CSV.
+        assert abs(row["gt0"][0] - 10.0) < 1e-6 and abs(row["gt0"][1] - 10.0) < 1e-6
+        assert abs(row["gt1"][0] - 90.0) < 1e-6 and abs(row["gt1"][1] - 10.0) < 1e-6
+        assert abs(row["pred0"][0] - 12.0) < 1e-6 and abs(row["pred0"][1] - 11.0) < 1e-6
         print("[PASS] test_eomt_loader_joins_order_and_coords_correctly")
     finally:
         shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_eomt_loader_inverts_anisotropic_coordinate_space_correctly():
+    """The core regression test for the coordinate-space bug: constructs a
+    case where the GT diameter is HORIZONTAL in original-image space (so a
+    vertical d_vect and x-sort would DISAGREE the same way DOD-vs-x-sort
+    normally disagrees), on a strongly non-square (150x600, 1:4) original
+    image. If load_eomt_per_image ever fed raw, un-inverted 512-space
+    points into dod_sort alongside an original-space d_vect (the original
+    bug), or computed NME directly on 512-space points, this test's
+    hand-computed original-space expectations would not match."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        width, height = 150.0, 600.0
+        gt0, gt1 = (20.0, 305.0), (130.0, 295.0)  # horizontal-ish, small dy
+        pred0, pred1 = (22.0, 303.0), (128.0, 296.0)
+        samples = [("v.jpg", gt0, gt1, pred0, pred1, width, height)]
+        _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        _write_synthetic_image(images_root, "Head", "v.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        data = load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
+        row = data["per_seed"][42]["v.jpg"]
+        assert abs(row["gt0"][0] - gt0[0]) < 1e-6 and abs(row["gt0"][1] - gt0[1]) < 1e-6
+        assert abs(row["gt1"][0] - gt1[0]) < 1e-6 and abs(row["gt1"][1] - gt1[1]) < 1e-6
+
+        d_vect = ((0.0, 0.0), (0.0, 1.0))  # purely vertical, like real near-vertical BPD d_vect
+        rescored = rescore_cell(data, d_vect)
+        out = rescored["per_seed_per_image"][42]["v.jpg"]
+
+        gt_x0, gt_x1 = x_sort(gt0, gt1)  # ascending x -> gt0 first (20 < 130)
+        pred_x0, pred_x1 = x_sort(pred0, pred1)
+        expected_xsort_nme = fixed_channel_nme(pred_x0, pred_x1, gt_x0, gt_x1)
+        assert abs(out["xsort"] - expected_xsort_nme) < 1e-6
+
+        gt_d0, gt_d1 = dod_sort(gt0, gt1, d_vect)  # ascending y -> gt1 first (295 < 305)
+        pred_d0, pred_d1 = dod_sort(pred0, pred1, d_vect)
+        expected_dod_nme = fixed_channel_nme(pred_d0, pred_d1, gt_d0, gt_d1)
+        assert abs(out["dod"] - expected_dod_nme) < 1e-6
+        assert gt_x0 != gt_d0, "test construction error: x-sort and DOD should disagree here"
+
+        # A naive, UN-FIXED loader would instead compute to_model_space of
+        # these same original points and hand them straight to dod_sort
+        # unconverted -- demonstrate that doing so gives a DIFFERENT (wrong)
+        # NME, confirming this test actually exercises the fix rather than
+        # passing vacuously regardless of whether inversion happened.
+        gt0_512 = to_model_space(*gt0, width, height, EOMT_INPUT_SIZE)
+        gt1_512 = to_model_space(*gt1, width, height, EOMT_INPUT_SIZE)
+        pred0_512 = to_model_space(*pred0, width, height, EOMT_INPUT_SIZE)
+        pred1_512 = to_model_space(*pred1, width, height, EOMT_INPUT_SIZE)
+        naive_gt_d0, naive_gt_d1 = dod_sort(gt0_512, gt1_512, d_vect)
+        naive_pred_d0, naive_pred_d1 = dod_sort(pred0_512, pred1_512, d_vect)
+        naive_dod_nme = fixed_channel_nme(naive_pred_d0, naive_pred_d1, naive_gt_d0, naive_gt_d1)
+        assert abs(naive_dod_nme - out["dod"]) > 1e-6, (
+            "test construction error: naive (un-inverted) and fixed DOD NME "
+            "should differ for this anisotropic case, or this test can't "
+            "distinguish a correct fix from the original bug"
+        )
+        print("[PASS] test_eomt_loader_inverts_anisotropic_coordinate_space_correctly")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
 
 
 def test_rescore_cell_recovers_x_sort_and_dod_correctly():
@@ -198,9 +326,92 @@ def test_gt_disagreement_rate_detects_real_disagreement():
         shutil.rmtree(tmp)
 
 
+def test_eomt_loader_rejects_missing_images_root_file():
+    """If the actual image file can't be found, load_eomt_per_image must
+    raise LoadError naming the exact missing path -- NOT fall back to
+    assuming a square image or any other guessed size, since that would
+    silently reintroduce the coordinate-space bug this fix addresses."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        samples = [("missing.jpg", (10.0, 10.0), (90.0, 10.0), (12.0, 11.0), (88.0, 9.0), 300.0, 600.0)]
+        _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        cache = _ImageSizeCache(images_root, "Head")  # deliberately: image file never written
+        try:
+            load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
+            raise AssertionError("expected LoadError for missing image file")
+        except LoadError as exc:
+            assert "missing.jpg" in str(exc)
+        print("[PASS] test_eomt_loader_rejects_missing_images_root_file")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_native_sanity_check_detects_corrupted_stored_nme():
+    """If a file's own stored native NME doesn't match what this script
+    recomputes from that same file's own raw coordinates, load_*_per_image
+    must raise LoadError rather than silently proceeding -- this is the
+    sanity check that would have caught the original coordinate-space bug
+    immediately (feeding 512-space points into an original-space-only NME
+    computation would fail to reproduce EoMT's own stored 512-space native
+    NME, since native reproduction must stay in native space)."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        run_dir = tmp / "fetal_landmark_hrnet_w18_UCL_brain_BPD_seed42_512fixed"
+        for seed in SEEDS:
+            run_dir = tmp / f"fetal_landmark_hrnet_w18_UCL_brain_BPD_seed{seed}_512fixed"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            path = run_dir / "fixed_channel_per_image.csv"
+            fields = ["index", "filename", "pred0_x", "pred0_y", "pred1_x", "pred1_y",
+                      "gt0_x", "gt0_y", "gt1_x", "gt1_y", "reference_distance",
+                      "fixed_channel_nme", "swap_min_nme"]
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({
+                    "index": 0, "filename": "corrupt.jpg",
+                    "pred0_x": 100.0, "pred0_y": 100.0, "pred1_x": 200.0, "pred1_y": 100.0,
+                    "gt0_x": 100.0, "gt0_y": 100.0, "gt1_x": 200.0, "gt1_y": 100.0,
+                    "reference_distance": 100.0,
+                    "fixed_channel_nme": 999.0,  # deliberately wrong (true value is 0.0)
+                    "swap_min_nme": 999.0,
+                })
+        try:
+            load_hrnet_per_image(tmp, "UCL", "bpd")
+            raise AssertionError("expected LoadError for native-sanity-check mismatch")
+        except LoadError as exc:
+            assert "sanity check FAILED" in str(exc)
+        print("[PASS] test_native_sanity_check_detects_corrupted_stored_nme")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_cross_method_gt_consistency_check_detects_mismatch():
+    """Two methods reporting a different GT location for the same filename
+    (simulating a coordinate-recovery or sample-matching bug) must be
+    flagged, not silently averaged away."""
+    method_a = {
+        "gt_by_filename": {"x.jpg": ((10.0, 10.0), (90.0, 10.0))},
+        "disagree_by_filename": {"x.jpg": False},
+    }
+    method_b = {
+        "gt_by_filename": {"x.jpg": ((10.0, 10.0), (200.0, 10.0))},  # gt1 badly wrong
+        "disagree_by_filename": {"x.jpg": True},
+    }
+    warnings = cross_method_gt_consistency_check("UCL", "bpd", {"hrnet": method_a, "eomt_dinov2": method_b})
+    assert len(warnings) == 1
+    assert warnings[0]["per_image_disagreement_mismatches"] == 1
+    print("[PASS] test_cross_method_gt_consistency_check_detects_mismatch")
+
+
 def main():
     test_hrnet_loader_and_native_nme_matches_stored_value()
     test_eomt_loader_joins_order_and_coords_correctly()
+    test_eomt_loader_inverts_anisotropic_coordinate_space_correctly()
+    test_eomt_loader_rejects_missing_images_root_file()
+    test_native_sanity_check_detects_corrupted_stored_nme()
+    test_cross_method_gt_consistency_check_detects_mismatch()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")
