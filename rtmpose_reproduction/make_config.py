@@ -65,16 +65,38 @@ official recipe was copied carelessly:
     confirmed against the real config -- not a compromise specific to this
     adaptation).
 
-THIRD REVIEW ROUND (2026-08-06): the official
-rtmpose-s_8xb256-420e_coco-256x192.py was fetched and read VERBATIM
-(https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/
-body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py) to
-check a reviewer's claim that this generator had silently dropped several
-official settings -- confirmed true for some, NOT confirmed for one
-(the reviewer's claim of "gradient clipping" in the official optim_wrapper
-does not match the actual fetched file, which has no `clip_grad` key at
-all; not added here since it was never actually there to match). Full
-item-by-item table:
+THIRD REVIEW ROUND (2026-08-06): fetched
+configs/body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py
+verbatim to check a reviewer's claim that this generator had silently
+dropped several official settings. That specific file has no `clip_grad`
+key, so "gradient clipping" was (wrongly, see round 4) recorded here as
+not a real official setting.
+
+FOURTH REVIEW ROUND (2026-08-06, corrects round 3's own mistake): a
+second reviewer pointed out that MMPose's actively-maintained RTMPose
+project config lives at a DIFFERENT path,
+projects/rtmpose/rtmpose/body_2d_keypoint/rtmpose-s_8xb256-420e_coco-256x192.py
+(confirmed to exist via the GitHub contents API, last modified at commit
+`94e15226a29a7067d9bb0cb7937b86e3c3fd0c8e`), not the
+`configs/body_2d_keypoint/rtmpose/coco/` path round 3 fetched (last
+modified at a DIFFERENT commit, `a910fd4c5684b0480f561efd703635d817944568`
+-- these are two independently-maintained, diverged files with the same
+filename, not one file at two mirror locations). Fetched the
+`projects/rtmpose/` version verbatim: it DOES contain
+`clip_grad=dict(max_norm=35, norm_type=2)`. Round 3's "gradient clipping
+is not a real official setting" claim was WRONG -- it checked a stale/
+divergent copy. Fixed below. This project now treats
+`projects/rtmpose/rtmpose/body_2d_keypoint/rtmpose-s_8xb256-420e_coco-256x192.py`
+at commit `94e15226a29a7067d9bb0cb7937b86e3c3fd0c8e` as the SOLE
+authoritative source for "what does the official recipe do" -- per a
+reviewer's explicit suggestion, do not re-derive this from a floating
+`main` checkout in future sessions; if MMPose is later pinned to a
+different commit for the actual training environment (see
+ENVIRONMENT.md), diff this specific file at that commit against the
+frozen table below before trusting either source blindly.
+
+Full item-by-item table (all rows re-verified against the CORRECT
+`projects/rtmpose/` source in round 4):
 
 | Official setting | Present here? | Disposition |
 |---|---|---|
@@ -82,17 +104,19 @@ item-by-item table:
 | `backbone.expand_ratio=0.5` | was MISSING | **FIXED** -- an actual CSPNeXt architecture parameter, not cosmetic; omitting it risks the backbone's internal channel widths not matching the pretrained checkpoint's own shapes, which could silently corrupt or outright fail the weight load |
 | `backbone.norm_cfg=SyncBN` | was `BN` | **FIXED to SyncBN** to match the checkpoint's own training norm type; flagged in ENVIRONMENT.md that SyncBN may need `torch.distributed` initialised even for a single-GPU run depending on the installed MMEngine/MMCV version -- confirm live, fall back to BN with a recorded justification if SyncBN errors out single-process |
 | `backbone.act_cfg` extra `inplace=True` | present, official has none | **FIXED** -- removed for exact fidelity (does not change weight shapes, low risk, but no reason to diverge) |
+| `optim_wrapper.clip_grad=dict(max_norm=35, norm_type=2)` | was MISSING | **FIXED in round 4** -- round 3 wrongly recorded this as not a real official setting after checking the wrong file path (see above); this is a real official optimizer setting, now matched |
 | `optim_wrapper.paramwise_cfg` (zero weight decay on norm/bias) | was MISSING | **FIXED** -- matched, no dataset-scale-dependent reason to omit it |
-| Cosine LR starting at `max_epochs // 2` | was starting at epoch 0 | **FIXED** -- now starts at `max_epochs // 2` proportionally, preserving the official recipe's warmup-then-half-cosine shape at whatever `max_epochs` this project uses |
-| `auto_scale_lr=dict(base_batch_size=1024)` | MISSING | **DELIBERATELY NOT ADDED** -- only takes effect via an explicit `--auto-scale-lr` CLI flag (not automatic from the config alone), and this project's `base_lr` was never tuned as a linear-scaling assumption from batch=1024; our batch_size (16, dataset-scale-appropriate) differs from official's 256 by design, not by oversight |
-| `custom_hooks: EMAHook` | MISSING | **DELIBERATELY NOT ADDED** -- this project's own EMA investigation for EoMT found "insufficient clean evidence either way" (thesis Ch5 ablation), so adding EMA to RTMPose alone, without it being part of the shared cross-method recipe, would be a new, unreviewed asymmetry, not a neutral fidelity fix |
+| `base_lr=4e-3` used directly at `batch_size=16` | official's `4e-3` is paired with `train_batch_size=256` and `auto_scale_lr=dict(base_batch_size=1024)` (8 GPUs x 256) | **FIXED in round 4 (real methodological risk, not just a fidelity gap)**: using the official LR unscaled at a batch size 64x smaller than official's base_batch_size risked severe training instability. `base_lr` is now computed as `4e-3 * (batch_size / 1024)` -- for this project's `batch_size=16`, that is `6.25e-5`. `auto_scale_lr` is deliberately NOT also added to the generated config to avoid double-scaling if `--auto-scale-lr` is ever passed to `tools/train.py`; the scaling is applied once, explicitly, in this file, and the resulting `base_lr` is recorded in the generated config's own comment. |
+| Cosine LR starting at `max_epochs // 2` | was starting at epoch 0, AND (round 4 finding) overlapped the 1000-iteration LinearLR warmup for this project's tiny datasets | **FIXED in round 4**: for a ~100-image internal-train split at `batch_size=16` (~7 iterations/epoch), the official recipe's fixed `end=1000` warmup would still be running past iteration 700 (`epoch_100 * 7`), the point at which a naive proportional `max_epochs // 2` cosine-begin would already have started -- warmup and cosine would overlap, which the official recipe's own numbers (`begin=1000` iterations vs `cosine begin=210 epochs * ~460 iterations/epoch ~= 96,600` iterations) never risk. `make_config()` now reads the ACTUAL internal-train COCO json's image count, computes real `iterations_per_epoch`, and sets the LinearLR warmup to `min(1000, cosine_begin_iters // 2)` -- asserting `warmup_end_iters < cosine_begin_iters` and raising loudly if this is somehow still violated, rather than silently reusing official's fixed 1000. |
+| `custom_hooks: EMAHook` | MISSING | **KEPT NOT ADDED, reframed in round 4**: round 3 justified this by citing EoMT's own EMA findings, which a reviewer correctly pointed out is not valid evidence for RTMPose (a structurally different model/training setup) -- EoMT's EMA result says nothing about whether RTMPose specifically benefits from EMA. The real, honest framing is a SCOPE decision: the canary and initial runs use the raw final checkpoint deliberately, to keep one fewer moving part while validating the adapter end-to-end; this must be described in any writeup as "RTMPose-s architecture trained under this project's common fetal protocol," NOT as "the official RTMPose-s recipe" or "an RTMPose-s reproduction," precisely because EMA (and the stage-2 switch, and the native augmentation) are official-recipe components this project does not use. Revisit EMA with a real seed-42 raw-vs-EMA diagnostic if the canary's own numbers motivate it -- do not decide this from EoMT's unrelated result. |
 | `custom_hooks: PipelineSwitchHook` (stage-2 augmentation cooldown) | MISSING | **DELIBERATELY NOT ADDED** -- the official stage-2 switch reduces the OFFICIAL RandomBBoxTransform's own scale/rotate ranges; this project already replaces that whole augmentation with EoMT/HRNet-matched values (PROTOCOL_LOCKED.md), so there is no equivalent "official range" to cool down between two stages |
-| `max_epochs=420` | is 200 (configurable) | **KEPT at 200, documented, not silently accidental** -- 420 epochs was tuned for COCO's ~118k training images; this project's fetal datasets are 2-3 orders of magnitude smaller (Train ~100-1600 images per task), so a directly-copied epoch count has no principled basis either way. 200 is this project's own choice, adjustable via `--max-epochs`, not a claimed replication of the official schedule. |
-| Pretrained checkpoint's own `checkpoint=` field | was a hardcoded URL | **FIXED (blocking issue)**: `model.init_weights()` would have loaded from this URL, completely independent of whatever local file `record_run_provenance.py` was separately hashing -- meaning the recorded SHA-256 was never guaranteed to correspond to the actual weights loaded into the model. `make_config()` now REQUIRES a local `pretrained_checkpoint_path` and embeds THAT path as `init_cfg.checkpoint`, so the file that gets loaded and the file that gets hashed/diffed are, by construction, the same file. |
+| `max_epochs=420` | is 200 (configurable) | **KEPT at 200, documented, not silently accidental** -- 420 epochs was tuned for COCO's ~118k training images; this project's fetal datasets are 2-3 orders of magnitude smaller (Train ~100-1600 images per task), so a directly-copied epoch count has no principled basis either way. 200 is this project's own choice, adjustable via `--max-epochs` -- MUST be justified by the canary's own train/val convergence curve, not asserted a priori, per a reviewer's explicit requirement. |
+| Pretrained checkpoint's own `checkpoint=` field | was a hardcoded URL | **FIXED (blocking issue)**: `model.init_weights()` would have loaded from this URL, completely independent of whatever local file `record_run_provenance.py` was separately hashing. `make_config()` now REQUIRES a local `pretrained_checkpoint_path` (resolved to an absolute path before being embedded, so the generated config is not sensitive to the working directory it was generated from) and embeds THAT path as `init_cfg.checkpoint`, so the file that gets loaded and the file that gets hashed/diffed are, by construction, the same file. |
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT_URL = (
@@ -319,20 +343,51 @@ test_cfg = dict()
 
 optim_wrapper = dict(
     type="OptimWrapper",
-    optimizer=dict(type="AdamW", lr=4e-3, weight_decay=0.0),
-    # Matches the official recipe's paramwise_cfg exactly -- was missing;
-    # no dataset-scale-dependent reason to omit this.
+    # base_lr is ALREADY linearly scaled from the official recipe's
+    # base_lr=4e-3 at base_batch_size=1024 (8 GPUs x train_batch_size=256)
+    # down to this project's actual batch_size={batch_size}: 4e-3 *
+    # ({batch_size}/1024) = {scaled_lr!r}. Fixed round 4 (real methodological
+    # risk, not just fidelity): using the official 4e-3 unscaled at a batch
+    # size 64x smaller than official's base_batch_size risked severe
+    # training instability. Deliberately NOT also adding auto_scale_lr to
+    # this config -- if `--auto-scale-lr` were ever passed to
+    # tools/train.py on top of an already-scaled base_lr, it would scale
+    # TWICE. The scaling is applied exactly once, here, explicitly.
+    optimizer=dict(type="AdamW", lr={scaled_lr!r}, weight_decay=0.0),
+    # Matches the official recipe exactly -- both were missing. clip_grad
+    # was wrongly recorded as "not a real official setting" in round 3
+    # (checked a stale/divergent config path by mistake, see module
+    # docstring) -- fixed in round 4 after a reviewer caught this using the
+    # correct projects/rtmpose/ source.
+    clip_grad=dict(max_norm=35, norm_type=2),
     paramwise_cfg=dict(norm_decay_mult=0, bias_decay_mult=0, bypass_duplicate=True),
 )
-# Cosine annealing now starts at max_epochs // 2, matching the official
-# recipe's own proportional shape (there: begin=210 of max_epochs=420) --
-# was previously starting at epoch 0, overlapping the LinearLR warmup
-# entirely and not matching the official schedule's shape at all.
-_cosine_begin = {max_epochs} // 2
+# Cosine annealing begins at max_epochs // 2 in EPOCH units (MMEngine
+# converts this to iterations at runtime using the actual dataloader
+# length) -- matches the official recipe's own proportional shape (there:
+# begin=210 of max_epochs=420). The LinearLR warmup below is fixed in
+# ITERATION units by the official recipe (end=1000) regardless of dataset
+# size; for this project's much smaller datasets that fixed value can
+# still be RUNNING past the point cosine annealing has already started
+# (round 4 finding, verified against the actual internal-train image count
+# below, not assumed) -- e.g. ~100 images at batch_size=16 gives ~7
+# iterations/epoch, so cosine's epoch-100 begin converts to ~700 iterations,
+# LESS than the official recipe's fixed 1000-iteration warmup end. Fixed:
+# warmup_end_iters is capped below 1000 AND below half of cosine's actual
+# begin-iteration, computed from the real internal-train COCO json image
+# count, with an explicit assertion this project's own driver script can
+# rely on rather than silently overlapping the two schedulers.
+warmup_end_iters = {warmup_end_iters}
+cosine_begin_epoch = {max_epochs} // 2
+assert warmup_end_iters < cosine_begin_epoch * {iters_per_epoch}, (
+    "LinearLR warmup would still be running when CosineAnnealingLR begins -- "
+    "recompute warmup_end_iters/cosine_begin_epoch for this dataset size."
+)
 param_scheduler = [
-    dict(type="LinearLR", start_factor=1e-5, by_epoch=False, begin=0, end=1000),
-    dict(type="CosineAnnealingLR", eta_min=0.0002, begin=_cosine_begin, end={max_epochs},
-         T_max={max_epochs} - _cosine_begin, by_epoch=True, convert_to_iter_based=True),
+    dict(type="LinearLR", start_factor=1e-5, by_epoch=False, begin=0, end=warmup_end_iters),
+    dict(type="CosineAnnealingLR", eta_min={scaled_lr!r} * 0.05, begin=cosine_begin_epoch,
+         end={max_epochs}, T_max={max_epochs} - cosine_begin_epoch,
+         by_epoch=True, convert_to_iter_based=True),
 ]
 
 # CORRECTED 2026-08-06 (review finding): save_best="PCK" removed entirely --
@@ -373,22 +428,62 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
     gets embedded as the backbone's `init_cfg.checkpoint`, so the weights
     `model.init_weights()` actually loads and the file
     `record_run_provenance.py` hashes/diffs are, by construction, the same
-    file (see this file's own module docstring for the leak this closes)."""
-    if not Path(pretrained_checkpoint_path).is_file():
+    file (see this file's own module docstring for the leak this closes).
+    Resolved to an absolute path (round 4 fix) so the generated config is
+    not sensitive to whatever working directory it happened to be
+    generated from."""
+    ckpt_path = Path(pretrained_checkpoint_path).resolve()
+    if not ckpt_path.is_file():
         raise SystemExit(
             f"ERROR: --pretrained-checkpoint-path does not exist: "
             f"{pretrained_checkpoint_path}. Download it first (see "
             f"ENVIRONMENT.md) -- refusing to embed a checkpoint path into "
             f"the config that init_weights() cannot actually load from."
         )
+
+    # Real LR scaling (round 4 fix): official base_lr=4e-3 is paired with
+    # a base_batch_size of 1024 (auto_scale_lr in the official recipe);
+    # applying it unscaled at this project's much smaller batch_size risks
+    # severe instability. Scaled once, explicitly, here.
+    scaled_lr = 4e-3 * (batch_size / 1024.0)
+
+    # Real warmup/cosine-overlap fix (round 4): read the ACTUAL internal-train
+    # COCO json's image count (already converted by the time make_config.py
+    # runs in run_rtmpose_canary.sh) to compute real iterations/epoch, rather
+    # than assuming the official recipe's fixed 1000-iteration warmup is
+    # safe at any dataset size.
+    internal_train_path = Path(internal_train_ann)
+    if not internal_train_path.is_file():
+        raise SystemExit(
+            f"ERROR: --internal-train-ann does not exist yet: {internal_train_ann}. "
+            f"Run convert_csv_to_coco.py for the internal-train split BEFORE "
+            f"make_config.py -- the warmup/cosine schedule below needs the "
+            f"real image count, not an assumption."
+        )
+    n_train_images = len(json.loads(internal_train_path.read_text(encoding="utf-8"))["images"])
+    iters_per_epoch = max(1, -(-n_train_images // batch_size))  # ceil division
+    cosine_begin_iters = (max_epochs // 2) * iters_per_epoch
+    warmup_end_iters = min(1000, max(1, cosine_begin_iters // 2))
+    if warmup_end_iters >= cosine_begin_iters:
+        raise SystemExit(
+            f"ERROR: computed warmup_end_iters ({warmup_end_iters}) >= "
+            f"cosine_begin_iters ({cosine_begin_iters}) for n_train_images="
+            f"{n_train_images}, batch_size={batch_size}, max_epochs={max_epochs} "
+            f"-- the LinearLR warmup would still be running when "
+            f"CosineAnnealingLR begins. Adjust batch_size/max_epochs or "
+            f"revisit this formula, do not generate an overlapping schedule."
+        )
+
     text = TEMPLATE.format(
         dataset=dataset, task=task, seed=seed,
         repo_root=repo_root or str(Path(__file__).resolve().parent),
-        backbone_checkpoint=str(pretrained_checkpoint_path),
+        backbone_checkpoint=str(ckpt_path),
         data_root=data_root, images_dir=images_dir,
         internal_train_ann=internal_train_ann, internal_val_ann=internal_val_ann,
         test_ann=test_ann,
         batch_size=batch_size, max_epochs=max_epochs, val_interval=val_interval,
+        scaled_lr=scaled_lr, iters_per_epoch=iters_per_epoch,
+        warmup_end_iters=warmup_end_iters,
         work_dir=work_dir,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)

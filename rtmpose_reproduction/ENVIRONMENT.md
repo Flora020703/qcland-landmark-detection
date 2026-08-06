@@ -29,6 +29,25 @@ freeze it: `git checkout <that commit hash>` in future invocations, and
 record the hash next to every result (mirrors the HRNet driver's own
 `EXPECTED_COMMIT` hard-check pattern in `run_hrnet_512_fixed_5seed.sh`).
 
+**Pin the "official recipe" source file, not just the MMPose commit**
+(round 4 finding, real not hypothetical): MMPose's repo contains TWO
+different, independently-maintained files both named
+`rtmpose-s_8xb256-420e_coco-256x192.py` --
+`configs/body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py`
+(no `clip_grad`, last touched at commit `a910fd4c5684b0480f561efd703635d817944568`)
+and `projects/rtmpose/rtmpose/body_2d_keypoint/rtmpose-s_8xb256-420e_coco-256x192.py`
+(HAS `clip_grad=dict(max_norm=35, norm_type=2)`, last touched at commit
+`94e15226a29a7067d9bb0cb7937b86e3c3fd0c8e`) -- a round-3 review checked the
+former and wrongly concluded gradient clipping wasn't a real official
+setting; a round-4 review caught this. **This project treats the
+`projects/rtmpose/` path as the sole authoritative "official recipe"
+source** (it is MMPose's own actively-maintained, dedicated RTMPose
+project directory). If re-deriving "what does official do" in a future
+session, fetch that exact path, at the exact commit you have installed
+(`git log -1 --format=%H -- projects/rtmpose/rtmpose/body_2d_keypoint/rtmpose-s_8xb256-420e_coco-256x192.py`
+inside the installed checkout), and do not assume the `configs/` path is
+equivalent or up to date.
+
 ## Download the pretrained backbone checkpoint locally (required)
 
 `record_run_provenance.py` now REQUIRES a local file path (not just the

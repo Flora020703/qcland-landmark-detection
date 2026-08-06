@@ -31,16 +31,36 @@ Round 2 also only checked that loaded values differed from their
 PRE-init-weights (random) state, not that they matched the checkpoint's
 OWN values -- a weaker claim than "the checkpoint was correctly loaded."
 
-Fixed now: (a) `make_config.py` was changed to embed the LOCAL checkpoint
+Fixed then: (a) `make_config.py` was changed to embed the LOCAL checkpoint
 path directly as `init_cfg.checkpoint` (see that file's own docstring), so
 this script can assert `cfg.model["backbone"]["init_cfg"]["checkpoint"] ==
-str(args.pretrained_checkpoint_path)` and fail loudly if they ever diverge
--- the file that gets loaded and the file that gets hashed are now
-guaranteed the same file, checked, not assumed; (b) every expected backbone
-key's post-`init_weights()` VALUE is now compared for exact equality
-against the checkpoint's OWN tensor (not just "changed from random init"),
-and EVERY key must match (missing, unexpected, or value-mismatched keys
-are ALL now fatal, not just "zero keys matched").
+str(args.pretrained_checkpoint_path)` and fail loudly if they ever diverge;
+(b) every expected backbone key's post-`init_weights()` VALUE is compared
+against the checkpoint's OWN tensor.
+
+CORRECTED 2026-08-06, round 4 (review finding -- round 3's own value
+comparison was weaker than it claimed to be): round 3 said "exact
+equality" but actually used `torch.allclose(..., atol=1e-6)`, a numerical-
+tolerance comparison, not a true exact match -- misleading given the config
+fix guarantees the loaded file and the audited file are literally the same
+file, so the correct comparison IS bit-exact equality, not "close enough."
+Round 3 also computed `unexpected_in_checkpoint` but never made it fatal,
+so a reviewer's own reading of the code ("any extra key would be caught")
+did not match what the code actually did. Round 3's "unchanged from
+random init" check additionally iterated ALL of `state_dict()`, including
+BN running_mean/running_var/num_batches_tracked buffers, some of which can
+legitimately hold the same value under both a fresh init and a real
+checkpoint (e.g. `num_batches_tracked=0` immediately after construction),
+risking a false failure unrelated to whether loading actually worked.
+
+Fixed now: (a) exact-value comparison uses `torch.equal()` (after casting
+the checkpoint's tensor to the model parameter's own dtype, so a
+fp16-stored checkpoint loaded into an fp32 model is still compared
+correctly -- an exact upcast, not a lossy one); (b) `unexpected_in_checkpoint`
+is now genuinely fatal, not just recorded; (c) the "unchanged from random
+init" check is removed entirely -- the exact-value-vs-checkpoint check
+already fully verifies correctness on its own and does not need this
+weaker, buffer-confounded secondary check.
 
 NEEDS LIVE MMPOSE (same tier as transforms.py/make_config.py) -- writes a
 JSON artifact, not just a printed report, so it becomes part of the
@@ -113,16 +133,7 @@ def main():
         )
 
     model = MODELS.build(cfg.model)
-
-    # Snapshot backbone weights BEFORE init_weights(), so we can also confirm
-    # by direct comparison that values actually changed (not just that keys
-    # matched by name) -- catches the case where init_weights() silently
-    # no-ops but key names still happen to line up.
-    pre_init_backbone_state = {k: v.detach().clone()
-                                for k, v in model.backbone.state_dict().items()}
-
     model.init_weights()
-
     post_init_backbone_state = model.backbone.state_dict()
 
     # Independently load the checkpoint's own state dict and diff it against
@@ -143,21 +154,22 @@ def main():
     missing_from_checkpoint = sorted(backbone_param_keys - ckpt_backbone_keys)
     unexpected_in_checkpoint = sorted(ckpt_backbone_keys - backbone_param_keys)
 
-    # CLOSES THE ROUND-2 GAP: compare the loaded VALUES against the
-    # checkpoint's OWN tensors for exact equality (not merely "differs from
-    # the pre-init random state", which only proves *something* loaded, not
-    # that the CORRECT thing loaded). Since round 3's fix above guarantees
-    # the config's checkpoint path and this script's checkpoint path are the
-    # same file, an exact match here is the real, closed-loop verification.
+    # CLOSES THE ROUND-2 GAP, TIGHTENED IN ROUND 4: compare the loaded
+    # VALUES against the checkpoint's OWN tensors for TRUE exact equality
+    # (torch.equal, not torch.allclose -- round 3's "exact" claim was
+    # actually a numerical-tolerance comparison, a real precision gap a
+    # reviewer caught). Since the config-path assertion above guarantees
+    # the config's checkpoint path and this script's checkpoint path are
+    # the same file, this must be a bit-exact match, not "close enough" --
+    # the only legitimate reason for ANY difference would be a dtype
+    # upcast (e.g. fp16 checkpoint into an fp32 model), so the checkpoint
+    # tensor is cast to the model parameter's own dtype (a lossless
+    # upcast, not a lossy rounding) before comparing.
     value_mismatches = [
         k for k in loaded_keys
         if post_init_backbone_state[k].shape != ckpt_backbone_state[k].shape
-        or not torch.allclose(post_init_backbone_state[k].float(),
-                               ckpt_backbone_state[k].float(), atol=1e-6)
-    ]
-    unchanged_from_random_init = [
-        k for k in loaded_keys
-        if torch.equal(pre_init_backbone_state[k], post_init_backbone_state[k])
+        or not torch.equal(post_init_backbone_state[k],
+                            ckpt_backbone_state[k].to(post_init_backbone_state[k].dtype))
     ]
 
     if missing_from_checkpoint:
@@ -167,21 +179,24 @@ def main():
             f"{prefix!r}): {missing_from_checkpoint[:10]}{'...' if len(missing_from_checkpoint) > 10 else ''} "
             f"-- refusing to proceed with a partially-initialised backbone."
         )
+    if unexpected_in_checkpoint:
+        # CORRECTED round 4: this used to be computed and recorded but
+        # never actually raised -- a reviewer caught that the code did not
+        # match its own documented claim ("any extra key would be caught").
+        raise SystemExit(
+            f"ERROR: {len(unexpected_in_checkpoint)} checkpoint key(s) (after "
+            f"stripping prefix {prefix!r}) have no matching backbone parameter: "
+            f"{unexpected_in_checkpoint[:10]}{'...' if len(unexpected_in_checkpoint) > 10 else ''} "
+            f"-- this checkpoint may not actually be a CSPNeXt-s backbone, or "
+            f"the configured prefix is wrong."
+        )
     if value_mismatches:
         raise SystemExit(
             f"ERROR: {len(value_mismatches)} backbone parameter(s) do not "
             f"exactly match the checkpoint's own values after init_weights() "
-            f"(shape mismatch or numerical difference > 1e-6): "
+            f"(shape mismatch or non-bit-exact value): "
             f"{value_mismatches[:10]}{'...' if len(value_mismatches) > 10 else ''} "
             f"-- init_weights() did not load this checkpoint correctly."
-        )
-    if unchanged_from_random_init:
-        raise SystemExit(
-            f"ERROR: {len(unchanged_from_random_init)} backbone parameter(s) "
-            f"are unchanged from their pre-init_weights() random state despite "
-            f"matching the checkpoint by name and value (a checkpoint whose "
-            f"values happen to equal a fresh random init is implausible for a "
-            f"real pretrained CSPNeXt-s) -- investigate before trusting this run."
         )
 
     head_param_keys = {k for k, _ in model.head.named_parameters()}
@@ -217,12 +232,11 @@ def main():
         "backbone_keys_missing_from_checkpoint": missing_from_checkpoint,
         "backbone_keys_unexpected_in_checkpoint": unexpected_in_checkpoint,
         "backbone_keys_value_mismatch_vs_checkpoint": value_mismatches,
-        "backbone_keys_unchanged_from_random_init": unchanged_from_random_init,
         "verified_pretrained_load_actually_happened": (
             len(loaded_keys) > 0
             and not missing_from_checkpoint
+            and not unexpected_in_checkpoint
             and not value_mismatches
-            and not unchanged_from_random_init
         ),  # would have raised above if False -- this field documents the
             # closed-loop check, not just an assumption
         "head_keys_unexpectedly_found_in_checkpoint": head_keys_present_in_checkpoint,

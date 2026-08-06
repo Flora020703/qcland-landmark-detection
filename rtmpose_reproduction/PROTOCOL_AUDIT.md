@@ -352,15 +352,17 @@ are all now individually fatal, not just "zero keys matched at all."
 
 ### 2. Generated config was missing several real (verified, not assumed) official-recipe settings
 
-The reviewer's list of missing official settings was checked against the
-ACTUAL official config, fetched verbatim
-(`https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/
-body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py`), not
+**SUPERSEDED by round 4, see below -- kept for the record, not deleted.**
+The reviewer's list of missing official settings was checked against
+`https://raw.githubusercontent.com/open-mmlab/mmpose/main/configs/
+body_2d_keypoint/rtmpose/coco/rtmpose-s_8xb256-420e_coco-256x192.py`, not
 accepted at face value -- one item in the reviewer's list ("gradient
-clipping") does NOT appear in the actual fetched file at all (no
-`clip_grad` key anywhere in its `optim_wrapper`), so it was NOT added here;
-citing an unverified claim back into this document would have been exactly
-the mistake this whole audit process exists to catch.
+clipping") appeared NOT to be present in that fetched file. **This
+correction was itself wrong**: that file path is a stale/divergent copy;
+MMPose's actual actively-maintained RTMPose project config lives at a
+DIFFERENT path (`projects/rtmpose/rtmpose/body_2d_keypoint/
+rtmpose-s_8xb256-420e_coco-256x192.py`) and DOES contain
+`clip_grad=dict(max_norm=35, norm_type=2)` -- see round 4.
 
 Verified-real gaps, fixed:
 - `backbone._scope_="mmdet"` -- was missing; CSPNeXt is registered under
@@ -463,3 +465,164 @@ the supervisor until: (a) the environment checklist is fully green, (b)
 the visual-overlay audit passes, and (c) ideally, the supervisor's reply on
 endpoint-ordering has been received -- environment setup and dry
 construction can proceed in parallel with waiting for that reply.
+
+## Fourth-round review: round 3's own official-config fetch was from the wrong path, plus a real LR/scheduler risk and provenance-precision gaps
+
+### 1. Round 3's "gradient clipping is not official" correction was itself wrong
+
+A second reviewer pointed out that MMPose's repository contains TWO
+different, independently-maintained files both named
+`rtmpose-s_8xb256-420e_coco-256x192.py`:
+`configs/body_2d_keypoint/rtmpose/coco/...` (round 3's source, last
+touched at commit `a910fd4c5684b0480f561efd703635d817944568`, no
+`clip_grad` key) and `projects/rtmpose/rtmpose/body_2d_keypoint/...`
+(MMPose's own dedicated, actively-maintained RTMPose project directory,
+last touched at commit `94e15226a29a7067d9bb0cb7937b86e3c3fd0c8e`). Fetched
+the `projects/rtmpose/` version verbatim -- it DOES contain
+`clip_grad=dict(max_norm=35, norm_type=2)`. Round 3's correction of the
+original reviewer's claim was itself the error, caught by checking a
+second, more authoritative source rather than stopping at the first
+fetch that seemed to settle the question.
+
+**Fixed**: `optim_wrapper.clip_grad=dict(max_norm=35, norm_type=2)` added
+to the generated config. `ENVIRONMENT.md` now explicitly documents that
+`projects/rtmpose/` is this project's chosen authoritative source (with
+both paths' commit hashes recorded) so a future session doesn't have to
+re-derive this distinction, and doesn't accidentally check the other path
+again.
+
+### 2. Real methodological risk: official base_lr=4e-3 used unscaled at a 64x-smaller batch size
+
+The official recipe's `base_lr=4e-3` is explicitly paired with
+`auto_scale_lr=dict(base_batch_size=1024)` (8 GPUs x 256). This project's
+generated config used `lr=4e-3` directly at `batch_size=16` -- a 64x
+smaller batch with no corresponding LR reduction, which is not a neutral
+scope decision but a real risk of training instability (too-large an
+effective step size per gradient update relative to the batch's own noise
+level). The previous framing ("this project's base_lr was never tuned as
+a linear-scaling assumption from batch=1024") accurately described the
+gap but incorrectly treated it as low-risk.
+
+**Fixed**: `base_lr` is now computed as `4e-3 * (batch_size / 1024)` inside
+`make_config()`, giving `6.25e-5` at this project's `batch_size=16`,
+applied explicitly and once. `auto_scale_lr` is deliberately NOT also
+added to the generated config -- if `--auto-scale-lr` were ever passed to
+`tools/train.py` on top of an already-scaled `base_lr`, the LR would be
+scaled twice. The scaled value is recorded directly in the generated
+config's own comment, not left implicit.
+
+### 3. Real scheduler-overlap risk on small datasets
+
+The official recipe's `LinearLR` warmup is fixed at `end=1000` iterations
+regardless of dataset size, and `CosineAnnealingLR` begins at
+`max_epochs // 2` in EPOCH units (converted to iterations by MMEngine at
+runtime using the actual dataloader length). For COCO (~118k train images,
+~460 iterations/epoch at official batch_size=256), 1000 iterations is a
+small fraction of the ~96,600 iterations at which cosine begins -- no
+overlap. For this project's UCL BPD internal-train split (100 images,
+`batch_size=16`, ~7 iterations/epoch), cosine begins at epoch 100 = ~700
+iterations, LESS than the fixed 1000-iteration warmup -- the two schedulers
+would genuinely overlap, which a naive "keep the official recipe's shape
+proportionally" fix (round 3's own `max_epochs // 2` change) did not
+address, since it only touched the EPOCH-based cosine begin, not the
+iteration-based warmup end.
+
+**Fixed**: `make_config()` now reads the ACTUAL internal-train COCO json's
+image count (produced by `convert_csv_to_coco.py` before `make_config.py`
+runs in `run_rtmpose_canary.sh`), computes the real `iterations_per_epoch`,
+and sets `warmup_end_iters = min(1000, cosine_begin_iters // 2)`. The
+generated config embeds an explicit `assert warmup_end_iters <
+cosine_begin_epoch * iters_per_epoch` that runs at config-load time (before
+any GPU work), and `make_config()` itself also raises loudly at generation
+time if the computed values would violate this -- two independent points
+where an overlapping schedule cannot silently pass through. Verified by
+generating a config against a realistic 100-image internal-train json:
+`iters_per_epoch=7`, `cosine_begin_iters=700`, `warmup_end_iters=350`,
+assertion holds; the generated config was executed directly (not just
+`py_compile`d) and the assertion passed before hitting the expected
+`cv2`/`mmcv` import boundary.
+
+### 4. Provenance-verification precision gaps (round 3's own claims didn't fully match its own code)
+
+Three real gaps found by re-reading round 3's `record_run_provenance.py`
+against what it actually does, not just what its comments claimed:
+- Documented as "EXACT" value comparison, but implemented with
+  `torch.allclose(..., atol=1e-6)` -- a numerical-tolerance comparison, not
+  a true exact match. Since the config-path assertion guarantees the
+  loaded file and the audited file are literally the same file, the
+  correct comparison is bit-exact. **Fixed**: switched to `torch.equal()`,
+  with the checkpoint tensor cast to the model parameter's own dtype first
+  (a lossless upcast for e.g. a stored-fp16 checkpoint into an fp32 model,
+  not a lossy rounding).
+- `unexpected_in_checkpoint` was computed and included in the output JSON,
+  but never actually raised as fatal -- the surrounding documentation's
+  claim that "any extra key would be caught" did not match the code.
+  **Fixed**: now genuinely fatal.
+- The "unchanged from random init" check iterated the ENTIRE
+  `state_dict()`, including BN `running_mean`/`running_var`/
+  `num_batches_tracked` buffers, some of which can legitimately be
+  identical between a fresh init and a real checkpoint (e.g.
+  `num_batches_tracked=0` right after construction) -- a false-failure
+  risk unrelated to whether loading actually worked. **Fixed**: removed
+  entirely, since the exact-value-vs-checkpoint check already fully
+  verifies correctness on its own without this weaker, buffer-confounded
+  secondary check.
+- Also fixed (a smaller, defensive improvement, not a bug report):
+  `pretrained_checkpoint_path` is now `.resolve()`d to an absolute path
+  before being embedded in the generated config, so the config is not
+  sensitive to the working directory it happened to be generated from.
+
+### 5. EMA framing corrected
+
+Round 3 justified not adding `EMAHook` by citing this project's OWN EMA
+investigation for EoMT ("insufficient clean evidence either way"). A
+reviewer correctly pointed out this is not valid evidence for RTMPose --
+EoMT and RTMPose are structurally different models with different training
+setups; a finding about EMA's effect on EoMT says nothing about whether
+RTMPose specifically benefits from EMA (which IS part of RTMPose's own
+official recipe, unlike stage-2 pipeline switching or `auto_scale_lr`,
+which have direct substitutes or dependencies already addressed elsewhere
+in this project). **Corrected framing**: not using EMA for the canary and
+initial runs is a SCOPE decision (fewer moving parts while validating the
+adapter end-to-end), not a claim that RTMPose doesn't need EMA. Any writeup
+of these results must describe the model as "RTMPose-s architecture
+trained under this project's common fetal training protocol," never as
+"the official RTMPose-s recipe" or "an RTMPose-s reproduction" -- EMA, the
+stage-2 augmentation switch, and the native RTMPose augmentation are all
+official-recipe components this project deliberately does not use. Revisit
+EMA with an actual seed-42 raw-vs-EMA diagnostic on this project's own data
+if the canary's results motivate it; do not decide this from EoMT's
+unrelated result.
+
+## Status after the fourth round
+
+Not yet run against a live install (still no MMPose environment available
+this session). Newly true:
+
+- The official-recipe source is now pinned to a specific file path AND
+  commit (`projects/rtmpose/rtmpose/body_2d_keypoint/
+  rtmpose-s_8xb256-420e_coco-256x192.py` @ `94e15226a29a7067d9bb0cb7937b86e3c3fd0c8e`),
+  not re-derived from a floating `main` checkout or an unverified second
+  path every time the question comes up.
+- `clip_grad` matches the real official setting.
+- The learning rate is explicitly, correctly scaled for this project's
+  actual batch size, not copied unscaled from a 64x-larger official batch.
+- The warmup/cosine schedule cannot silently overlap for small datasets --
+  computed from the real image count, asserted at both generation time and
+  config-load time.
+- Provenance verification is now genuinely exact (not tolerance-based) and
+  genuinely enforces every claimed check (unexpected keys included).
+- EMA's omission is now framed as a scope decision, not (mis)supported by
+  an unrelated EoMT finding -- and any results writeup must name the model
+  precisely ("architecture under this project's protocol," not "official
+  reproduction").
+
+Unchanged, still blocking: install MMPose, confirm `SyncBN` builds
+single-GPU, run the full non-square + SimCC-codec round trip, resolve the
+EoMT-vs-HRNet/RTMPose endpoint-ordering question with the supervisor. Given
+four review rounds have each found real, distinct issues the previous
+round missed or introduced, a fifth pass focused specifically on the parts
+of this adapter that have NOT yet been independently re-checked (the
+augmentation item-by-item table, `convert_csv_to_coco.py`, `dod_vectors.py`)
+would be a reasonable use of time before the actual server run, though the
+core blockers this round found are now addressed.
