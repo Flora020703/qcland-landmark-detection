@@ -65,6 +65,11 @@ echo "=== [3/5] generate the canary config ==="
   --work-dir "$WORK_DIR" \
   --out "$CONFIG_PATH"
 
+echo "=== [3b/5] record pretrained-weight provenance + actual parameter counts ==="
+"$PY" record_run_provenance.py \
+  --config "$CONFIG_PATH" \
+  --out-json "$ARTIFACT_ROOT/UCL_BPD_seed42_canary_provenance.json"
+
 echo "=== [4/5] train (this is the canary -- one run, watched, not backgrounded) ==="
 MMPOSE_TRAIN_TOOL="${MMPOSE_TRAIN_TOOL:?set MMPOSE_TRAIN_TOOL to the installed mmpose repo's tools/train.py path}"
 "$PY" "$MMPOSE_TRAIN_TOOL" "$CONFIG_PATH" --work-dir "$WORK_DIR"

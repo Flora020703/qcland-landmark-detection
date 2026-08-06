@@ -94,6 +94,19 @@ and near-vertical endpoint pairs and prove that:
 3. fixed-channel NME is never smaller than swap-min NME for the same sample;
 4. flip plus inverse flip preserves the canonical endpoint identities.
 
+**Update, 2026-08-06**: item 4 above was audited with real code and real
+data (`audit_flip_order_stability.py`) before the canary, per this
+project's own review process, and the FIRST implementation of this gate
+failed it -- a static `flip_indices` setting silently mislabelled ~100% of
+UCL OFD/APAD/FL training samples under flip (0.0-0.2% for BPD/TAD, whose
+DOD direction happens to be near-vertical). Fixed via
+`fetal_augment.sequential_train_augment` / `transforms.FetalTrainAugment`,
+which re-derives the DOD projection after every accepted flip/rotation
+instead of assuming a fixed swap/no-swap rule. Full writeup:
+`PROTOCOL_AUDIT.md`. This is the concrete lesson behind this file's own
+instruction above ("must be audited... before any training") -- audit
+against real code and real data, not by name/analogy alone.
+
 ## Mandatory canary
 
 The first and only canary is **UCL BPD, seed 42**.  It must stop after training

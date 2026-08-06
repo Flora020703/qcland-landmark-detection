@@ -1,32 +1,32 @@
 """MMPose dataset metainfo for the two-endpoint fetal measurement task.
 
-`swap=''` on both keypoints (rather than pointing each at the other) is a
-deliberate choice, not an oversight: it tells MMPose's flip augmentation to
-mirror each keypoint's x-coordinate WITHOUT swapping which channel holds
-which point (matching flip_indices=[0, 1], the identity mapping). This
-reproduces the audited upstream HRNet behaviour (`_flip_x_only` in
-lib/datasets/fetal.py, used whenever DOD/REASSIGN is enabled) rather than
-the "swap paired left/right keypoint" convention COCO's own body keypoints
-use -- our two endpoints have no persistent left/right anatomical identity
-(thesis Chapter 3, sec:method-formulation); the frozen DOD direction vector
-(dod_vectors.py), not the flip transform, is what determines channel
-identity.
+`swap=''` on both keypoints (rather than pointing each at the other) means
+our two endpoints have no persistent left/right anatomical identity (thesis
+Chapter 3, sec:method-formulation) -- unlike the "swap paired left/right
+keypoint" convention COCO's own body keypoints use. Channel identity is
+determined entirely by the frozen DOD direction vector (dod_vectors.py), as
+re-applied after every accepted augmentation draw by
+transforms.FetalTrainAugment.
 
-SCOPE NOTE (documented, not hidden): this project's converter applies
-endpoint_order.canonical_order() ONCE, before any augmentation, using the
-original un-augmented coordinates. The audited upstream HRNet pipeline
-re-applies its own equivalent projection-based sort AFTER every
-rotation/flip augmentation draw, so a training-time rotated/flipped HRNet
-sample can occasionally end up in the opposite channel order from this
-project's fixed-at-conversion-time order. Replicating that exactly would
-require re-deriving the direction-vector projection in the current sample's
-augmented coordinate frame on every __getitem__ call, which this first
-implementation does not attempt -- this is the same class of already-
-disclosed endpoint-canonicalisation instability documented for EoMT's own
-x-sort convention (thesis sec:discussion-limitations-endpoint-canon), not a
-new, silent problem. Revisit only if the canary's visual-overlay audit
-(PROTOCOL_LOCKED.md's mandatory canary gate) shows this actually matters in
-practice.
+SUPERSEDED 2026-08-06 (kept for the historical record, not deleted, per
+this project's own norm of not silently rewriting history): this file
+previously exported a static `FLIP_INDICES = [0, 1]` and relied on MMPose's
+stock RandomFlip to apply it, on the theory that HRNet's own `_flip_x_only`
+(no index swap) meant a static "never swap on flip" rule was safe. That
+theory was WRONG in general: audit_flip_order_stability.py, run against the
+real UCL Train CSVs, measured 0/110 (0.0%) of UCL BPD training images where
+a flip would invalidate that static rule (BPD's d_vect happens to be
+near-vertical), but 110/110, 94/94 and 96/96 (100.0% each) for UCL OFD,
+APAD and FL respectively (all near-horizontal d_vect directions) -- i.e.
+for 3 of 5 tasks, a flip_indices=[0,1] static rule silently mislabels
+essentially every flipped training sample. FLIP_INDICES is no longer
+imported by make_config.py or used by the training pipeline;
+transforms.FetalTrainAugment re-derives the DOD-canonical order itself
+after every accepted flip/rotation instead (see fetal_augment.py and
+PROTOCOL_AUDIT.md). Left defined below only in case some MMPose tooling
+(e.g. a visualisation script) expects the dataset metainfo to declare it;
+it does not participate in this project's own training or evaluation code
+path.
 
 `sigmas` below are OKS keypoint sigmas, an MMPose/COCO-metric bookkeeping
 field unrelated to the SimCC label sigma locked in PROTOCOL_LOCKED.md

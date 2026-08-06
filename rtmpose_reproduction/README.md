@@ -19,6 +19,8 @@ tests that actually run and pass (not just written):
 | `endpoint_order.py` | `test_endpoint_order.py`: reproduces HRNet's OWN real per-image canonicalisation exactly for two actual UCL BPD test images pulled from `fixed_channel_per_image.csv` -- including `004_HC.jpeg`, a genuine swap case (raw CSV order differs from canonical order). **4/4 pass.** |
 | `convert_csv_to_coco.py` | `test_convert_csv_to_coco.py`: synthetic non-square images, row filtering (missing image / negative landmark), bbox correctness, and that the real swap case round-trips through the actual CSV-parsing code path. **Passes.** |
 | `evaluate_rtmpose_fixed.py` | `test_evaluate_rtmpose_fixed.py`: exact-prediction zero-NME, swapped-prediction-only-hurts-fixed-channel, and a deliberately-broken-swap-min case proving the fixed>=swap-min invariant assertion actually fires rather than passing by luck. **3/3 pass.** |
+| `fetal_augment.py` | `test_fetal_augment.py`: algebraic invariant (flip/rotation preserve DOD projection order when the direction vector is transformed consistently) checked via a 500-case randomised property test, a direct regression test on the real UCL OFD flip-bug case found by `audit_flip_order_stability.py` (see `PROTOCOL_AUDIT.md` Section 2c), and per-stage accept/reject (out-of-bounds rotation/scale) tests. **7/7 pass.** |
+| `audit_flip_order_stability.py` | Not a unit test -- a one-off measurement script, already run against the real UCL/Multicentre Train CSVs; its findings are recorded in `PROTOCOL_AUDIT.md`, not just left as ad hoc console output. |
 
 Run all four test files directly (`python test_*.py`) -- no MMPose
 dependency, works in a plain Python env (this session used the project's
@@ -30,9 +32,11 @@ trusting canary output:
 
 | File | Main risk if unverified |
 |---|---|
-| `transforms.py` | Exact `results` dict keys/shapes MMPose's `PackPoseInputs` expects; import paths (`mmcv.transforms.BaseTransform`, `mmpose.registry.TRANSFORMS`) may differ by installed version. |
-| `make_config.py` | Field names/nesting for `RTMCCHead`/`CSPNeXt`/`SimCCLabel` were cross-checked against the official config's *documented* structure, not built and run. |
+| `transforms.py` (`PixelCentreResize`) | Exact `results` dict keys/shapes MMPose's `PackPoseInputs` expects; import paths (`mmcv.transforms.BaseTransform`, `mmpose.registry.TRANSFORMS`) may differ by installed version. |
+| `transforms.py` (`FetalTrainAugment`, added 2026-08-06) | Same `results`-dict-contract risk as `PixelCentreResize`, plus: assumes it runs immediately after `PixelCentreResize` (operates on an already-512x512 image/keypoints, not the original); its own flip/rotate/scale + DOD-reorder LOGIC is fully unit-tested pure Python (`fetal_augment.py`, see above), only the MMPose glue (image dict keys, `GenerateTarget` compatibility) is unverified. |
+| `make_config.py` | Field names/nesting for `RTMCCHead`/`CSPNeXt`/`SimCCLabel` were cross-checked against the official config's *documented* structure, not built and run. The generated config DOES successfully import `dod_vectors`/`fetal_dataset_info` and fails only at the `cv2`/`mmcv` import boundary when executed locally (confirmed 2026-08-06) -- everything before that boundary is real, working Python, not just plausible-looking text. |
 | `run_inference.py` | **Highest risk file.** Deliberately bypasses MMPose's high-level inference API to avoid its stock bbox-based inverse transform (see the file's own docstring for why) -- but this means it depends on `model.head.decode(...)` behaving exactly as assumed. Confirm against the installed source before trusting any exported coordinate. |
+| `record_run_provenance.py` (added 2026-08-06) | Assumes `model.backbone`/`model.head` attribute names and `cfg.model["backbone"]["init_cfg"]` structure match the installed `TopdownPoseEstimator`/`CSPNeXt` -- confirm against the installed source, same tier as the rest of this table. |
 | `run_rtmpose_canary.sh` | Assumes `tools/train.py <config>` is the correct entrypoint for the installed MMPose version (standard OpenMMLab convention, not confirmed against this specific checkout). |
 
 ## Design decisions carried over from the HRNet-512 adapter
@@ -56,23 +60,36 @@ trusting canary output:
   to endpoint-order instability for near-vertical diameters. Enabling
   RTMPose's own `flip_test` would reintroduce exactly that failure mode.
 
-## Explicit scope decisions NOT yet raised with the supervisor (do before the full sweep, not necessarily before the canary)
+## RESOLVED 2026-08-06 (see `PROTOCOL_AUDIT.md` for the full write-up)
 
-- **No rotation/scale augmentation in this first version** (`make_config.py`'s
-  docstring). The canary only needs to prove basic geometric/architectural
-  correctness; adding HRNet-equivalent rotation-aware DOD re-projection is
-  extra work this session did not attempt. Flag this explicitly once the
-  canary passes -- do not silently add rotation augmentation later without
-  re-deriving the endpoint-order handling under it.
-- **No post-flip DOD re-sort**: `endpoint_order.canonical_order()` runs once
-  at CSV-conversion time, before any augmentation; `RandomFlip` mirrors
-  coordinates without swapping channel identity (`flip_indices=[0,1]` in
-  `fetal_dataset_info.py`). HRNet's own pipeline re-derives the projection
-  sort after every flip/rotation draw; this adapter does not yet. Documented
-  in `fetal_dataset_info.py`'s docstring as the same class of limitation
-  already disclosed for EoMT's own endpoint canonicalisation, not a new
-  silent bug -- but it is a real behavioural difference from HRNet worth
-  naming explicitly if it turns out to matter.
+The two items previously listed here as deferred scope decisions were
+resolved during a pre-canary code-level protocol audit, not left for later:
+
+- **Rotation/scale augmentation** is now implemented (`transforms.
+  FetalTrainAugment`), matching EoMT/HRNet's exact parameters
+  (ROT_FACTOR=30 p=0.6, SCALE_FACTOR=0.25 unconditional) -- see
+  `PROTOCOL_AUDIT.md` Section 3.
+- **Post-flip DOD re-sort** is now implemented and was in fact a REAL BUG,
+  not just a theoretical limitation: `audit_flip_order_stability.py`,
+  run against the real released UCL Train CSVs, measured that the old
+  static `flip_indices=[0,1]` design silently mislabelled the channel
+  identity on 100% of UCL OFD/APAD/FL training images (0.0%/0.2% for
+  BPD/TAD specifically, since those two tasks' DOD direction happens to be
+  near-vertical) -- see `PROTOCOL_AUDIT.md` Section 2c for the measured
+  numbers, the fix (`fetal_augment.py`'s `sequential_train_augment`,
+  matching HRNet's own per-sample re-projection architecture), and the
+  algebraic + empirical proof of correctness (`test_fetal_augment.py`,
+  7/7 pass).
+
+Still not fully identical to HRNet's own training-time behaviour: this
+adapter re-derives DOD order using ORIGINAL-image-space `d_vect`, carried
+through EACH sample's own flip/rotate/scale draws independently -- this
+mirrors HRNet's architecture but has not been proven bit-identical to
+HRNet's exact training-time numerical output (out of scope; the two
+implementations' underlying warp mechanics already differ per Section 1's
+table). What IS verified is that RTMPose's own training targets are now
+internally self-consistent under augmentation, which they provably were not
+before this fix for 3 of 5 tasks.
 
 ## Usage
 

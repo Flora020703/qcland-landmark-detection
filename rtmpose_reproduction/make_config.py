@@ -30,17 +30,19 @@ official recipe was copied carelessly:
     under flip for near-vertical diameters; enabling RTMPose's own
     flip-test would silently reintroduce the exact failure mode already
     documented and avoided for EoMT.
-  - Rotation/scale augmentation (RandomBBoxTransform) is NOT included in
-    this first version. This is a deliberate, disclosed scope decision for
-    the canary and initial runs, not an oversight: this project's own DOD
-    endpoint-order convention is applied once, before augmentation
-    (endpoint_order.canonical_order in convert_csv_to_coco.py); replicating
-    HRNet's rotation-aware re-projection exactly would require re-deriving
-    the direction-vector projection in the augmented coordinate frame on
-    every __getitem__, which has not been implemented yet. Revisit only
-    after the canary's mandatory visual-overlay audit, and flag to the
-    supervisor if rotation/scale augmentation is later added, since it
-    changes this project's train-time endpoint-order guarantee.
+  - Rotation/scale/flip augmentation (RandomBBoxTransform/RandomFlip) is
+    NOT delegated to MMPose's stock transforms; a custom FetalTrainAugment
+    (transforms.py) replaces all three. CORRECTED 2026-08-06 after
+    audit_flip_order_stability.py measured that a static flip_indices
+    setting (this file's earlier version) is silently wrong for 100% of
+    UCL OFD/APAD/FL training images (see fetal_augment.py's module
+    docstring and PROTOCOL_AUDIT.md) -- FetalTrainAugment re-derives the
+    DOD-canonical order after every accepted flip/rotation, matching the
+    audited upstream HRNet's own per-sample re-projection architecture,
+    and also adds the rotation (ROT_FACTOR=30, p=0.6) + scale
+    (SCALE_FACTOR=0.25, unconditional) augmentation this file's previous
+    version deferred entirely -- see PROTOCOL_AUDIT.md's augmentation
+    item-by-item table for what does/doesn't match EoMT/HRNet exactly.
   - Backbone-only pretrained init via prefix='backbone.'; RTMCCHead fully
     randomly initialised (matches the OFFICIAL recipe's own convention,
     confirmed against the real config -- not a compromise specific to this
@@ -70,7 +72,15 @@ randomness = dict(seed={seed}, deterministic=True)
 
 # --- import the custom transform so @TRANSFORMS.register_module() runs ---
 import transforms  # noqa: F401,E402
-from fetal_dataset_info import FETAL_DATASET_INFO, FLIP_INDICES  # noqa: E402
+from fetal_dataset_info import FETAL_DATASET_INFO  # noqa: E402
+from dod_vectors import get_d_vect  # noqa: E402
+
+# Frozen DOD prototype vector for this (dataset, task), reused verbatim from
+# the audited upstream HRNet reproduction (dod_vectors.py) -- FetalTrainAugment
+# uses this to re-derive the canonical channel order after every accepted
+# flip/rotation, replacing the old static-flip_indices design (see
+# fetal_augment.py's module docstring and PROTOCOL_AUDIT.md).
+d_vect = get_d_vect({dataset!r}, {task!r})
 
 input_size = (512, 512)
 
@@ -141,10 +151,15 @@ data_mode = "topdown"
 
 train_pipeline = [
     dict(type="LoadImage"),
-    dict(type="RandomFlip", direction="horizontal", prob=0.5),
     # RandomHalfBody deliberately removed (supervisor instruction).
-    # Rotation/scale augmentation deliberately deferred (see module docstring).
     dict(type="PixelCentreResize", input_size=512),
+    # Replaces RandomFlip + RandomBBoxTransform: flip (p=0.5), rotation
+    # (+-30 deg, p=0.6), scale (0.75-1.25, unconditional), colour jitter,
+    # ALL with DOD-consistent re-canonicalisation after every accepted
+    # geometric draw. See transforms.FetalTrainAugment's own docstring and
+    # PROTOCOL_AUDIT.md for what this fixes and what remains disclosed as
+    # non-bit-identical to EoMT/HRNet.
+    dict(type="FetalTrainAugment", d_vect=d_vect, input_size=512),
     dict(type="GenerateTarget", encoder=codec),
     dict(type="PackPoseInputs"),
 ]
