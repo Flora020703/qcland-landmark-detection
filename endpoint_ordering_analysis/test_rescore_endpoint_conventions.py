@@ -573,7 +573,11 @@ def test_min_paired_max_abs_diff_picks_closer_pairing():
 def test_raw_channel_vs_prediction_xsort_audit_detects_reversal():
     """A location-perfect but channel-reversed prediction must score badly
     under raw-channel fixed correspondence and exactly zero after
-    prediction-only x-sort; the audit flag must identify the reversal."""
+    prediction-only x-sort; the audit flag must identify the reversal.
+    Also a clean hand-computed check of cross_pairing/oracle_min for a
+    GENUINE swap: here prediction_x_reversed and cross_pairing_preferred
+    must BOTH be true (contrast with the near-vertical case below, where
+    they must disagree)."""
     row = {
         "pred0": (90.0, 10.0),
         "pred1": (10.0, 10.0),
@@ -591,7 +595,60 @@ def test_raw_channel_vs_prediction_xsort_audit_detects_reversal():
         assert result["prediction_x_reversed"] is True
         assert abs(result["raw_channel_original"] - 1.0) < 1e-12
         assert abs(result["xsort"]) < 1e-12
+        # Hand-computed: cross_pairing pairs pred0<->gt1, pred1<->gt0 --
+        # both distances are exactly 0 here (pred0 sits exactly on gt1,
+        # pred1 exactly on gt0), so cross_pairing_nme=0, correctly
+        # preferred over raw_channel_original=1.0, and oracle_min=0.
+        assert abs(result["cross_pairing"]) < 1e-12
+        assert result["cross_pairing_preferred"] is True
+        assert abs(result["oracle_min"]) < 1e-12
     print("[PASS] test_raw_channel_vs_prediction_xsort_audit_detects_reversal")
+
+
+def test_correspondence_diagnostic_distinguishes_reversal_from_true_swap():
+    """THE key regression test for the correspondence-diagnostic addition
+    (2026-08-07): `prediction_x_reversed` only checks the raw prediction's
+    OWN left-to-right order -- it does NOT tell you whether p0/p1 actually
+    correspond to the wrong GT side. On a near-vertical diameter (matching
+    BPD/TAD's real geometry -- the two GT points differ by a fraction of a
+    pixel in x but tens of pixels in y), a tiny prediction x-noise can flip
+    prediction_x_reversed to True while the predictions are still each
+    unambiguously, correctly closest to their OWN intended GT point. This
+    test constructs exactly that case and asserts `cross_pairing_preferred`
+    correctly says False (correspondence is fine) even though
+    `prediction_x_reversed` says True (raw x-order looks flipped) --
+    proving the two are genuinely different signals, not redundant ones."""
+    gt0 = (50.00, 10.0)   # x-sort left (barely: 50.00 < 50.10)
+    gt1 = (50.10, 90.0)   # x-sort right
+    # pred0 is near gt0 (distance ~2.0), pred1 is near gt1 (distance ~2.0)
+    # -- genuinely well-localised, correctly-corresponded predictions --
+    # but pred0.x is nudged JUST above pred1.x by prediction noise smaller
+    # than the localisation error itself, flipping the raw x-order.
+    pred0 = (50.05, 12.0)   # correctly near gt0, but pred0.x > pred1.x
+    pred1 = (50.02, 88.0)   # correctly near gt1
+    row = {"pred0": pred0, "pred1": pred1, "gt0": gt0, "gt1": gt1, "native_fixed_nme": 0.0}
+    data = {
+        "filenames": ["near_vertical.png"],
+        "per_seed": {seed: {"near_vertical.png": dict(row)} for seed in SEEDS},
+    }
+    scored = rescore_cell(data, ((0.0, 0.0), (1.0, 0.0)))["per_seed_per_image"]
+    for seed in SEEDS:
+        result = scored[seed]["near_vertical.png"]
+        assert result["prediction_x_reversed"] is True, (
+            "test construction error: expected raw x-order to look reversed"
+        )
+        assert result["cross_pairing_preferred"] is False, (
+            "cross_pairing_preferred incorrectly flagged a correspondence error "
+            "for predictions that are genuinely, correctly localised -- "
+            "prediction_x_reversed and cross_pairing_preferred must be able to "
+            "disagree, this is exactly the case that motivated adding the latter"
+        )
+        # raw_channel_original should already be small (correct correspondence),
+        # and oracle_min should be nearly identical to it (little to no
+        # "correspondence penalty" left to explain).
+        assert result["raw_channel_original"] < 0.05
+        assert abs(result["raw_channel_original"] - result["oracle_min"]) < 1e-9
+    print("[PASS] test_correspondence_diagnostic_distinguishes_reversal_from_true_swap")
 
 
 def main():
@@ -606,6 +663,7 @@ def main():
     test_gt_consistency_threshold_tiers()
     test_min_paired_max_abs_diff_picks_closer_pairing()
     test_raw_channel_vs_prediction_xsort_audit_detects_reversal()
+    test_correspondence_diagnostic_distinguishes_reversal_from_true_swap()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")

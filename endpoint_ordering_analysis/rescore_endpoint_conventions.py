@@ -98,6 +98,27 @@ an actual coordinate-recovery bug. Fixed to compare the two POSSIBLE
 pairings (standard and swapped) and take whichever is closer -- see
 `_min_paired_max_abs_diff()` below.
 
+*** CORRESPONDENCE DIAGNOSTIC (2026-08-07, addresses what `prediction_x_
+reversed` alone could not answer) ***: `prediction_x_reversed` (raw pred0.x
+> pred1.x) only tells you whether the RAW prediction pair keeps a left-to-
+right order AMONG ITSELF -- it does NOT tell you whether p0 is actually
+closer to the LEFT GT and p1 actually closer to the RIGHT GT. On a
+near-vertical diameter (BPD/TAD), a tiny prediction error can flip which
+of p0/p1 has the smaller x-coordinate WITHOUT changing which physical GT
+point each one is actually closest to -- so a high `prediction_x_reversal_
+rate` on those tasks does not, by itself, mean p0/p1 are landing on the
+wrong side. The direct, convention-agnostic question is a per-image
+bipartite-distance comparison: does the AS-TRAINED pairing (p0<->left GT,
+p1<->right GT, i.e. `raw_channel_original`) have lower total distance than
+the CROSSED pairing (p0<->right GT, p1<->left GT)? `cross_pairing_
+preferred` answers exactly this, per image; `oracle_min` (the smaller of
+the two, DIAGNOSTIC ONLY -- it uses GT to choose the pairing after the
+fact and is never a valid inference-time metric) and `raw_minus_oracle_min`
+decompose how much of `raw_channel_original`'s own reported error is a
+"wrong side" (correspondence) problem versus genuine localisation error
+that persists under either pairing. See `correspondence_diagnostic_summary.tsv`
+and `rescore_cell()`'s own comment for the exact formulas.
+
 The three canonicalisation rules, everything now genuinely in ORIGINAL
 image pixel coordinates for BOTH methods:
   1. NATIVE: recomputed directly from each file's OWN raw dumped
@@ -544,10 +565,36 @@ def rescore_cell(data: dict, d_vect) -> dict:
             # remain untouched: raw channel 0 -> left GT, raw channel 1 ->
             # right GT.  It therefore tests localisation + channel assignment.
             raw_channel_nme = fixed_channel_nme(pred0, pred1, gt_x0, gt_x1)
+
+            # `prediction_x_reversed` (pred0.x > pred1.x) only answers
+            # whether the RAW prediction pair keeps a left-to-right order
+            # AMONG ITSELF -- it says nothing about whether p0 is actually
+            # the point closer to the LEFT GT and p1 closer to the RIGHT
+            # GT. Those are different questions: on a near-vertical
+            # diameter (BPD/TAD) a tiny prediction error can flip pred0.x
+            # vs pred1.x without changing which GT point each prediction
+            # is actually closest to. The direct, convention-agnostic
+            # answer to "did p0/p1 end up corresponding to the wrong GT
+            # side" is a per-image bipartite-distance comparison: does the
+            # AS-TRAINED pairing (p0<->left GT, p1<->right GT) have lower
+            # total distance than the CROSSED pairing (p0<->right GT,
+            # p1<->left GT)? `cross_pairing_preferred=True` means the
+            # crossed pairing is closer -- i.e. p0/p1 look, purely by
+            # distance, like they correspond to the opposite GT side from
+            # what raw_channel_original assumes. `oracle_min` (the smaller
+            # of the two) is DIAGNOSTIC ONLY -- it uses GT to pick the
+            # pairing after the fact, so it is never a valid inference-time
+            # metric, only a tool to decompose how much of
+            # raw_channel_original's error is "wrong side" (correspondence)
+            # versus genuine localisation error.
             prediction_x_reversed = bool(
                 (pred0[0] > pred1[0]) or
                 (pred0[0] == pred1[0] and pred0[1] > pred1[1])
             )
+            cross_pairing_nme = fixed_channel_nme(pred0, pred1, gt_x1, gt_x0)
+            cross_pairing_preferred = cross_pairing_nme < raw_channel_nme
+            oracle_min_nme = min(raw_channel_nme, cross_pairing_nme)
+
             pred_x0, pred_x1 = x_sort(pred0, pred1)
             xsort_nme = fixed_channel_nme(pred_x0, pred_x1, gt_x0, gt_x1)
 
@@ -558,9 +605,12 @@ def rescore_cell(data: dict, d_vect) -> dict:
             out[fn] = {
                 "native": native_nme,
                 "raw_channel_original": raw_channel_nme,
+                "cross_pairing": cross_pairing_nme,
+                "oracle_min": oracle_min_nme,
                 "xsort": xsort_nme,
                 "dod": dod_nme,
                 "prediction_x_reversed": prediction_x_reversed,
+                "cross_pairing_preferred": cross_pairing_preferred,
             }
 
             if seed == SEEDS[0]:
@@ -586,7 +636,7 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
 
     seed_rows = []
     for seed in SEEDS:
-        for conv in ("native", "raw_channel_original", "xsort", "dod"):
+        for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min", "xsort", "dod"):
             values = np.array([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
             seed_rows.append({
                 "dataset": dataset, "task": task, "method": method_label, "seed": seed,
@@ -595,17 +645,22 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
                 "prediction_x_reversal_rate": (
                     f"{np.mean([per_seed[seed][fn]['prediction_x_reversed'] for fn in filenames]):.8f}"
                 ),
+                "cross_pairing_preferred_rate": (
+                    f"{np.mean([per_seed[seed][fn]['cross_pairing_preferred'] for fn in filenames]):.8f}"
+                ),
             })
 
     per_image_avg = {}
-    for conv in ("native", "raw_channel_original", "xsort", "dod"):
+    for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min", "xsort", "dod"):
         stacked = np.array([[per_seed[seed][fn][conv] for seed in SEEDS] for fn in filenames]) * 100.0
         per_image_avg[conv] = stacked.mean(axis=1)  # average across 5 seeds, per image
 
     raw_vals = per_image_avg["raw_channel_original"]
+    oracle_min_vals = per_image_avg["oracle_min"]
     xsort_vals = per_image_avg["xsort"]
     dod_vals = per_image_avg["dod"]
     raw_minus_xsort = raw_vals - xsort_vals
+    raw_minus_oracle_min = raw_vals - oracle_min_vals
     diff = xsort_vals - dod_vals
     lo, hi = bootstrap_ci(diff, bootstrap_reps, rng) if len(diff) > 1 else (float("nan"), float("nan"))
 
@@ -613,6 +668,8 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     with per_image_path.open("w", newline="", encoding="utf-8") as handle:
         fields = [
             "filename", "native_nme_pct", "raw_channel_original_nme_pct",
+            "cross_pairing_nme_pct", "cross_pairing_preferred_fraction_across_seeds",
+            "oracle_min_nme_pct", "raw_minus_oracle_min_pp",
             "prediction_xsort_nme_pct", "raw_minus_prediction_xsort_pp",
             "prediction_x_reversal_fraction_across_seeds", "dod_nme_pct",
             "xsort_minus_dod_pp",
@@ -624,6 +681,10 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
                 "filename": fn,
                 "native_nme_pct": f"{per_image_avg['native'][i]:.8f}",
                 "raw_channel_original_nme_pct": f"{raw_vals[i]:.8f}",
+                "cross_pairing_nme_pct": f"{per_image_avg['cross_pairing'][i]:.8f}",
+                "cross_pairing_preferred_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['cross_pairing_preferred'] for seed in SEEDS]):.8f}",
+                "oracle_min_nme_pct": f"{oracle_min_vals[i]:.8f}",
+                "raw_minus_oracle_min_pp": f"{raw_minus_oracle_min[i]:.8f}",
                 "prediction_xsort_nme_pct": f"{xsort_vals[i]:.8f}",
                 "raw_minus_prediction_xsort_pp": f"{raw_minus_xsort[i]:.8f}",
                 "prediction_x_reversal_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['prediction_x_reversed'] for seed in SEEDS]):.8f}",
@@ -636,7 +697,7 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
         "n_images": len(filenames),
         "gt_xsort_vs_dod_disagreement_rate": f"{rescored['gt_disagreement_rate']:.6f}",
     }
-    for conv in ("native", "raw_channel_original", "xsort", "dod"):
+    for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min", "xsort", "dod"):
         seed_means = np.array([
             np.mean([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
             for seed in SEEDS
@@ -649,8 +710,18 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     ])
     summary_row["prediction_x_reversal_rate_5seed_mean"] = f"{reversal_rates.mean():.8f}"
     summary_row["prediction_x_reversal_rate_5seed_sample_sd"] = f"{reversal_rates.std(ddof=1):.8f}"
+    cross_pairing_preferred_rates = np.array([
+        np.mean([per_seed[seed][fn]["cross_pairing_preferred"] for fn in filenames])
+        for seed in SEEDS
+    ])
+    summary_row["cross_pairing_preferred_rate_5seed_mean"] = f"{cross_pairing_preferred_rates.mean():.8f}"
+    summary_row["cross_pairing_preferred_rate_5seed_sample_sd"] = f"{cross_pairing_preferred_rates.std(ddof=1):.8f}"
     raw_seed_means = np.array([
         np.mean([per_seed[seed][fn]["raw_channel_original"] for fn in filenames]) * 100.0
+        for seed in SEEDS
+    ])
+    oracle_min_seed_means = np.array([
+        np.mean([per_seed[seed][fn]["oracle_min"] for fn in filenames]) * 100.0
         for seed in SEEDS
     ])
     xsort_seed_means = np.array([
@@ -660,6 +731,14 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     paired_seed_delta = raw_seed_means - xsort_seed_means
     summary_row["raw_minus_prediction_xsort_5seed_mean_pp"] = f"{paired_seed_delta.mean():.8f}"
     summary_row["raw_minus_prediction_xsort_5seed_sample_sd_pp"] = f"{paired_seed_delta.std(ddof=1):.8f}"
+    # "Correspondence penalty" (diagnostic only -- oracle_min uses GT to
+    # pick the better-scoring pairing after the fact, never a valid
+    # inference-time metric): how much of raw_channel_original's own error
+    # is attributable to p0/p1 landing closer to the OPPOSITE GT side,
+    # versus genuine localisation error that persists under either pairing.
+    correspondence_penalty_seed = raw_seed_means - oracle_min_seed_means
+    summary_row["raw_minus_oracle_min_5seed_mean_pp"] = f"{correspondence_penalty_seed.mean():.8f}"
+    summary_row["raw_minus_oracle_min_5seed_sample_sd_pp"] = f"{correspondence_penalty_seed.std(ddof=1):.8f}"
     summary_row["xsort_minus_dod_mean_pp"] = f"{diff.mean():.8f}"
     summary_row["xsort_minus_dod_bootstrap_95ci_low_pp"] = f"{lo:.8f}"
     summary_row["xsort_minus_dod_bootstrap_95ci_high_pp"] = f"{hi:.8f}"
@@ -855,6 +934,35 @@ def main():
         writer.writeheader()
         writer.writerows({field: row[field] for field in audit_fields} for row in all_summary_rows)
 
+    # Compact supervisor-facing table for the DIFFERENT, more direct
+    # question: on each image, are p0/p1 actually closer (by distance) to
+    # the LEFT/RIGHT GT the training convention assumes, or to the
+    # OPPOSITE side? `prediction_x_reversal_rate` above only tells you
+    # whether the raw prediction pair keeps its own left-to-right order --
+    # it does NOT tell you whether that order matches which GT point each
+    # prediction is actually closest to (see rescore_cell's own comment on
+    # this exact distinction). `oracle_min` is diagnostic ONLY -- it uses
+    # GT to pick the better-scoring pairing after the fact and is never a
+    # valid inference-time metric; it exists solely to decompose
+    # raw_channel_original's own error into a "wrong side"
+    # (correspondence) component versus genuine localisation error.
+    correspondence_path = args.output_root / "correspondence_diagnostic_summary.tsv"
+    correspondence_fields = [
+        "dataset", "task", "method", "n_images",
+        "prediction_x_reversal_rate_5seed_mean",
+        "cross_pairing_preferred_rate_5seed_mean",
+        "cross_pairing_preferred_rate_5seed_sample_sd",
+        "raw_channel_original_5seed_mean_pct",
+        "raw_channel_original_5seed_sample_sd_pct",
+        "oracle_min_5seed_mean_pct", "oracle_min_5seed_sample_sd_pct",
+        "raw_minus_oracle_min_5seed_mean_pp",
+        "raw_minus_oracle_min_5seed_sample_sd_pp",
+    ]
+    with correspondence_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=correspondence_fields, delimiter="\t")
+        writer.writeheader()
+        writer.writerows({field: row[field] for field in correspondence_fields} for row in all_summary_rows)
+
     dvect_path = args.output_root / "dod_vectors.tsv"
     with dvect_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(dvect_rows[0]), delimiter="\t")
@@ -886,8 +994,9 @@ def main():
               f"cells' 'unified' numbers as trustworthy until resolved.")
     for row in excluded:
         print(f"  excluded: {row['dataset']}/{row['task']}/{row['method']}")
-    print(f"Wrote: {summary_path}, {audit_path}, {seed_summary_path}, {dvect_path}, {excluded_path}, "
-          f"{consistency_path}, and {n_scored} per-image CSVs under {args.output_root}")
+    print(f"Wrote: {summary_path}, {audit_path}, {correspondence_path}, {seed_summary_path}, "
+          f"{dvect_path}, {excluded_path}, {consistency_path}, and {n_scored} per-image CSVs "
+          f"under {args.output_root}")
     print("\n*** LIMITATION, repeat to the supervisor alongside these numbers ***")
     print("This is a retrospective RE-SCORING of already-saved predictions under two")
     print("external conventions -- it quantifies how much the EXTERNAL SCORING RULE")
