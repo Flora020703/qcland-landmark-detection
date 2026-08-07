@@ -108,6 +108,16 @@ echo "=== [4/6] generate the canary config ==="
 # regardless of $MAX_EPOCHS. Found while wiring up run_smoke_test.sh, which
 # genuinely needs MAX_EPOCHS=1 to take effect.
 
+echo "=== [4a/6] regression test: generated configs avoid MMEngine's lazy-import mode (round 11 finding) ==="
+# A real run of this exact pipeline once failed here with a cryptic
+# MMEngine LazyObject error surfacing inside record_run_provenance.py's own
+# Config.fromfile() call (step 4b) -- see make_config.py's TEMPLATE "LAZY
+# IMPORT" comment for the root cause and fix. This standalone regression
+# test (self-contained, generates its own throwaway synthetic config via
+# the same make_config() function, not $CONFIG_PATH) fails fast with a
+# clear message instead, before wasting a step-4b traceback on it.
+"$PY" test_make_config_real_load.py
+
 echo "=== [4b/6] record + VERIFY pretrained-weight provenance (fails loudly on any key/value mismatch) + actual parameter counts ==="
 "$PY" record_run_provenance.py \
   --config "$CONFIG_PATH" \

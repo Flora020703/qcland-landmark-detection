@@ -124,12 +124,23 @@ Full item-by-item table (all rows re-verified against the CORRECT
 | Pretrained checkpoint's own `checkpoint=` field | was a hardcoded URL | **FIXED (blocking issue)**: `model.init_weights()` would have loaded from this URL, completely independent of whatever local file `record_run_provenance.py` was separately hashing. `make_config()` now REQUIRES a local `pretrained_checkpoint_path` (resolved to an absolute path before being embedded, so the generated config is not sensitive to the working directory it was generated from) and embeds THAT path as `init_cfg.checkpoint`, so the file that gets loaded and the file that gets hashed/diffed are, by construction, the same file. |
 | `--max-epochs`/`--val-interval` CLI flags | claimed to exist (the `max_epochs=420` row above already said "adjustable via `--max-epochs`"), but the argparse block never actually defined them | **FIXED (real, self-caught discrepancy, 2026-08-07)**: `make_config()` always accepted `max_epochs`/`val_interval` as Python keyword arguments with defaults, but the CLI (`if __name__ == "__main__":` block) never exposed a flag for either -- meaning `run_rtmpose_canary.sh`'s own `$MAX_EPOCHS` shell variable was silently ignored, and every invocation actually generated a 200-epoch config regardless of that variable's value. Found while wiring up `run_smoke_test.sh`, which genuinely needs `--max-epochs 1 --val-interval 1` to take effect. Both flags now exist and are wired through. |
 | Warmup/cosine overlap for very short `max_epochs` | the round-5 warmup formula (`min(5, max(1, max_epochs//20))` epochs) always warms up for >=1 epoch, but `cosine_begin_epoch = max_epochs//2` is 0 or 1 for `max_epochs<4` -- mathematically guaranteed to overlap and trip the existing `SystemExit` guard | **HANDLED, not "fixed" (2026-08-07)**: unreachable for any real config in this project (every real run uses `max_epochs>=20`, comfortably satisfying `warmup_epochs<=5 < max_epochs//2`), so this is not a methodology bug in any existing result. Only reachable when a run genuinely wants `max_epochs<5` (`run_smoke_test.sh`'s `MAX_EPOCHS=1`) -- for that case only, warmup is disabled entirely (`warmup_end_iters=0`, with a loud `WARNING:` printed) rather than erroring, since LR-schedule shape is irrelevant to a smoke test's actual purpose. The generated config's own embedded assert was updated to tolerate `warmup_end_iters==0` as this deliberate degenerate case, not silently pass over a real overlap. |
+| Generated config's top-level `import transforms` / `import internal_val_hook` / `from fetal_dataset_info import ...` / `from dod_vectors import get_d_vect` | previously present, defended in a now-corrected comment as a harmless "belt and suspenders" duplicate of `custom_imports` | **FIXED (blocking issue, round 11, 2026-08-07, found by a REAL live_preflight.py pipeline run against a real MMEngine install)**: verified against MMEngine 0.10.7's own source that ANY top-level import of a non-builtin module (not in `sys.builtin_module_names`, not resolving inside Python's own install root) auto-triggers MMEngine's "lazy import" config-parsing mode for the ENTIRE file -- `transforms`/`internal_val_hook`/`fetal_dataset_info`/`dod_vectors` are all this project's own local modules, each independently sufficient to trigger it. In lazy mode, imported names become `LazyObject`/`LazyAttr` proxies, not the real objects, until a Runner builds the config -- so the generated config's own `d_vect = get_d_vect(...)` line (calling a not-yet-real proxy at parse time) could not work, exactly the error a real run surfaced. Fixed: `get_d_vect(dataset, task)`/`FETAL_DATASET_INFO` are now resolved in make_config.py's OWN module scope (real imports, a normal script) and embedded into the generated config as plain literal values -- no import, no function call, in the generated text at all. `custom_imports = dict(...)` (a plain dict literal, not an AST Import node) is now the SOLE registration mechanism for `transforms`/`internal_val_hook`. Regression-tested against a REAL `Config.fromfile()` call in `test_make_config_real_load.py` (requires a live MMPose environment; wired into `run_rtmpose_canary.sh`'s new step [4a/6]). |
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
+
+from dod_vectors import get_d_vect
+from fetal_dataset_info import FETAL_DATASET_INFO
+
+# CORRECTED 2026-08-07 (round 11, live_preflight.py finding against a real
+# MMEngine install): `get_d_vect`/`FETAL_DATASET_INFO` are imported HERE, in
+# make_config.py's own module scope (a normal script, executed normally),
+# NOT inside the generated config's own TEMPLATE text -- see that template's
+# own comment (search "LAZY IMPORT") for why importing them into the
+# GENERATED config is actively broken, not just unnecessary.
 
 OFFICIAL_CSPNEXT_S_BACKBONE_CHECKPOINT_URL = (
     "https://download.openmmlab.com/mmpose/v1/projects/rtmposev1/"
@@ -148,38 +159,67 @@ TEMPLATE = '''\
 # module docstring for what was locked/changed and why.
 
 import sys
-sys.path.insert(0, {repo_root!r})  # for transforms.py / fetal_dataset_info.py
+sys.path.insert(0, {repo_root!r})  # so custom_imports below can find transforms.py / internal_val_hook.py
 
 default_scope = "mmpose"
 randomness = dict(seed={seed}, deterministic=True)
 
-# --- import custom transforms/hooks so their @*.register_module() run ---
-# BOTH mechanisms used deliberately (round 6, review request for a more
-# robust registration path than a bare top-level `import`): the plain
-# imports below already work for this project's existing custom transforms
-# (this is the same pattern `transforms.py`'s own TRANSFORMS registration
-# has used since round 1 -- MMEngine's Config.fromfile() genuinely imports
-# a Python-format config as a real module, executing top-level imports with
-# real side effects, not a restricted AST-only variable extraction).
-# `custom_imports` is ADDITIONALLY declared as MMEngine's own officially
-# documented mechanism for this, in case some installed version's config-
-# loading path is more restrictive than assumed -- belt and suspenders,
-# not a sign the plain imports were known to be broken.
+# --- LAZY IMPORT (round 11, corrects a wrong "belt and suspenders" claim
+# made in round 6): a real live_preflight.py run against a real MMEngine
+# install found `Config.fromfile()` genuinely FAILS on this file with the
+# plain top-level `import transforms` / `import internal_val_hook` /
+# `from fetal_dataset_info import ...` / `from dod_vectors import ...`
+# lines this comment used to defend as a harmless belt-and-suspenders
+# duplicate of `custom_imports` below. Verified against MMEngine 0.10.7's
+# own source (mmengine/config/config.py's `Config._is_lazy_import`,
+# mmengine/config/utils.py's `_is_builtin_module`): ANY top-level import of
+# a non-stdlib module (checked via `sys.builtin_module_names` plus whether
+# the module resolves outside Python's own install root/site-packages)
+# auto-triggers MMEngine's "lazy import" config-parsing mode for the WHOLE
+# file -- `sys` alone is safe (genuinely stdlib), but `transforms`,
+# `internal_val_hook`, `fetal_dataset_info`, and `dod_vectors` are this
+# project's own local modules, each independently sufficient to trigger it.
+# In lazy mode, imported names become `LazyObject`/`LazyAttr` PROXIES, not
+# the real objects, until the config is actually built by a Runner --
+# calling `get_d_vect(...)` immediately at module-parse time (as this file
+# used to, right below) cannot work against a proxy that isn't really
+# `dod_vectors.get_d_vect` yet. `custom_imports = dict(...)` below is a
+# PLAIN DICT LITERAL, not a Python `import`/`from` AST node, so it alone
+# does not trigger lazy mode -- it is now the SOLE mechanism registering
+# `transforms`/`internal_val_hook`'s `@*.register_module()` side effects
+# (MMEngine resolves and imports them for real, at Runner-build time, well
+# after this file's own parsing has already finished normally). `d_vect`
+# and `FETAL_DATASET_INFO` are now embedded below as plain literal
+# values (computed by make_config.py itself, a normal script where
+# `get_d_vect`/`FETAL_DATASET_INFO` really are the real objects), not
+# recomputed via an import+call inside the generated config at all.
 custom_imports = dict(
     imports=["transforms", "internal_val_hook"],
     allow_failed_imports=False,
 )
-import transforms  # noqa: F401,E402
-import internal_val_hook  # noqa: F401,E402
-from fetal_dataset_info import FETAL_DATASET_INFO  # noqa: E402
-from dod_vectors import get_d_vect  # noqa: E402
 
 # Frozen DOD prototype vector for this (dataset, task), reused verbatim from
 # the audited upstream HRNet reproduction (dod_vectors.py) -- FetalRandomFlipAndCanonicalize
 # uses this to re-derive the canonical channel order after every flip draw,
 # in ORIGINAL image space, replacing the old static-flip_indices design (see
-# fetal_augment.py's module docstring and PROTOCOL_AUDIT.md).
-d_vect = get_d_vect({dataset!r}, {task!r})
+# fetal_augment.py's module docstring and PROTOCOL_AUDIT.md). Embedded as a
+# plain numeric literal (resolved by make_config.py itself before this text
+# is even written to disk) -- see this section's own "LAZY IMPORT" comment
+# above for why calling get_d_vect(...) here, in the generated config text,
+# does not work.
+d_vect = {d_vect!r}
+
+# Same reasoning as d_vect above: a plain literal, not an import + name
+# reference, so it works identically whether or not this config ever enters
+# MMEngine's lazy-import parsing mode.
+FETAL_DATASET_INFO = {fetal_dataset_info!r}
+
+# Plain string literals (round 11) purely so a regression test can
+# independently recompute get_d_vect(dataset_name, task_name) and compare
+# it against cfg.d_vect above, without needing to parse this file's own
+# header comment -- see test_make_config_real_load.py.
+dataset_name = {dataset!r}
+task_name = {task!r}
 
 input_size = (512, 512)
 
@@ -542,6 +582,12 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
             f"the config that init_weights() cannot actually load from."
         )
 
+    # Resolved HERE, in this normal (non-lazy-parsed) script, to real
+    # Python objects -- embedded into the generated config as plain
+    # literals (see TEMPLATE's own "LAZY IMPORT" comment for why the
+    # generated config text must never import-and-call these itself).
+    d_vect_value = get_d_vect(dataset, task)
+
     # Real LR scaling (round 4 fix): official base_lr=4e-3 is paired with
     # a base_batch_size of 1024 (auto_scale_lr in the official recipe);
     # applying it unscaled at this project's much smaller batch_size risks
@@ -624,6 +670,7 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
         scaled_lr=scaled_lr, iters_per_epoch=iters_per_epoch,
         warmup_end_iters=warmup_end_iters, n_train_images=n_train_images,
         work_dir=work_dir,
+        d_vect=d_vect_value, fetal_dataset_info=FETAL_DATASET_INFO,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(text, encoding="utf-8")
