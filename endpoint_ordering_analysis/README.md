@@ -91,14 +91,18 @@ the server). Any OTHER load failure is, by construction, something new --
 a bad path, a truncated file, a server-side regression -- and rendering it
 identically as `Unavailable` in the final table would disguise a real run
 problem as the one gap everyone already expects. After every run, the SET
-of (dataset, task, method) cells that actually failed to load is compared
-against `EXPECTED_MISSING`; if it is not EXACTLY equal, the run prints
-exactly which cell(s) are unexpectedly missing (or, symmetrically, which
-previously-missing cell unexpectedly started loading, as a reminder to
-update the constant) and exits non-zero WITHOUT generating the official
-final table. Every other diagnostic output (`endpoint_ordering_summary.tsv`,
-`excluded_images.tsv`, etc.) is still written first, so the reasons remain
-inspectable even when the run hard-fails on this gate.
+of (dataset, task, method) cells that actually failed to load
+(`actual_missing`) is compared against `EXPECTED_MISSING`: **the actual
+missing set must be a SUBSET of `EXPECTED_MISSING`** -- any additional
+missing cell outside the allowlist causes a non-zero exit WITHOUT
+generating the official final table, printing exactly which cell(s) are
+unexpectedly missing; a previously-missing cell that becomes available
+this run is ACCEPTED (not an error) and reported as a non-fatal reminder
+to update the allowlist, and the official table is generated using that
+cell's real, freshly-recovered numbers. Every other diagnostic output
+(`endpoint_ordering_summary.tsv`, `excluded_images.tsv`, etc.) is still
+written first, so the reasons remain inspectable even when the run
+hard-fails on this gate.
 
 **No retraining, no new inference required**: this re-scores the SAME
 already-saved per-image predictions used throughout this analysis.
@@ -315,7 +319,7 @@ endpoint_ordering_analysis/results/
                                                endpoint_ordering_summary.tsv. Missing cells
                                                (UCL BPD EoMT) marked "Unavailable", never
                                                backfilled. Only generated if the actual set of
-                                               load failures exactly equals EXPECTED_MISSING
+                                               load failures is a SUBSET of EXPECTED_MISSING
                                                (see the strict missing-cell gate above) --
                                                otherwise the run exits non-zero before this
                                                file is written.
