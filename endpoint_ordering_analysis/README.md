@@ -9,7 +9,73 @@ vector, and RTMPose (per `PROTOCOL_LOCKED.md`) currently follows HRNet's
 convention. How much does this choice actually matter for the numbers
 already reported, and does it change any conclusion?
 
-## What this does and does not do
+## THE OFFICIAL EVALUATION METRIC (supervisor decision, 2026-08-07)
+
+**Read this section first.** Everything below it (Native/Unified x-sort/
+Unified DOD, `raw_channel_original`, the correspondence diagnostic,
+`prediction_x_reversal_rate`) is now **Appendix-only implementation-audit
+material** documenting HOW this decision was reached -- it must not be
+mixed into, or presented alongside, the main results table.
+
+After reviewing this investigation's own correspondence-diagnostic
+findings (large, reproducible endpoint-assignment sensitivity on
+Multicentre BPD/TAD specifically), the supervisor decided that
+**permutation-invariant matching is the correct metric definition** for
+this task, for EoMT, HRNet, and RTMPose alike, replacing fixed-channel NME
+as the primary reported number. Rationale, in the supervisor's own words:
+the two fetal-biometry endpoints define the SAME clinical measurement
+regardless of which one is labelled "left"/"channel 0" -- an evaluator
+that penalises a channel-identity swap is measuring an artificial
+convention with no independent clinical meaning, not a real localisation
+error. This is a **metric-definition** decision: no prediction coordinate
+is read, modified, or selected based on GT; GT is only used, as in any
+correspondence-matching evaluation, to decide which GT point counts as
+matched to which predicted point for an unordered pair.
+
+**The metric** (`permutation_invariant_nme()` in
+`rescore_endpoint_conventions.py`): for each image,
+
+```
+E_direct  = ||p0 - g0|| + ||p1 - g1||
+E_crossed = ||p0 - g1|| + ||p1 - g0||
+E         = min(E_direct, E_crossed)
+```
+
+normalised and aggregated exactly as fixed-channel NME always was (divide
+by the GT inter-endpoint distance, mean over seeds, report 5-seed
+mean ± sample SD). This is mathematically identical to this project's own
+`oracle_min` diagnostic (verified exactly, over 500 randomised trials, not
+just argued -- see the test suite) and to HRNet's own native
+`swap_min_nme` column (cross-checked against it directly on load, see
+`_check_permutation_invariant_sanity`) -- the same computation, now
+formally adopted as the metric rather than a diagnostic layered on top of
+a different one.
+
+**The official final table**: `permutation_invariant_nme_final_table.md`/
+`.tsv` (written by every run, see `write_final_permutation_invariant_table()`).
+UCL BPD's two EoMT cells are marked `Unavailable` -- the retained per-image
+predictions and checkpoints are confirmed gone from the server, and this
+is NEVER backfilled with a historical fixed-channel number computed under
+a different convention.
+
+**No retraining, no new inference required**: this re-scores the SAME
+already-saved per-image predictions used throughout this analysis.
+Applies retrospectively to the retained EoMT and HRNet predictions, and
+prospectively to RTMPose once its results exist (same evaluator function,
+no method-specific special-casing).
+
+**Explicitly out of scope for the main table, per the same decision**
+(kept fully computed below for the Appendix/audit trail, not deleted):
+prediction-only x-sorting, frozen-DOD canonicalisation, and raw
+channel-identity preservation as a primary metric. These were tested as
+candidate GT-independent inference-time fixes BEFORE the permutation-
+invariant decision; frozen-DOD in particular came very close to the
+GT-informed diagnostic value and remains documented below as it may
+inform a future redesign of EoMT's own heatmap-channel convention if the
+models are ever retrained -- but is not needed to evaluate the current
+models under an unordered-pair metric.
+
+## What this does and does not do (Appendix -- historical audit trail below this line)
 
 Re-scores EXISTING, already-saved per-image EoMT/HRNet predictions under
 two common EXTERNAL conventions, without retraining, without re-running
@@ -156,9 +222,17 @@ python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
 
 ```
 endpoint_ordering_analysis/results/
+  permutation_invariant_nme_final_table.md    *** THE OFFICIAL RESULT ***. Ready-to-paste
+                                               Markdown table, permutation-invariant NME
+                                               (%) +-5-seed sample SD, per (dataset, method,
+                                               task). Missing cells (UCL BPD EoMT) marked
+                                               "Unavailable", never backfilled.
+  permutation_invariant_nme_final_table.tsv   same data, machine-readable
   endpoint_ordering_summary.tsv               one row per (dataset, task, method): 5-seed
-                                               mean+-SD for all 3 conventions, GT disagreement
-                                               rate, raw-channel-vs-prediction-x-sort audit,
+                                               mean+-SD for permutation_invariant_nme (the
+                                               official metric) PLUS every Appendix-only
+                                               convention below, GT disagreement rate,
+                                               raw-channel-vs-prediction-x-sort audit,
                                                prediction reversal rate, and x-sort-vs-DOD
                                                mean difference + bootstrap 95% CI
   endpoint_ordering_seed_summary.tsv          one row per (dataset, task, method, seed, convention)
@@ -175,21 +249,26 @@ endpoint_ordering_analysis/results/
                                                on location or on x-sort-vs-DOD disagreement rate --
                                                a non-empty file signals a coordinate-recovery or
                                                sample-matching bug, not a real dataset property
-  raw_channel_vs_prediction_xsort_summary.tsv a compact extract of endpoint_ordering_summary.tsv's
-                                               raw-channel/prediction-x-sort columns only (see
-                                               "For the supervisor's immediate ... question" below
-                                               for what these mean and, critically, for which
-                                               method they are and are not a meaningful diagnostic)
-  correspondence_diagnostic_summary.tsv       DIFFERENT question from the above: does p0/p1 actually
-                                               correspond, by distance, to the correct GT side, or
-                                               only look reversed in raw x-order? See "Correspondence
-                                               diagnostic" below -- prediction_x_reversal_rate alone
-                                               cannot answer this, especially for near-vertical
-                                               diameters (BPD/TAD)
+  raw_channel_vs_prediction_xsort_summary.tsv (APPENDIX / historical) a compact extract of
+                                               endpoint_ordering_summary.tsv's raw-channel/
+                                               prediction-x-sort columns only -- part of the
+                                               audit trail that led to the permutation-invariant
+                                               decision above, not part of the main result
+  correspondence_diagnostic_summary.tsv       (APPENDIX / historical) the analysis that directly
+                                               motivated the supervisor's decision above: does
+                                               p0/p1 actually correspond, by distance, to the
+                                               correct GT side, or only look reversed in raw
+                                               x-order? See "Correspondence diagnostic" below
 ```
 
-For the supervisor's immediate training/inference correspondence question,
-use these columns from `endpoint_ordering_summary.tsv`:
+**Everything from here to "Reading the summary for the supervisor
+conversation" is Appendix / historical audit-trail material** -- how the
+permutation-invariant decision above was reached, kept in full for
+provenance, not part of the main result.
+
+For the (pre-decision) audit trail's own "immediate training/inference
+correspondence question," these columns from `endpoint_ordering_summary.tsv`
+were used:
 
 - `raw_channel_original_5seed_mean_pct` / `*_sample_sd_pct`: channel 0 and
   channel 1 retained exactly as decoded, compared with left/right x-sorted
@@ -222,7 +301,13 @@ not the x-sort-left point. Read HRNet's numbers here as "the cost of
 scoring HRNet under an x-sort assumption it was never trained for," not as
 evidence of a channel-assignment defect in HRNet itself.
 
-## Correspondence diagnostic (`correspondence_diagnostic_summary.tsv`)
+## Correspondence diagnostic (`correspondence_diagnostic_summary.tsv`) -- APPENDIX / historical
+
+**This section documents the analysis that led directly to the
+permutation-invariant decision at the top of this README.** It is retained
+in full as the audit trail; the numbers here (`raw_channel_original`,
+`cross_pairing`, `oracle_min`, etc.) are Appendix material, not the main
+result -- see `permutation_invariant_nme_final_table.md` for that.
 
 `prediction_x_reversal_rate` only checks whether the RAW prediction pair
 keeps its own left-to-right order (`pred0.x > pred1.x`) -- it does NOT
@@ -304,7 +389,14 @@ rates ACROSS HRNet and EoMT directly, see the native-convention note above):
   under the opposite pairing -- worth a closer per-image look, but still
   subject to the same non-causal caveat above.
 
-## Reading the summary for the supervisor conversation
+## Reading the summary for the supervisor conversation -- APPENDIX / historical
+
+**Superseded by the permutation-invariant decision at the top of this
+README for the MAIN result.** Retained as the record of how "Question 1"
+below was actually resolved (see "THE OFFICIAL EVALUATION METRIC" section)
+and because "Question 2" (endpoint-ordering convention choice) remains
+independently useful context for RTMPose/future redesign discussions, even
+though it is no longer needed to score the CURRENT models.
 
 This analysis answers TWO separate questions -- do not compress them into
 one table, they use different columns and support different conclusions.

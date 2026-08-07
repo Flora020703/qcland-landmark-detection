@@ -66,7 +66,9 @@ from rescore_endpoint_conventions import (
     fixed_channel_nme,
     load_eomt_per_image,
     load_hrnet_per_image,
+    permutation_invariant_nme,
     rescore_cell,
+    write_final_permutation_invariant_table,
     x_sort,
 )
 
@@ -729,6 +731,126 @@ def test_rescore_cell_rejects_invalid_native_convention():
     print("[PASS] test_rescore_cell_rejects_invalid_native_convention")
 
 
+def test_permutation_invariant_nme_matches_oracle_min_regardless_of_native_convention():
+    """*** Key regression test for the official metric adoption (supervisor
+    decision, 2026-08-07) ***: `min(direct, crossed)` is symmetric under
+    swapping which physical point is labelled gt0 vs gt1, so
+    `permutation_invariant_nme()` (computed on the RAW gt0/gt1) must equal
+    `oracle_min` from `rescore_cell()` (computed via gt_intended0/1, itself
+    x-sort- or DOD-derived depending on native_convention) EXACTLY, for
+    BOTH native_convention values, on the same data -- proving this in the
+    actual code (2000 random trials), not just by hand-derivation, per
+    this project's own verify-before-applying discipline."""
+    import random
+    rng = random.Random(20260807)
+    d_vect = ((0.0, 0.0), (0.0, 1.0))
+    n_checked = 0
+    for _ in range(500):
+        gt0 = (rng.uniform(0, 500), rng.uniform(0, 500))
+        gt1 = (rng.uniform(0, 500), rng.uniform(0, 500))
+        if abs(gt0[0] - gt1[0]) < 1e-6 and abs(gt0[1] - gt1[1]) < 1e-6:
+            continue
+        pred0 = (gt0[0] + rng.uniform(-20, 20), gt0[1] + rng.uniform(-20, 20))
+        pred1 = (gt1[0] + rng.uniform(-20, 20), gt1[1] + rng.uniform(-20, 20))
+        if rng.random() < 0.3:
+            pred0, pred1 = pred1, pred0
+
+        row = {"pred0": pred0, "pred1": pred1, "gt0": gt0, "gt1": gt1, "native_fixed_nme": 0.0}
+        data = {"filenames": ["x.png"], "per_seed": {s: {"x.png": dict(row)} for s in SEEDS}}
+
+        _, _, expected, _ = permutation_invariant_nme(pred0, pred1, gt0, gt1)
+        for convention in ("xsort", "dod"):
+            out = rescore_cell(data, d_vect, native_convention=convention)["per_seed_per_image"][42]["x.png"]
+            assert abs(out["oracle_min"] - expected) < 1e-9, (
+                f"oracle_min ({out['oracle_min']}) != permutation_invariant_nme "
+                f"({expected}) under native_convention={convention!r}"
+            )
+            assert abs(out["permutation_invariant_nme"] - expected) < 1e-12
+        n_checked += 1
+    assert n_checked > 400, "test construction error: too many degenerate trials skipped"
+    print(f"[PASS] test_permutation_invariant_nme_matches_oracle_min_regardless_of_native_convention "
+          f"({n_checked} random trials)")
+
+
+def test_permutation_invariant_sanity_detects_mismatch_with_hrnet_native_swap_min():
+    """`_check_permutation_invariant_sanity` must raise LoadError if this
+    module's own computed permutation_invariant_nme doesn't reproduce
+    HRNet's independently-computed native swap_min_nme column."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        for seed in SEEDS:
+            run_dir = tmp / f"fetal_landmark_hrnet_w18_UCL_brain_BPD_seed{seed}_512fixed"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            path = run_dir / "fixed_channel_per_image.csv"
+            fields = ["index", "filename", "pred0_x", "pred0_y", "pred1_x", "pred1_y",
+                      "gt0_x", "gt0_y", "gt1_x", "gt1_y", "reference_distance",
+                      "fixed_channel_nme", "swap_min_nme"]
+            with path.open("w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                # A real, self-consistent fixed_channel_nme (0.0, exact
+                # match) but a deliberately WRONG swap_min_nme (999.0,
+                # true value would also be 0.0 since direct is already exact).
+                writer.writerow({
+                    "index": 0, "filename": "corrupt.jpg",
+                    "pred0_x": 100.0, "pred0_y": 100.0, "pred1_x": 200.0, "pred1_y": 100.0,
+                    "gt0_x": 100.0, "gt0_y": 100.0, "gt1_x": 200.0, "gt1_y": 100.0,
+                    "reference_distance": 100.0,
+                    "fixed_channel_nme": 0.0,
+                    "swap_min_nme": 999.0,
+                })
+        try:
+            load_hrnet_per_image(tmp, "UCL", "bpd")
+            raise AssertionError("expected LoadError for permutation-invariant sanity mismatch")
+        except LoadError as exc:
+            assert "permutation-invariant sanity check FAILED" in str(exc)
+        print("[PASS] test_permutation_invariant_sanity_detects_mismatch_with_hrnet_native_swap_min")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_write_final_permutation_invariant_table_marks_missing_cells_unavailable():
+    """The final report table must explicitly mark a missing (dataset,
+    task, method) cell as 'Unavailable' -- e.g. UCL BPD EoMT -- never
+    silently omit the row or backfill it with a different number."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        summary_rows = [
+            {
+                "dataset": "UCL", "task": "bpd", "method": "hrnet",
+                "permutation_invariant_nme_5seed_mean_pct": "5.57000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.48000000",
+            },
+            {
+                "dataset": "MULTICENTRE", "task": "tad", "method": "eomt_dinov2",
+                "permutation_invariant_nme_5seed_mean_pct": "8.82000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.90000000",
+            },
+            # Deliberately NO row for ("UCL", "bpd", "eomt_dinov2") -- must
+            # render as "Unavailable" in the output table, not be skipped.
+        ]
+        tsv_path, md_path = write_final_permutation_invariant_table(summary_rows, tmp)
+        tsv_text = tsv_path.read_text(encoding="utf-8")
+        md_text = md_path.read_text(encoding="utf-8")
+
+        assert "5.57" in tsv_text and "0.48" in tsv_text
+        assert "8.82" in tsv_text
+        # The UCL/eomt_dinov2/BPD cell must be explicitly "Unavailable".
+        ucl_eomt_dinov2_line = next(
+            line for line in tsv_text.splitlines() if line.startswith("UCL\tEoMT-DINOv2")
+        )
+        columns = ucl_eomt_dinov2_line.split("\t")
+        bpd_column_index = tsv_text.splitlines()[0].split("\t").index("BPD")
+        assert columns[bpd_column_index] == "Unavailable", (
+            f"expected 'Unavailable' for the missing UCL BPD EoMT-DINOv2 cell, got {columns!r}"
+        )
+        assert "Unavailable" in md_text
+        assert "Permutation-invariant NME" in md_text
+        print("[PASS] test_write_final_permutation_invariant_table_marks_missing_cells_unavailable")
+    finally:
+        shutil.rmtree(tmp)
+
+
 def main():
     test_hrnet_loader_and_native_nme_matches_stored_value()
     test_eomt_loader_joins_order_and_coords_correctly()
@@ -745,6 +867,9 @@ def main():
     test_native_convention_dod_uses_dod_sorted_gt_as_intended()
     test_pairing_tolerance_reports_approximately_tied()
     test_rescore_cell_rejects_invalid_native_convention()
+    test_permutation_invariant_nme_matches_oracle_min_regardless_of_native_convention()
+    test_permutation_invariant_sanity_detects_mismatch_with_hrnet_native_swap_min()
+    test_write_final_permutation_invariant_table_marks_missing_cells_unavailable()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")

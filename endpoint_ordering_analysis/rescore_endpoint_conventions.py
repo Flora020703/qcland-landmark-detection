@@ -142,6 +142,41 @@ by X pp," not "X pp of error is caused by wrong correspondence." See
 `correspondence_diagnostic_summary.tsv` and `rescore_cell()`'s own comment
 for the exact formulas.
 
+*** OFFICIAL METRIC DECISION (supervisor decision, 2026-08-07, SUPERSEDES
+fixed-channel NME as the primary reported metric for EoMT, HRNet, and
+RTMPose) ***: after reviewing the correspondence-diagnostic findings above,
+the supervisor decided that PERMUTATION-INVARIANT matching --
+`permutation_invariant_nme()`, `min(direct, crossed)` -- should be the
+metric definition going forward, not fixed-channel NME with a
+diagnostic layered on top. Rationale (recorded verbatim in project
+memory): the two fetal-biometry endpoints define the SAME clinical
+measurement regardless of which is labelled "left"/"channel 0", so an
+evaluator that penalises a channel-identity swap is measuring an
+artificial convention, not a real localisation error. This is a genuine
+METRIC-DEFINITION decision, not the same operation as the `oracle_min`
+diagnostic above used for a different purpose -- see
+`permutation_invariant_nme()`'s own docstring for why these are
+mathematically identical (verified, not just argued) despite serving two
+different roles at two different points in this project's history.
+
+Practical consequence for what to report and what belongs where:
+  - `permutation_invariant_nme` (and `write_final_permutation_invariant_table()`'s
+    output) is now the MAIN result to report for EoMT/HRNet (and RTMPose,
+    once results exist), computed identically for every method with no
+    special-casing.
+  - `raw_channel_original`/`xsort`/`dod`/`prediction_x_reversal_rate`/
+    `cross_pairing_preferred`/`oracle_min` and everything else described
+    above remain fully computed and written (nothing deleted, per this
+    project's own norm of never erasing an already-archived analysis) but
+    are now IMPLEMENTATION-AUDIT / Appendix material only -- useful for
+    explaining historical numbers and this investigation's own trail, but
+    must not be mixed into the main results table alongside
+    `permutation_invariant_nme`.
+  - UCL BPD's EoMT cells remain unavailable under this metric too (same
+    missing checkpoints/per-image files) -- `write_final_permutation_invariant_table()`
+    marks them `Unavailable` explicitly, never backfilled with a
+    historical fixed-channel number computed under a different convention.
+
 The three canonicalisation rules, everything now genuinely in ORIGINAL
 image pixel coordinates for BOTH methods:
   1. NATIVE: recomputed directly from each file's OWN raw dumped
@@ -316,6 +351,53 @@ def fixed_channel_nme(pred0, pred1, gt0, gt1) -> float:
     return err / (2.0 * ref)
 
 
+def permutation_invariant_nme(pred0, pred1, gt0, gt1) -> tuple[float, float, float, str]:
+    """*** THE OFFICIAL, FINAL EVALUATION METRIC (supervisor decision,
+    2026-08-07) for EoMT, HRNet, and RTMPose alike, superseding
+    fixed-channel NME as the primary reported number. ***
+
+    Rationale (the supervisor's own, recorded verbatim in project memory):
+    the two fetal-biometry endpoints define the SAME clinical measurement
+    regardless of which one is labelled "left"/"channel 0" -- swapping
+    them is not a localisation error, so the metric should match the two
+    PREDICTED points to the two GT points as an UNORDERED pair, not
+    penalise a channel-identity convention that has no independent
+    clinical meaning. This is a METRIC DEFINITION for an unordered pair,
+    not a post-hoc correction of individual predictions: no prediction
+    coordinate is read, modified, or selected based on GT -- GT is only
+    used, exactly as in any correspondence-matching evaluation, to decide
+    which GT point counts as matched to which predicted point when scoring
+    the pair, in a task where both admissible correspondences award the
+    same clinical measurement.
+
+    Mathematically identical to (verified exactly, not just argued, in the
+    test suite):
+      - this module's own historical `oracle_min` diagnostic (round 12,
+        2026-08-07) -- `min(direct, crossed)` is symmetric under swapping
+        which physical point is called gt0 vs gt1, so oracle_min's value
+        does not depend on `native_convention`, and always already equalled
+        this quantity;
+      - HRNet's own native `swap_min_nme` column;
+      - `training/landmark_detection.py`'s `compute_nme(...,
+        endpoint_order_invariant=True)` branch.
+    `oracle_min` and its surrounding "diagnostic only" language are LEFT
+    UNCHANGED elsewhere in this file for historical-audit continuity (the
+    already-archived 2026-08-07 correspondence-diagnostic run used that
+    name and framing) -- this function is the new, forward-facing,
+    officially-named entry point for anything computed AFTER the
+    supervisor's decision.
+
+    Returns (direct_nme, crossed_nme, selected_nme, assignment) where
+    `assignment` is `"direct"` or `"crossed"` (a tie -- direct <= crossed --
+    resolves to `"direct"`, never swapping on exact equality, matching this
+    project's established tie-break convention elsewhere)."""
+    direct = fixed_channel_nme(pred0, pred1, gt0, gt1)
+    crossed = fixed_channel_nme(pred0, pred1, gt1, gt0)
+    if crossed < direct:
+        return direct, crossed, crossed, "crossed"
+    return direct, crossed, direct, "direct"
+
+
 class LoadError(RuntimeError):
     """Raised (and caught at the top level, per-cell) when a specific
     (dataset, task[, backbone]) cell's real per-image files are missing,
@@ -370,7 +452,8 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
             raise LoadError(f"HRNet {dataset}/{task}/seed{seed}: missing {path}")
         rows = _read_rows(path)
         required = {"filename", "pred0_x", "pred0_y", "pred1_x", "pred1_y",
-                    "gt0_x", "gt0_y", "gt1_x", "gt1_y", "fixed_channel_nme"}
+                    "gt0_x", "gt0_y", "gt1_x", "gt1_y", "fixed_channel_nme",
+                    "swap_min_nme"}
         if not required.issubset(rows[0]):
             raise LoadError(
                 f"HRNet {dataset}/{task}/seed{seed}: {path} is missing required "
@@ -387,6 +470,10 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
                 "gt0": (float(r["gt0_x"]), float(r["gt0_y"])),
                 "gt1": (float(r["gt1_x"]), float(r["gt1_y"])),
                 "native_fixed_nme": float(r["fixed_channel_nme"]),
+                # HRNet's OWN independently-computed permutation-invariant
+                # NME (2026-08-07: cross-checked against this module's own
+                # permutation_invariant_nme() below, not just trusted).
+                "native_swap_min_nme": float(r["swap_min_nme"]),
             }
         per_seed[seed] = by_name
 
@@ -396,6 +483,7 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
             raise LoadError(f"HRNet {dataset}/{task}: filename set differs across seeds")
 
     _check_native_sanity("HRNet", dataset, task, per_seed)
+    _check_permutation_invariant_sanity("HRNet", dataset, task, per_seed)
     return {"per_seed": per_seed, "filenames": sorted(keys)}
 
 
@@ -553,6 +641,41 @@ def _check_native_sanity(method_label: str, dataset: str, task: str, per_seed: d
           f"{worst_rel_err:.2e}, over {n_checked} (seed,image) pairs")
 
 
+def _check_permutation_invariant_sanity(method_label: str, dataset: str, task: str, per_seed: dict) -> None:
+    """Cross-checks this module's own `permutation_invariant_nme()` against
+    HRNet's INDEPENDENTLY-computed native `swap_min_nme` column (2026-08-07,
+    per the supervisor's decision to adopt permutation-invariant matching as
+    the official metric) -- both are computed from the same raw pred/gt
+    coordinates, so they must agree exactly (up to the same combined
+    tolerance `_check_native_sanity` uses) if this module's implementation
+    is correct. This is a genuine independent-recomputation check, not a
+    tautology: HRNet's `swap_min_nme` was written by a completely different
+    codebase (`baseline_reproduction/evaluate_hrnet_fixed.py`) at a
+    different time, using its own `min(direct, crossed)` implementation."""
+    worst_abs_err = 0.0
+    all_within_tolerance = True
+    n_checked = 0
+    for seed, by_name in per_seed.items():
+        for fn, row in by_name.items():
+            _, _, recomputed, _ = permutation_invariant_nme(row["pred0"], row["pred1"], row["gt0"], row["gt1"])
+            stored = row["native_swap_min_nme"]
+            abs_err = abs(recomputed - stored)
+            worst_abs_err = max(worst_abs_err, abs_err)
+            if abs_err > NATIVE_SANITY_ATOL + NATIVE_SANITY_RTOL * abs(stored):
+                all_within_tolerance = False
+            n_checked += 1
+    if not all_within_tolerance:
+        raise LoadError(
+            f"{method_label} {dataset}/{task}: permutation-invariant sanity check FAILED "
+            f"(worst absolute error {worst_abs_err:.3e} across {n_checked} (seed, image) "
+            f"pairs) -- this module's permutation_invariant_nme() does not reproduce "
+            f"{method_label}'s own independently-computed swap_min_nme; do not trust the "
+            f"official metric for this cell until this is resolved."
+        )
+    print(f"  [permutation-invariant sanity OK] {method_label} {dataset}/{task}: "
+          f"worst absolute error {worst_abs_err:.2e} over {n_checked} (seed,image) pairs")
+
+
 def bootstrap_ci(values: np.ndarray, replicates: int, rng: np.random.Generator) -> tuple[float, float]:
     means = np.empty(replicates, dtype=np.float64)
     chunk = 1000
@@ -683,6 +806,16 @@ def rescore_cell(data: dict, d_vect, native_convention: str = "xsort") -> dict:
             pred_d0, pred_d1 = dod_sort(pred0, pred1, d_vect)
             dod_nme = fixed_channel_nme(pred_d0, pred_d1, gt_d0, gt_d1)
 
+            # *** OFFICIAL METRIC (supervisor decision, 2026-08-07) ***: see
+            # permutation_invariant_nme()'s own docstring. Computed from the
+            # RAW gt0/gt1 (as loaded, NOT gt_intended) specifically to make
+            # this manifestly independent of `native_convention` in the code
+            # itself, not just by mathematical argument -- verified equal to
+            # `oracle_min` above (any native_convention) in the test suite.
+            perm_direct, perm_crossed, perm_selected, perm_assignment = permutation_invariant_nme(
+                pred0, pred1, gt0, gt1
+            )
+
             out[fn] = {
                 "native": native_nme,
                 "raw_channel_original": raw_channel_nme,
@@ -693,6 +826,10 @@ def rescore_cell(data: dict, d_vect, native_convention: str = "xsort") -> dict:
                 "prediction_x_reversed": prediction_x_reversed,
                 "cross_pairing_preferred": cross_pairing_preferred,
                 "pairing_status": pairing_status,
+                "permutation_invariant_nme": perm_selected,
+                "permutation_invariant_direct": perm_direct,
+                "permutation_invariant_crossed": perm_crossed,
+                "permutation_invariant_assignment": perm_assignment,
             }
 
             if seed == SEEDS[0]:
@@ -718,7 +855,8 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
 
     seed_rows = []
     for seed in SEEDS:
-        for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min", "xsort", "dod"):
+        for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min",
+                     "permutation_invariant_nme", "xsort", "dod"):
             values = np.array([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
             seed_rows.append({
                 "dataset": dataset, "task": task, "method": method_label, "seed": seed,
@@ -733,12 +871,14 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
             })
 
     per_image_avg = {}
-    for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min", "xsort", "dod"):
+    for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min",
+                 "permutation_invariant_nme", "xsort", "dod"):
         stacked = np.array([[per_seed[seed][fn][conv] for seed in SEEDS] for fn in filenames]) * 100.0
         per_image_avg[conv] = stacked.mean(axis=1)  # average across 5 seeds, per image
 
     raw_vals = per_image_avg["raw_channel_original"]
     oracle_min_vals = per_image_avg["oracle_min"]
+    perm_vals = per_image_avg["permutation_invariant_nme"]
     xsort_vals = per_image_avg["xsort"]
     dod_vals = per_image_avg["dod"]
     raw_minus_xsort = raw_vals - xsort_vals
@@ -749,7 +889,10 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     per_image_path = output_root / f"{dataset.lower()}_{task}_{method_label}_per_image.csv"
     with per_image_path.open("w", newline="", encoding="utf-8") as handle:
         fields = [
-            "filename", "native_nme_pct", "raw_channel_original_nme_pct",
+            "filename",
+            "permutation_invariant_nme_pct",
+            "permutation_invariant_crossed_selected_fraction_across_seeds",
+            "native_nme_pct", "raw_channel_original_nme_pct",
             "cross_pairing_nme_pct",
             "intended_pairing_preferred_fraction_across_seeds",
             "cross_pairing_preferred_fraction_across_seeds",
@@ -764,6 +907,8 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
         for i, fn in enumerate(filenames):
             writer.writerow({
                 "filename": fn,
+                "permutation_invariant_nme_pct": f"{perm_vals[i]:.8f}",
+                "permutation_invariant_crossed_selected_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['permutation_invariant_assignment'] == 'crossed' for seed in SEEDS]):.8f}",
                 "native_nme_pct": f"{per_image_avg['native'][i]:.8f}",
                 "raw_channel_original_nme_pct": f"{raw_vals[i]:.8f}",
                 "cross_pairing_nme_pct": f"{per_image_avg['cross_pairing'][i]:.8f}",
@@ -784,7 +929,8 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
         "n_images": len(filenames),
         "gt_xsort_vs_dod_disagreement_rate": f"{rescored['gt_disagreement_rate']:.6f}",
     }
-    for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min", "xsort", "dod"):
+    for conv in ("native", "raw_channel_original", "cross_pairing", "oracle_min",
+                 "permutation_invariant_nme", "xsort", "dod"):
         seed_means = np.array([
             np.mean([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
             for seed in SEEDS
@@ -797,6 +943,15 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     ])
     summary_row["prediction_x_reversal_rate_5seed_mean"] = f"{reversal_rates.mean():.8f}"
     summary_row["prediction_x_reversal_rate_5seed_sample_sd"] = f"{reversal_rates.std(ddof=1):.8f}"
+    # How often the OFFICIAL metric selected the crossed assignment -- an
+    # implementation-audit statistic (belongs in the Appendix per the
+    # supervisor's own framing), not evidence about WHY, just how often.
+    perm_crossed_rates = np.array([
+        np.mean([per_seed[seed][fn]["permutation_invariant_assignment"] == "crossed" for fn in filenames])
+        for seed in SEEDS
+    ])
+    summary_row["permutation_invariant_crossed_selected_rate_5seed_mean"] = f"{perm_crossed_rates.mean():.8f}"
+    summary_row["permutation_invariant_crossed_selected_rate_5seed_sample_sd"] = f"{perm_crossed_rates.std(ddof=1):.8f}"
     # Three-way breakdown (2026-08-07 review finding): a strict `<` on two
     # continuous distances forces even a near-exact tie into "one pairing
     # preferred" -- report all three PAIRING_TOL-based categories so a tie
@@ -930,6 +1085,70 @@ def cross_method_gt_consistency_check(dataset: str, task: str, rescored_by_metho
                 "severe": "true" if severe else "false",
             })
     return warnings
+
+
+# Fixed row/column order for the final report table -- deliberately NOT
+# alphabetical, matches the anatomy grouping this project's own tables use
+# elsewhere (Head: BPD/OFD, Abdomen: APAD/TAD, Femur: FL).
+_FINAL_TABLE_TASK_ORDER = ("bpd", "ofd", "apad", "tad", "fl")
+_FINAL_TABLE_METHOD_ORDER = ("eomt_dinov2", "eomt_dinov3", "hrnet")
+_FINAL_TABLE_METHOD_DISPLAY = {
+    "eomt_dinov2": "EoMT-DINOv2", "eomt_dinov3": "EoMT-DINOv3", "hrnet": "HRNet-W18",
+}
+_FINAL_TABLE_DATASET_ORDER = ("UCL", "MULTICENTRE")
+
+
+def write_final_permutation_invariant_table(summary_rows: list[dict], output_root: Path) -> tuple[Path, Path]:
+    """*** THE final, supervisor-approved report table (2026-08-07) ***:
+    Permutation-invariant NME (%) +/- 5-seed sample SD, in original-image
+    coordinates, for EoMT/HRNet on every (dataset, task) already scored.
+    A missing cell (UCL BPD EoMT, both backbones -- checkpoints/per-image
+    files confirmed gone from the server) is written as `Unavailable`,
+    NEVER silently backfilled with a historical fixed-channel number or
+    any other substitute -- see excluded_images.tsv for the exact reason.
+    Writes both a machine-readable TSV and a ready-to-paste Markdown table
+    with the exact caption this project's own supervisor-facing convention
+    requires."""
+    by_key = {(r["dataset"], r["task"], r["method"]): r for r in summary_rows}
+
+    tsv_path = output_root / "permutation_invariant_nme_final_table.tsv"
+    md_path = output_root / "permutation_invariant_nme_final_table.md"
+
+    header = ["dataset", "method"] + [t.upper() for t in _FINAL_TABLE_TASK_ORDER]
+    data_rows = []
+    for dataset in _FINAL_TABLE_DATASET_ORDER:
+        for method in _FINAL_TABLE_METHOD_ORDER:
+            row = [dataset, _FINAL_TABLE_METHOD_DISPLAY[method]]
+            for task in _FINAL_TABLE_TASK_ORDER:
+                key = (dataset, task, method)
+                if key not in by_key:
+                    row.append("Unavailable")
+                    continue
+                r = by_key[key]
+                mean = float(r["permutation_invariant_nme_5seed_mean_pct"])
+                sd = float(r["permutation_invariant_nme_5seed_sample_sd_pct"])
+                row.append(f"{mean:.2f}±{sd:.2f}")
+            data_rows.append(row)
+
+    with tsv_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(header)
+        writer.writerows(data_rows)
+
+    with md_path.open("w", encoding="utf-8") as handle:
+        handle.write("**Permutation-invariant NME (%) ± seed-level sample SD, "
+                      "evaluated in original-image coordinates.**\n\n")
+        handle.write("| " + " | ".join(["Train/Test", "Method"] + list(_FINAL_TABLE_TASK_ORDER)).upper() + " |\n")
+        handle.write("|" + "---|" * len(header) + "\n")
+        for row in data_rows:
+            handle.write("| " + " | ".join(row) + " |\n")
+        handle.write(
+            "\nUCL BPD EoMT cells are `Unavailable`: retained per-image predictions/"
+            "checkpoints are confirmed absent from the server -- not backfilled with "
+            "any historical fixed-channel number.\n"
+        )
+
+    return tsv_path, md_path
 
 
 def main():
@@ -1093,6 +1312,10 @@ def main():
         writer.writeheader()
         writer.writerows(dvect_rows)
 
+    final_table_tsv_path, final_table_md_path = write_final_permutation_invariant_table(
+        all_summary_rows, args.output_root
+    )
+
     excluded_path = args.output_root / "excluded_images.tsv"
     with excluded_path.open("w", newline="", encoding="utf-8") as handle:
         fields = ["dataset", "task", "method", "reason"]
@@ -1118,15 +1341,25 @@ def main():
               f"cells' 'unified' numbers as trustworthy until resolved.")
     for row in excluded:
         print(f"  excluded: {row['dataset']}/{row['task']}/{row['method']}")
-    print(f"Wrote: {summary_path}, {audit_path}, {correspondence_path}, {seed_summary_path}, "
+    print(f"Wrote: {summary_path}, {audit_path}, {correspondence_path}, "
+          f"{final_table_tsv_path}, {final_table_md_path}, {seed_summary_path}, "
           f"{dvect_path}, {excluded_path}, {consistency_path}, and {n_scored} per-image CSVs "
           f"under {args.output_root}")
-    print("\n*** LIMITATION, repeat to the supervisor alongside these numbers ***")
-    print("This is a retrospective RE-SCORING of already-saved predictions under two")
-    print("external conventions -- it quantifies how much the EXTERNAL SCORING RULE")
-    print("alone changes each method's reported number and whether conclusions flip.")
-    print("It does NOT retrain either method, and does NOT prove a method trained")
-    print("under a different convention from the start would perform identically.")
+    print(f"\n*** OFFICIAL FINAL TABLE (supervisor decision, 2026-08-07): "
+          f"{final_table_md_path} ***")
+    print("The permutation_invariant_nme columns in this table/the summary TSVs are the")
+    print("OFFICIAL evaluation metric for EoMT, HRNet, and (once results exist) RTMPose,")
+    print("per an explicit supervisor decision: the two endpoints define one clinical")
+    print("measurement regardless of channel order, so matching them as an unordered pair")
+    print("is the metric definition, not a diagnostic correction of predictions.")
+    print("\n*** LIMITATION on the raw_channel_original/xsort/dod/prediction_x_reversal_rate")
+    print("columns (Appendix-only implementation-audit material, per the same decision --")
+    print("do NOT mix them into the main results table) ***")
+    print("These are a retrospective RE-SCORING of already-saved predictions under two")
+    print("external FIXED-CHANNEL conventions -- they quantify how much the external")
+    print("scoring rule alone changes each method's reported number under an ordered-pair")
+    print("assumption. They do NOT retrain either method, and do NOT prove a method")
+    print("trained under a different convention from the start would perform identically.")
     print(f"\n{n_excluded} of {n_task_cells} cells could NOT be scored (see excluded_images.tsv) --")
     print("for those specific (dataset, task) combinations, this analysis provides NO evidence")
     print("about endpoint-ordering sensitivity; state this explicitly, do not extrapolate from")
