@@ -49,7 +49,16 @@ just argued -- see the test suite) and to HRNet's own native
 `swap_min_nme` column (cross-checked against it directly on load, see
 `_check_permutation_invariant_sanity`) -- the same computation, now
 formally adopted as the metric rather than a diagnostic layered on top of
-a different one.
+a different one. **`oracle_min` itself is a deprecated historical alias,
+retained only for audit compatibility: its numerical operation is
+identical to the official permutation-invariant NME, while the earlier
+"diagnostic-only" interpretation described further below has been
+superseded by this supervisor-approved metric definition.** Do not read
+the "diagnostic only, never a valid metric" framing attached to
+`oracle_min` further down as still applying to the underlying
+computation -- it applies to that OLD interpretation, not to
+`permutation_invariant_nme` itself, which is deliberately the same numbers
+under a new, officially-adopted meaning.
 
 **The official final table**: `permutation_invariant_nme_final_table.md`/
 `.tsv` (written by every run, see `write_final_permutation_invariant_table()`).
@@ -58,11 +67,63 @@ predictions and checkpoints are confirmed gone from the server, and this
 is NEVER backfilled with a historical fixed-channel number computed under
 a different convention.
 
+**Common cross-method image subset, not each method's own full set**
+(2026-08-07 review finding, fixed the same day): real data showed EoMT and
+HRNet do not always share an identical per-image filename set for the same
+(dataset, task) -- e.g. Multicentre BPD had EoMT n=1191 vs HRNet n=1180.
+Comparing each method's own full, differently-sized set would silently mix
+a sample-composition difference into what is meant to be a pure method
+comparison. The official final table is therefore built from
+`common_subset/endpoint_ordering_summary.tsv`, in which every method for a
+given (dataset, task) has already been re-aggregated on the INTERSECTION
+of filenames across all methods loaded for that cell -- `n` is shown
+explicitly in every table cell (`mean±sd (n=...)`) and is now IDENTICAL
+across methods in the same row by construction. The top-level
+`endpoint_ordering_summary.tsv` (each method's own full available set) is
+retained unchanged as supplementary material -- compare the two if a
+cell's `n` differs between them, which signals exactly this kind of
+cross-method sample mismatch.
+
+**Strict missing-cell gate (`EXPECTED_MISSING`)** (2026-08-07 review
+finding, fixed the same day): a load failure is only ever expected for UCL
+BPD's two EoMT backbones (checkpoints/per-image files confirmed gone from
+the server). Any OTHER load failure is, by construction, something new --
+a bad path, a truncated file, a server-side regression -- and rendering it
+identically as `Unavailable` in the final table would disguise a real run
+problem as the one gap everyone already expects. After every run, the SET
+of (dataset, task, method) cells that actually failed to load is compared
+against `EXPECTED_MISSING`; if it is not EXACTLY equal, the run prints
+exactly which cell(s) are unexpectedly missing (or, symmetrically, which
+previously-missing cell unexpectedly started loading, as a reminder to
+update the constant) and exits non-zero WITHOUT generating the official
+final table. Every other diagnostic output (`endpoint_ordering_summary.tsv`,
+`excluded_images.tsv`, etc.) is still written first, so the reasons remain
+inspectable even when the run hard-fails on this gate.
+
 **No retraining, no new inference required**: this re-scores the SAME
 already-saved per-image predictions used throughout this analysis.
 Applies retrospectively to the retained EoMT and HRNet predictions, and
 prospectively to RTMPose once its results exist (same evaluator function,
 no method-specific special-casing).
+
+**Independent cross-codebase verification, and its current asymmetry**
+(2026-08-07 review finding): HRNet's own per-image CSV already carries an
+independently-computed `swap_min_nme` column, written by a completely
+different script (`baseline_reproduction/evaluate_hrnet_fixed.py`) --
+`load_hrnet_per_image` cross-checks this module's `permutation_invariant_nme`
+against it on every load (`_check_permutation_invariant_sanity`), a genuine
+cross-codebase check, not just two code paths in this same file agreeing.
+`load_eomt_per_image` performs the SAME cross-check, best-effort, against
+an optional `*_final_swapmin_per_image.csv` companion file if one happens
+to exist next to the required fixed-channel dump -- but whether such a
+file genuinely exists for any given EoMT run is not currently confirmed.
+When it is absent, the run prints
+`[permutation-invariant sanity SKIPPED] ...` and proceeds; in that case,
+`permutation_invariant_nme` for that EoMT cell is only verified against
+this module's own `oracle_min` (same script) and the 500-trial randomised
+property test in the test suite -- real but weaker evidence than HRNet's
+independent check. State this asymmetry explicitly if asked how thoroughly
+EoMT's official numbers were cross-validated.
 
 **Explicitly out of scope for the main table, per the same decision**
 (kept fully computed below for the Appendix/audit trail, not deleted):
@@ -223,27 +284,52 @@ python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
 ```
 endpoint_ordering_analysis/results/
   permutation_invariant_nme_final_table.md    *** THE OFFICIAL RESULT ***. Ready-to-paste
-                                               Markdown table, permutation-invariant NME
-                                               (%) +-5-seed sample SD, per (dataset, method,
-                                               task). Missing cells (UCL BPD EoMT) marked
-                                               "Unavailable", never backfilled.
+                                               Markdown table, permutation-invariant NME (%)
+                                               +-5-seed sample SD, WITH n SHOWN EXPLICITLY per
+                                               cell, per (dataset, method, task) -- built from
+                                               common_subset/ below, not the top-level
+                                               endpoint_ordering_summary.tsv. Missing cells
+                                               (UCL BPD EoMT) marked "Unavailable", never
+                                               backfilled. Only generated if the actual set of
+                                               load failures exactly equals EXPECTED_MISSING
+                                               (see the strict missing-cell gate above) --
+                                               otherwise the run exits non-zero before this
+                                               file is written.
   permutation_invariant_nme_final_table.tsv   same data, machine-readable
-  endpoint_ordering_summary.tsv               one row per (dataset, task, method): 5-seed
-                                               mean+-SD for permutation_invariant_nme (the
-                                               official metric) PLUS every Appendix-only
-                                               convention below, GT disagreement rate,
-                                               raw-channel-vs-prediction-x-sort audit,
-                                               prediction reversal rate, and x-sort-vs-DOD
-                                               mean difference + bootstrap 95% CI
-  endpoint_ordering_seed_summary.tsv          one row per (dataset, task, method, seed, convention)
+  common_subset/                              *** the OFFICIAL common-cross-method-subset
+                                               re-aggregation this final table is built from ***
+                                               -- same file layout as the top level (below),
+                                               but every method's per-image set is first
+                                               restricted to the filenames ALL methods loaded
+                                               for that (dataset, task) share.
+    endpoint_ordering_summary.tsv             one row per (dataset, task, method), on the
+                                               common subset -- `n_images` is identical across
+                                               methods in the same (dataset, task) by construction
+    endpoint_ordering_seed_summary.tsv        (same, per seed)
+    *_per_image.csv                           per-image rows restricted to the common subset
+  endpoint_ordering_summary.tsv               SUPPLEMENTARY: one row per (dataset, task, method),
+                                               on EACH METHOD'S OWN FULL available set (sample
+                                               counts may legitimately differ across methods --
+                                               compare `n_images` here against common_subset/'s
+                                               copy to see by how much). 5-seed mean+-SD for
+                                               permutation_invariant_nme (the official metric)
+                                               PLUS every Appendix-only convention below, GT
+                                               disagreement rate, raw-channel-vs-prediction-
+                                               x-sort audit, prediction reversal rate, and
+                                               x-sort-vs-DOD mean difference + bootstrap 95% CI
+  endpoint_ordering_seed_summary.tsv          one row per (dataset, task, method, seed, convention),
+                                               full set (supplementary, see above)
   ucl_*_per_image.csv                         per-image, 5-seed-averaged NME under all 3
-                                               conventions, in unified original-image coordinates
-  multicentre_*_per_image.csv                 (same, Multicentre)
+                                               conventions, in unified original-image coordinates,
+                                               full set (supplementary)
+  multicentre_*_per_image.csv                 (same, Multicentre, full set)
   dod_vectors.tsv                             every frozen (dataset, task) direction vector used
   excluded_images.tsv                         every (dataset, task, method) cell that could not
                                                be scored, and exactly why (missing files, missing
                                                coordinate columns, missing original image file) --
-                                               never silently dropped
+                                               never silently dropped. Checked after every run
+                                               against EXPECTED_MISSING (see above); any cell here
+                                               NOT in that constant hard-fails the run.
   cross_method_gt_consistency_warnings.tsv    any (dataset, task) where HRNet's and EoMT's own
                                                GT (after EoMT's original-space conversion) disagree
                                                on location or on x-sort-vs-DOD disagreement rate --
@@ -349,9 +435,18 @@ comparison, computed in `rescore_cell()`:
   `E_crossed` isn't arbitrarily assigned to whichever side of zero
   floating-point noise landed on). `cross_pairing_preferred` is `True` iff
   `pairing_status == "crossed_preferred"`.
-- `oracle_min`: `min(E_intended, E_crossed)`. **DIAGNOSTIC ONLY -- never an
-  inference-time metric.** It uses GT to pick the better-scoring pairing
-  after the fact, which no real deployment could do.
+- `oracle_min`: `min(E_intended, E_crossed)`. At the time this diagnostic
+  was built, **DIAGNOSTIC ONLY -- never an inference-time metric**: it uses
+  GT to pick the better-scoring pairing after the fact, which no real
+  deployment could do. **This interpretation is now superseded** (see "THE
+  OFFICIAL EVALUATION METRIC" at the top of this README): the supervisor
+  subsequently adopted exactly this computation, under the name
+  `permutation_invariant_nme`, as the official metric definition for an
+  unordered pair of clinically-equivalent endpoints -- `oracle_min` is kept
+  here, unchanged, only as a deprecated historical alias for audit-trail
+  continuity; do not read the "diagnostic only" framing below as still
+  describing the underlying number today, only the OLD framing this
+  diagnostic was originally built and named under.
 - `raw_minus_oracle_min`: an **oracle-reassignment reduction / correspondence-
   SENSITIVITY diagnostic** -- how much `raw_channel_original` could shrink
   under GT-informed reassignment. **This is not a causal decomposition**

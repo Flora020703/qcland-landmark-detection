@@ -303,6 +303,44 @@ PAIRING_TOL = 1e-8
 GT_CONSISTENCY_WARN_THRESHOLD_PX = 0.1
 GT_CONSISTENCY_FAIL_THRESHOLD_PX = 1.0
 
+# *** STRICT missing-cell allowlist (2026-08-07, review finding) ***: before
+# this, ANY load failure -- a genuinely-known gap (UCL BPD's EoMT
+# checkpoints) or a NEW, unrelated failure (a bad path, a truncated file, a
+# server-side regression) -- rendered identically as "Unavailable" in the
+# final table, so a brand-new bug could hide behind the one gap everyone
+# already expects. `main()` computes the SET of (dataset, task, method)
+# cells that actually failed to load and hard-fails the run (non-zero exit,
+# before generating the official table) unless it is EXACTLY this set --
+# not a subset, not a superset. If a cell in this set unexpectedly starts
+# loading successfully, that is also reported (loudly, non-fatally) as a
+# reminder to update this constant, since the table generator would
+# otherwise silently start reporting a real number for a cell every prior
+# run treated as categorically missing.
+EXPECTED_MISSING = {
+    ("UCL", "bpd", "eomt_dinov2"),
+    ("UCL", "bpd", "eomt_dinov3"),
+}
+
+
+def _restrict_to_filenames(data: dict, keep: set[str]) -> dict:
+    """Returns a copy of a loader's `{"per_seed": ..., "filenames": [...]}`
+    restricted to `keep` -- used to re-aggregate every method on the SAME
+    cross-method-common image subset (2026-08-07 review finding: real data
+    showed EoMT and HRNet do not always share an identical per-image
+    filename set for the same (dataset, task), e.g. Multicentre BPD had
+    EoMT n=1191 vs HRNet n=1180 -- comparing each method's own full,
+    differently-sized set silently mixes a sample-composition difference
+    into what is supposed to be a pure method comparison). Does not mutate
+    `data`; every downstream consumer (`rescore_cell`, `summarize_and_write`)
+    only reads `per_seed`/`filenames`, so restricting those two keys is
+    sufficient."""
+    filenames = [fn for fn in data["filenames"] if fn in keep]
+    per_seed = {
+        seed: {fn: by_name[fn] for fn in filenames}
+        for seed, by_name in data["per_seed"].items()
+    }
+    return {"per_seed": per_seed, "filenames": filenames}
+
 
 def _heatmap_dump_to_model_input_space(dumped_x: float, dumped_y: float) -> tuple[float, float]:
     """Recovers true 512x512 model-input-space coordinates from EoMT's raw
@@ -501,13 +539,28 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     actionable message rather than silently falling back to NME-only."""
     is_multicentre = dataset == "MULTICENTRE"
     per_seed_raw: dict[int, dict[str, dict]] = {}
+    # *** Best-effort independent EoMT-side swap-min cross-check (2026-08-07
+    # review finding) ***: the HRNet-side `_check_permutation_invariant_
+    # sanity` above is a genuine cross-codebase check (HRNet's swap_min_nme
+    # column comes from a completely different script). No equivalent
+    # currently exists for EoMT -- the 500-trial property test only proves
+    # two code paths WITHIN this same script agree. If a companion
+    # `*_final_swapmin_per_image.csv` file (naming mirrors the existing
+    # `*_final_fixedchannel_per_image.csv` convention) happens to exist next
+    # to the required fixed-channel dump, load and cross-check it the same
+    # way; if it does not exist, this is honestly reported as "no
+    # independent check available" rather than silently skipped or assumed.
+    eomt_swapmin_available = True
+    eomt_swapmin_reason = None
     for seed in SEEDS:
         if is_multicentre:
             run = eomt_root / f"multicentre-{task}-{backbone}" / f"seed{seed}"
             nme_path = run / f"seed{seed}_final_fixedchannel_per_image.csv"
+            swapmin_path = run / f"seed{seed}_final_swapmin_per_image.csv"
         else:
             run = eomt_root / f"{task}_{backbone}" / f"seed{seed}"
             nme_path = run / "final_fixedchannel_per_image.csv"
+            swapmin_path = run / "final_swapmin_per_image.csv"
         order_path = run / "test_image_order.csv"
         if not order_path.is_file() or not nme_path.is_file():
             raise LoadError(
@@ -533,6 +586,30 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
                 f"IMPOSSIBLE for this cell without re-running inference. Do not proceed "
                 f"with a partial/fabricated result for this cell."
             )
+        swapmin_by_index = None
+        if eomt_swapmin_available:
+            if not swapmin_path.is_file():
+                eomt_swapmin_available = False
+                eomt_swapmin_reason = f"optional file not found: {swapmin_path}"
+            else:
+                try:
+                    swapmin_rows = _read_rows(swapmin_path)
+                    value_col = next(
+                        (c for c in ("swap_min_nme", "permutation_invariant_nme", "nme")
+                         if swapmin_rows and c in swapmin_rows[0]), None
+                    )
+                    if not swapmin_rows or "index" not in swapmin_rows[0] or value_col is None:
+                        eomt_swapmin_available = False
+                        eomt_swapmin_reason = (
+                            f"{swapmin_path} exists but lacks a recognised "
+                            f"index/value column layout -- schema unknown, not assumed"
+                        )
+                    else:
+                        swapmin_by_index = {int(r["index"]): float(r[value_col]) for r in swapmin_rows}
+                except Exception as exc:  # noqa: BLE001 -- best-effort, must never break the required load path
+                    eomt_swapmin_available = False
+                    eomt_swapmin_reason = f"failed to parse optional {swapmin_path}: {exc}"
+
         by_index = {}
         for r in nme_rows:
             idx = int(r["index"])
@@ -545,6 +622,16 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
                 "gt1": (float(r["gt_x1"]), float(r["gt_y1"])),
                 "native_fixed_nme": float(r["nme"]),
             }
+        if eomt_swapmin_available and swapmin_by_index is not None:
+            if set(swapmin_by_index) != set(by_index):
+                eomt_swapmin_available = False
+                eomt_swapmin_reason = (
+                    f"{swapmin_path}'s index set does not match {nme_path}'s -- "
+                    f"cannot align rows, skipping the optional cross-check"
+                )
+            else:
+                for idx in by_index:
+                    by_index[idx]["native_swap_min_nme"] = swapmin_by_index[idx]
         if set(order) != set(by_index):
             raise LoadError(f"EoMT {dataset}/{task}/{backbone}/seed{seed}: index mismatch "
                              f"between {order_path} and {nme_path}")
@@ -564,6 +651,15 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     # native convention is computed in ITS OWN space, with no re-sort
     # needed since predicted/GT channels are already aligned 1:1 as trained).
     _check_native_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw)
+
+    if eomt_swapmin_available:
+        _check_permutation_invariant_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw)
+    else:
+        print(f"  [permutation-invariant sanity SKIPPED] EoMT({backbone}) {dataset}/{task}: "
+              f"no independent cross-check available ({eomt_swapmin_reason}) -- "
+              f"permutation_invariant_nme for this cell is only verified against this "
+              f"module's own oracle_min (same-script) and the 500-trial property test, "
+              f"not an independent codebase, unlike HRNet.")
 
     # *** THE FIX ***: convert every coordinate to real original-image
     # pixel space, using each image's REAL width/height (opened once per
@@ -643,15 +739,21 @@ def _check_native_sanity(method_label: str, dataset: str, task: str, per_seed: d
 
 def _check_permutation_invariant_sanity(method_label: str, dataset: str, task: str, per_seed: dict) -> None:
     """Cross-checks this module's own `permutation_invariant_nme()` against
-    HRNet's INDEPENDENTLY-computed native `swap_min_nme` column (2026-08-07,
-    per the supervisor's decision to adopt permutation-invariant matching as
-    the official metric) -- both are computed from the same raw pred/gt
-    coordinates, so they must agree exactly (up to the same combined
+    the CALLER's own INDEPENDENTLY-computed `native_swap_min_nme` column
+    (2026-08-07, per the supervisor's decision to adopt permutation-invariant
+    matching as the official metric) -- both are computed from the same raw
+    pred/gt coordinates, so they must agree exactly (up to the same combined
     tolerance `_check_native_sanity` uses) if this module's implementation
     is correct. This is a genuine independent-recomputation check, not a
-    tautology: HRNet's `swap_min_nme` was written by a completely different
-    codebase (`baseline_reproduction/evaluate_hrnet_fixed.py`) at a
-    different time, using its own `min(direct, crossed)` implementation."""
+    tautology, PROVIDED `native_swap_min_nme` really was written by a
+    different codebase at a different time: HRNet's `swap_min_nme` column
+    (`baseline_reproduction/evaluate_hrnet_fixed.py`'s own `min(direct,
+    crossed)` implementation) always qualifies; an optional EoMT-side
+    `final_swapmin_per_image.csv` companion file (best-effort, see
+    `load_eomt_per_image`) qualifies only if such a file genuinely exists on
+    the server -- `load_eomt_per_image` only calls this function when one
+    was actually found and parsed, never fabricates one to call this
+    unconditionally."""
     worst_abs_err = 0.0
     all_within_tolerance = True
     n_checked = 0
@@ -1102,6 +1204,17 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
     """*** THE final, supervisor-approved report table (2026-08-07) ***:
     Permutation-invariant NME (%) +/- 5-seed sample SD, in original-image
     coordinates, for EoMT/HRNet on every (dataset, task) already scored.
+
+    `summary_rows` MUST be the COMMON-SUBSET summary rows (2026-08-07
+    review finding), i.e. each method already re-aggregated on the SAME
+    cross-method filename intersection for that (dataset, task) -- real
+    data showed EoMT and HRNet do not always share an identical per-image
+    set (e.g. Multicentre BPD: EoMT n=1191, HRNet n=1180), so feeding this
+    function each method's own full, differently-sized set would silently
+    compare on different images. Each cell therefore also displays `n`
+    explicitly, which is now IDENTICAL across every method in a given
+    (dataset, task) row by construction.
+
     A missing cell (UCL BPD EoMT, both backbones -- checkpoints/per-image
     files confirmed gone from the server) is written as `Unavailable`,
     NEVER silently backfilled with a historical fixed-channel number or
@@ -1127,7 +1240,8 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
                 r = by_key[key]
                 mean = float(r["permutation_invariant_nme_5seed_mean_pct"])
                 sd = float(r["permutation_invariant_nme_5seed_sample_sd_pct"])
-                row.append(f"{mean:.2f}±{sd:.2f}")
+                n = r["n_images"]
+                row.append(f"{mean:.2f}±{sd:.2f} (n={n})")
             data_rows.append(row)
 
     with tsv_path.open("w", newline="", encoding="utf-8") as handle:
@@ -1136,8 +1250,9 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
         writer.writerows(data_rows)
 
     with md_path.open("w", encoding="utf-8") as handle:
-        handle.write("**Permutation-invariant NME (%) ± seed-level sample SD, "
-                      "evaluated in original-image coordinates.**\n\n")
+        handle.write("**Permutation-invariant NME (%) ± seed-level sample SD (n = common "
+                      "cross-method image subset size), evaluated in original-image "
+                      "coordinates.**\n\n")
         handle.write("| " + " | ".join(["Train/Test", "Method"] + list(_FINAL_TABLE_TASK_ORDER)).upper() + " |\n")
         handle.write("|" + "---|" * len(header) + "\n")
         for row in data_rows:
@@ -1146,6 +1261,13 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
             "\nUCL BPD EoMT cells are `Unavailable`: retained per-image predictions/"
             "checkpoints are confirmed absent from the server -- not backfilled with "
             "any historical fixed-channel number.\n"
+        )
+        handle.write(
+            "\n`n` is the size of the cross-method common image-filename intersection for "
+            "that (dataset, task), NOT necessarily each method's own full available test-set "
+            "size -- see common_subset/endpoint_ordering_summary.tsv (official) vs "
+            "endpoint_ordering_summary.tsv (each method's own full set, supplementary) if "
+            "the two differ for a given cell.\n"
         )
 
     return tsv_path, md_path
@@ -1176,6 +1298,19 @@ def main():
 
     all_seed_rows: list[dict] = []
     all_summary_rows: list[dict] = []
+    # *** COMMON-SUBSET (OFFICIAL) results (2026-08-07 review finding) ***:
+    # `all_summary_rows`/`all_seed_rows` above are each method's own FULL
+    # available per-image set -- kept exactly as before as SUPPLEMENTARY
+    # material, since real data showed these sets are not always identical
+    # across methods for the same (dataset, task) (e.g. Multicentre BPD:
+    # EoMT n=1191, HRNet n=1180). The OFFICIAL comparison (and the final
+    # permutation-invariant table) must use the cross-method INTERSECTION
+    # of filenames instead, so every method in a given (dataset, task) row
+    # is scored on the exact same images -- see `_restrict_to_filenames`.
+    all_common_seed_rows: list[dict] = []
+    all_common_summary_rows: list[dict] = []
+    common_subset_output_root = args.output_root / "common_subset"
+    common_subset_output_root.mkdir(parents=True, exist_ok=True)
     excluded: list[dict] = []
     gt_consistency_warnings: list[dict] = []
     dvect_rows = [
@@ -1195,6 +1330,7 @@ def main():
             image_cache = _ImageSizeCache(images_root, anatomy)
             d_vect = get_d_vect(dataset, task.upper())
             rescored_by_method: dict[str, dict] = {}
+            loaded_data_by_method: dict[str, dict] = {}
 
             cell_specs = [("hrnet", None)] + [("eomt", b) for b in BACKBONES]
             for method, backbone in cell_specs:
@@ -1217,6 +1353,11 @@ def main():
                 # DOD-vs-x-sort disagreement rate (see rescore_cell()'s
                 # own docstring for why).
                 native_convention = "dod" if method == "hrnet" else "xsort"
+
+                # FULL available-set numbers -- SUPPLEMENTARY material (see
+                # the comment above `all_common_seed_rows`): each method's
+                # own complete per-image set, sample counts may legitimately
+                # differ across methods for the same (dataset, task).
                 rescored = rescore_cell(data, d_vect, native_convention=native_convention)
                 rescored_by_method[method_label] = rescored
                 seed_rows, summary_rows = summarize_and_write(
@@ -1225,12 +1366,41 @@ def main():
                 )
                 all_seed_rows.extend(seed_rows)
                 all_summary_rows.extend(summary_rows)
-                print(f"[OK] {dataset}/{task}/{method_label}: n={rescored['n_images']}, "
+                loaded_data_by_method[method_label] = data
+                print(f"[OK] {dataset}/{task}/{method_label}: n={rescored['n_images']} (full set), "
                       f"gt_disagreement={rescored['gt_disagreement_rate']:.4f}")
 
             gt_consistency_warnings.extend(
                 cross_method_gt_consistency_check(dataset, task, rescored_by_method)
             )
+
+            # *** COMMON-SUBSET re-aggregation (2026-08-07 review finding) ***:
+            # re-score every successfully-loaded method on the INTERSECTION
+            # of filenames across all methods loaded for this (dataset,
+            # task) -- this is the OFFICIAL comparison. When only one
+            # method loaded, the "intersection" is trivially that method's
+            # own full set, so a single-method cell (there are none today,
+            # but the code makes no assumption otherwise) is unaffected.
+            # Skipped entirely (no common-subset row emitted at all) when
+            # NOTHING loaded, matching how such a cell is already absent
+            # from `all_summary_rows`.
+            if loaded_data_by_method:
+                common_filenames = set.intersection(
+                    *(set(d["filenames"]) for d in loaded_data_by_method.values())
+                )
+                for method_label, data in loaded_data_by_method.items():
+                    native_convention = "dod" if method_label == "hrnet" else "xsort"
+                    common_data = _restrict_to_filenames(data, common_filenames)
+                    rescored_common = rescore_cell(common_data, d_vect, native_convention=native_convention)
+                    seed_rows_common, summary_rows_common = summarize_and_write(
+                        dataset, task, method_label, rescored_common, common_subset_output_root,
+                        args.bootstrap_replicates, rng,
+                    )
+                    all_common_seed_rows.extend(seed_rows_common)
+                    all_common_summary_rows.extend(summary_rows_common)
+                    print(f"  [common-subset] {dataset}/{task}/{method_label}: "
+                          f"n={rescored_common['n_images']} (of {len(data['filenames'])} "
+                          f"own full-set images)")
 
     n_task_cells = sum(len(tasks) for _, tasks, *_ in task_groups) * (1 + len(BACKBONES))
     if not all_summary_rows:
@@ -1253,6 +1423,26 @@ def main():
         writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
         writer.writeheader()
         writer.writerows(all_summary_rows)
+
+    # *** OFFICIAL common-subset summaries (2026-08-07 review finding) ***:
+    # same shape as the two files just above, but computed on the
+    # cross-method common-filename intersection per (dataset, task) -- this
+    # (not endpoint_ordering_summary.tsv) is what
+    # `write_final_permutation_invariant_table` below reads from.
+    common_seed_summary_path = common_subset_output_root / "endpoint_ordering_seed_summary.tsv"
+    common_summary_path = common_subset_output_root / "endpoint_ordering_summary.tsv"
+    if all_common_summary_rows:
+        with common_seed_summary_path.open("w", newline="", encoding="utf-8") as handle:
+            fields = list(all_common_seed_rows[0])
+            writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+            writer.writeheader()
+            writer.writerows(all_common_seed_rows)
+
+        with common_summary_path.open("w", newline="", encoding="utf-8") as handle:
+            fields = list(all_common_summary_rows[0])
+            writer = csv.DictWriter(handle, fieldnames=fields, delimiter="\t")
+            writer.writeheader()
+            writer.writerows(all_common_summary_rows)
 
     # Compact supervisor-facing table for the immediate question: does the
     # raw query/channel order obey the left-to-right target convention, and
@@ -1312,10 +1502,6 @@ def main():
         writer.writeheader()
         writer.writerows(dvect_rows)
 
-    final_table_tsv_path, final_table_md_path = write_final_permutation_invariant_table(
-        all_summary_rows, args.output_root
-    )
-
     excluded_path = args.output_root / "excluded_images.tsv"
     with excluded_path.open("w", newline="", encoding="utf-8") as handle:
         fields = ["dataset", "task", "method", "reason"]
@@ -1332,6 +1518,39 @@ def main():
         writer.writeheader()
         writer.writerows(gt_consistency_warnings)
 
+    # *** STRICT missing-cell gate (2026-08-07 review finding) ***: any
+    # load failure NOT in EXPECTED_MISSING is treated as a NEW, unexplained
+    # failure -- generating the official table anyway would render it
+    # identically to the already-known UCL-BPD-EoMT gap ("Unavailable"),
+    # silently hiding a real run problem. Checked AFTER all diagnostic
+    # outputs above are written, so the reasons are on disk either way.
+    actual_missing = {(row["dataset"], row["task"], row["method"]) for row in excluded}
+    unexpectedly_recovered = EXPECTED_MISSING - actual_missing
+    unexpected_missing = actual_missing - EXPECTED_MISSING
+    if unexpectedly_recovered:
+        print(f"\n*** REMINDER: {len(unexpectedly_recovered)} cell(s) previously in "
+              f"EXPECTED_MISSING loaded successfully this run -- update EXPECTED_MISSING in "
+              f"rescore_endpoint_conventions.py so the allowlist reflects reality: "
+              f"{sorted(unexpectedly_recovered)} ***")
+    if unexpected_missing:
+        print(f"\n*** HARD FAILURE: {len(unexpected_missing)} cell(s) failed to load that are "
+              f"NOT in the known EXPECTED_MISSING allowlist -- this looks like a NEW failure "
+              f"(bad path, truncated file, server regression), not the already-known "
+              f"UCL-BPD-EoMT gap. Refusing to generate the official final table: a silently "
+              f"'Unavailable' cell here could disguise a real run failure as the known one. ***")
+        for dataset, task, method in sorted(unexpected_missing):
+            reason = next(r["reason"] for r in excluded
+                          if (r["dataset"], r["task"], r["method"]) == (dataset, task, method))
+            print(f"  UNEXPECTED MISSING: {dataset}/{task}/{method}: {reason}")
+        print(f"Expected missing set: {sorted(EXPECTED_MISSING)}")
+        print(f"Actual missing set:   {sorted(actual_missing)}")
+        print(f"See {excluded_path} for full reasons. Exiting non-zero.")
+        sys.exit(1)
+
+    final_table_tsv_path, final_table_md_path = write_final_permutation_invariant_table(
+        all_common_summary_rows, args.output_root
+    )
+
     n_scored = len(all_summary_rows)
     n_excluded = len(excluded)
     print(f"\n[COMPLETE] {n_scored}/{n_task_cells} cells scored, {n_excluded}/{n_task_cells} excluded.")
@@ -1345,6 +1564,9 @@ def main():
           f"{final_table_tsv_path}, {final_table_md_path}, {seed_summary_path}, "
           f"{dvect_path}, {excluded_path}, {consistency_path}, and {n_scored} per-image CSVs "
           f"under {args.output_root}")
+    print(f"Also wrote common-subset (OFFICIAL) re-aggregation under {common_subset_output_root}: "
+          f"{common_summary_path}, {common_seed_summary_path}, and "
+          f"{len(all_common_summary_rows)} common-subset per-image CSVs.")
     print(f"\n*** OFFICIAL FINAL TABLE (supervisor decision, 2026-08-07): "
           f"{final_table_md_path} ***")
     print("The permutation_invariant_nme columns in this table/the summary TSVs are the")
@@ -1352,6 +1574,9 @@ def main():
     print("per an explicit supervisor decision: the two endpoints define one clinical")
     print("measurement regardless of channel order, so matching them as an unordered pair")
     print("is the metric definition, not a diagnostic correction of predictions.")
+    print("This final table is computed on the CROSS-METHOD COMMON image subset per")
+    print("(dataset, task) (2026-08-07 review finding), not each method's own full available")
+    print("set -- see common_subset/ vs the top-level endpoint_ordering_summary.tsv if they differ.")
     print("\n*** LIMITATION on the raw_channel_original/xsort/dod/prediction_x_reversal_rate")
     print("columns (Appendix-only implementation-audit material, per the same decision --")
     print("do NOT mix them into the main results table) ***")

@@ -54,6 +54,7 @@ from geometry import to_image_space, to_model_space  # noqa: E402
 from rescore_endpoint_conventions import (
     EOMT_HEATMAP_SIZE,
     EOMT_MODEL_INPUT_SIZE,
+    EXPECTED_MISSING,
     GT_CONSISTENCY_FAIL_THRESHOLD_PX,
     GT_CONSISTENCY_WARN_THRESHOLD_PX,
     PAIRING_TOL,
@@ -61,6 +62,7 @@ from rescore_endpoint_conventions import (
     _ImageSizeCache,
     _heatmap_dump_to_model_input_space,
     _min_paired_max_abs_diff,
+    _restrict_to_filenames,
     cross_method_gt_consistency_check,
     dod_sort,
     fixed_channel_nme,
@@ -186,6 +188,41 @@ def _write_eomt_synthetic(root: Path, task: str, backbone: str,
                 })
 
 
+def _write_eomt_swapmin_companion(root: Path, task: str, backbone: str,
+                                   filenames_points_and_sizes, is_multicentre: bool = False,
+                                   corrupt_seed: int | None = None):
+    """Writes the OPTIONAL `*_final_swapmin_per_image.csv` companion file
+    `load_eomt_per_image` best-effort-checks for (2026-08-07 review finding:
+    an independent cross-codebase check for EoMT, mirroring HRNet's own
+    `swap_min_nme` column, since this project cannot currently confirm
+    whether such a file genuinely exists on the real server). Values are
+    computed from the SAME dumped (512-model-input, pre-inversion) points
+    `_write_eomt_synthetic` writes, since that is the space the real dump's
+    own `nme` column is in. `corrupt_seed`, if given, writes a deliberately
+    wrong value for that one seed to exercise the mismatch-detection path."""
+    for seed in SEEDS:
+        if is_multicentre:
+            run_dir = root / f"multicentre-{task}-{backbone}" / f"seed{seed}"
+            swapmin_name = f"seed{seed}_final_swapmin_per_image.csv"
+        else:
+            run_dir = root / f"{task}_{backbone}" / f"seed{seed}"
+            swapmin_name = "final_swapmin_per_image.csv"
+        swapmin_path = run_dir / swapmin_name
+        with swapmin_path.open("w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["index", "swap_min_nme"])
+            writer.writeheader()
+            for i, (fn, gt0, gt1, pred0, pred1, width, height) in enumerate(filenames_points_and_sizes):
+                if seed == corrupt_seed:
+                    value = 999.0
+                else:
+                    gt0_dump = _simulate_real_eomt_dump(gt0, width, height)
+                    gt1_dump = _simulate_real_eomt_dump(gt1, width, height)
+                    pred0_dump = _simulate_real_eomt_dump(pred0, width, height)
+                    pred1_dump = _simulate_real_eomt_dump(pred1, width, height)
+                    _, _, value, _ = permutation_invariant_nme(pred0_dump, pred1_dump, gt0_dump, gt1_dump)
+                writer.writerow({"index": i, "swap_min_nme": value})
+
+
 def test_hrnet_loader_and_native_nme_matches_stored_value():
     tmp = Path(tempfile.mkdtemp())
     try:
@@ -235,6 +272,88 @@ def test_eomt_loader_joins_order_and_coords_correctly():
         assert abs(row["gt1"][0] - 90.0) < 1e-6 and abs(row["gt1"][1] - 10.0) < 1e-6
         assert abs(row["pred0"][0] - 12.0) < 1e-6 and abs(row["pred0"][1] - 11.0) < 1e-6
         print("[PASS] test_eomt_loader_joins_order_and_coords_correctly")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_eomt_loader_uses_optional_swapmin_companion_when_present():
+    """2026-08-07 review finding (should-tighten #3): if a
+    `final_swapmin_per_image.csv` companion happens to exist next to the
+    required fixed-channel dump, `load_eomt_per_image` must load it and
+    run the SAME independent permutation-invariant cross-check HRNet
+    already gets -- must succeed silently (no exception) when the
+    companion's values are correct."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        width, height = 300.0, 600.0
+        samples = [
+            ("a.jpg", (10.0, 10.0), (90.0, 10.0), (12.0, 11.0), (88.0, 9.0), width, height),
+            ("b.jpg", (5.0, 5.0), (5.0, 95.0), (6.0, 6.0), (4.0, 94.0), width, height),
+        ]
+        _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        _write_eomt_swapmin_companion(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        _write_synthetic_image(images_root, "Head", "a.jpg", int(width), int(height))
+        _write_synthetic_image(images_root, "Head", "b.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        data = load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
+        assert data["filenames"] == ["a.jpg", "b.jpg"]
+        print("[PASS] test_eomt_loader_uses_optional_swapmin_companion_when_present")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_eomt_loader_detects_mismatch_in_optional_swapmin_companion():
+    """Same setup as above, but the companion file has a deliberately wrong
+    value for one seed -- must raise LoadError (this cell's
+    permutation_invariant_nme cannot be trusted until resolved), the same
+    way a corrupted HRNet swap_min_nme column does."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        width, height = 300.0, 600.0
+        samples = [
+            ("a.jpg", (10.0, 10.0), (90.0, 10.0), (12.0, 11.0), (88.0, 9.0), width, height),
+        ]
+        _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        _write_eomt_swapmin_companion(tmp, "bpd", "dinov2", samples, is_multicentre=False, corrupt_seed=42)
+        _write_synthetic_image(images_root, "Head", "a.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        try:
+            load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
+            raise AssertionError("expected LoadError for EoMT permutation-invariant sanity mismatch")
+        except LoadError as exc:
+            assert "permutation-invariant sanity check FAILED" in str(exc)
+        print("[PASS] test_eomt_loader_detects_mismatch_in_optional_swapmin_companion")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_eomt_loader_skips_swapmin_check_when_companion_absent():
+    """The common real case: no companion file exists at all. Must load
+    successfully with no cross-check attempted (best-effort, not fatal) --
+    this is the behaviour already implicitly exercised by every other EoMT
+    loader test (none of which write a companion file), verified here
+    explicitly as its own regression test."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        width, height = 300.0, 600.0
+        samples = [
+            ("a.jpg", (10.0, 10.0), (90.0, 10.0), (12.0, 11.0), (88.0, 9.0), width, height),
+        ]
+        _write_eomt_synthetic(tmp, "bpd", "dinov2", samples, is_multicentre=False)
+        _write_synthetic_image(images_root, "Head", "a.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        data = load_eomt_per_image(tmp, "UCL", "bpd", "dinov2", cache)
+        assert data["filenames"] == ["a.jpg"]
+        print("[PASS] test_eomt_loader_skips_swapmin_check_when_companion_absent")
     finally:
         shutil.rmtree(tmp)
         shutil.rmtree(images_root)
@@ -817,12 +936,12 @@ def test_write_final_permutation_invariant_table_marks_missing_cells_unavailable
     try:
         summary_rows = [
             {
-                "dataset": "UCL", "task": "bpd", "method": "hrnet",
+                "dataset": "UCL", "task": "bpd", "method": "hrnet", "n_images": 49,
                 "permutation_invariant_nme_5seed_mean_pct": "5.57000000",
                 "permutation_invariant_nme_5seed_sample_sd_pct": "0.48000000",
             },
             {
-                "dataset": "MULTICENTRE", "task": "tad", "method": "eomt_dinov2",
+                "dataset": "MULTICENTRE", "task": "tad", "method": "eomt_dinov2", "n_images": 1180,
                 "permutation_invariant_nme_5seed_mean_pct": "8.82000000",
                 "permutation_invariant_nme_5seed_sample_sd_pct": "0.90000000",
             },
@@ -835,6 +954,9 @@ def test_write_final_permutation_invariant_table_marks_missing_cells_unavailable
 
         assert "5.57" in tsv_text and "0.48" in tsv_text
         assert "8.82" in tsv_text
+        # 2026-08-07 review finding: `n` must be shown explicitly per cell.
+        assert "n=49" in tsv_text
+        assert "n=1180" in tsv_text
         # The UCL/eomt_dinov2/BPD cell must be explicitly "Unavailable".
         ucl_eomt_dinov2_line = next(
             line for line in tsv_text.splitlines() if line.startswith("UCL\tEoMT-DINOv2")
@@ -851,9 +973,63 @@ def test_write_final_permutation_invariant_table_marks_missing_cells_unavailable
         shutil.rmtree(tmp)
 
 
+def test_restrict_to_filenames_filters_data_correctly():
+    """`_restrict_to_filenames` (2026-08-07 review finding: the common-subset
+    re-aggregation fix) must filter both `filenames` and every seed's
+    `per_seed` dict to exactly the `keep` set, preserve each row's own
+    content unchanged, and not mutate the original `data`."""
+    seeds = (42, 0)
+    filenames = ["a.jpg", "b.jpg", "c.jpg"]
+    data = {
+        "filenames": list(filenames),
+        "per_seed": {
+            seed: {fn: {"pred0": (float(seed), 0.0), "fn": fn} for fn in filenames}
+            for seed in seeds
+        },
+    }
+    restricted = _restrict_to_filenames(data, {"a.jpg", "c.jpg"})
+
+    assert restricted["filenames"] == ["a.jpg", "c.jpg"]
+    for seed in seeds:
+        assert set(restricted["per_seed"][seed]) == {"a.jpg", "c.jpg"}
+        assert restricted["per_seed"][seed]["a.jpg"] == {"pred0": (float(seed), 0.0), "fn": "a.jpg"}
+
+    # Original `data` must be untouched.
+    assert data["filenames"] == filenames
+    for seed in seeds:
+        assert set(data["per_seed"][seed]) == set(filenames)
+
+    # Restricting to a set that includes an unknown filename must not
+    # fabricate a row for it.
+    restricted2 = _restrict_to_filenames(data, {"a.jpg", "nonexistent.jpg"})
+    assert restricted2["filenames"] == ["a.jpg"]
+    for seed in seeds:
+        assert set(restricted2["per_seed"][seed]) == {"a.jpg"}
+
+    print("[PASS] test_restrict_to_filenames_filters_data_correctly")
+
+
+def test_expected_missing_matches_known_ucl_bpd_eomt_gap():
+    """EXPECTED_MISSING (2026-08-07 review finding: the strict missing-cell
+    gate) must name EXACTLY the one known, documented gap -- UCL BPD's two
+    EoMT backbones, whose checkpoints/per-image files are confirmed gone
+    from the server -- and nothing else. If this constant is ever widened
+    to silently tolerate more missing cells, that must be a deliberate,
+    reviewed change, not an accident; this test pins the current, real
+    known-gap set so any change to it is visible in a diff/test failure."""
+    assert EXPECTED_MISSING == {
+        ("UCL", "bpd", "eomt_dinov2"),
+        ("UCL", "bpd", "eomt_dinov3"),
+    }
+    print("[PASS] test_expected_missing_matches_known_ucl_bpd_eomt_gap")
+
+
 def main():
     test_hrnet_loader_and_native_nme_matches_stored_value()
     test_eomt_loader_joins_order_and_coords_correctly()
+    test_eomt_loader_uses_optional_swapmin_companion_when_present()
+    test_eomt_loader_detects_mismatch_in_optional_swapmin_companion()
+    test_eomt_loader_skips_swapmin_check_when_companion_absent()
     test_eomt_loader_inverts_anisotropic_coordinate_space_correctly()
     test_heatmap_dump_offset_recovery_matches_real_encode_chain()
     test_eomt_loader_rejects_missing_images_root_file()
@@ -872,6 +1048,8 @@ def main():
     test_write_final_permutation_invariant_table_marks_missing_cells_unavailable()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
+    test_restrict_to_filenames_filters_data_correctly()
+    test_expected_missing_matches_known_ucl_bpd_eomt_gap()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")
 
 
