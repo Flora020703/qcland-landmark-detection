@@ -56,6 +56,7 @@ from rescore_endpoint_conventions import (
     EOMT_MODEL_INPUT_SIZE,
     GT_CONSISTENCY_FAIL_THRESHOLD_PX,
     GT_CONSISTENCY_WARN_THRESHOLD_PX,
+    PAIRING_TOL,
     LoadError,
     _ImageSizeCache,
     _heatmap_dump_to_model_input_space,
@@ -645,10 +646,68 @@ def test_correspondence_diagnostic_distinguishes_reversal_from_true_swap():
         )
         # raw_channel_original should already be small (correct correspondence),
         # and oracle_min should be nearly identical to it (little to no
-        # "correspondence penalty" left to explain).
+        # oracle-reassignment reduction left on the table).
         assert result["raw_channel_original"] < 0.05
         assert abs(result["raw_channel_original"] - result["oracle_min"]) < 1e-9
     print("[PASS] test_correspondence_diagnostic_distinguishes_reversal_from_true_swap")
+
+
+def test_native_convention_dod_uses_dod_sorted_gt_as_intended():
+    """Regression test for the HRNet-confound fix (2026-08-07 review
+    finding): with native_convention='dod', the 'intended' pairing must use
+    DOD-sorted GT, not x-sorted GT -- using x-sort as 'intended' for a
+    DOD-native method (HRNet) would structurally confound the diagnostic
+    with the already-known DOD-vs-x-sort disagreement rate. Constructs a
+    case where x-sort and DOD assign OPPOSITE 'first' points, predictions
+    sit exactly on the DOD-intended points, and asserts raw_channel_original
+    is ~0 under native_convention='dod' but would be large if the (wrong)
+    x-sort assumption were used instead."""
+    gt0, gt1 = (100.0, 205.0), (500.0, 195.0)
+    d_vect = ((0.0, 0.0), (0.0, 1.0))  # purely vertical -> DOD picks ascending y
+    gt_x0, gt_x1 = x_sort(gt0, gt1)          # ascending x -> gt0 first (100 < 500)
+    gt_d0, gt_d1 = dod_sort(gt0, gt1, d_vect)  # ascending y -> gt1 first (195 < 205)
+    assert gt_x0 != gt_d0, "test construction error: x-sort and DOD must disagree here"
+
+    # Predictions sit EXACTLY on the DOD-intended points.
+    pred0, pred1 = gt_d0, gt_d1
+    row = {"pred0": pred0, "pred1": pred1, "gt0": gt0, "gt1": gt1, "native_fixed_nme": 0.0}
+    data = {"filenames": ["x.png"], "per_seed": {s: {"x.png": dict(row)} for s in SEEDS}}
+
+    dod_scored = rescore_cell(data, d_vect, native_convention="dod")["per_seed_per_image"][42]["x.png"]
+    assert dod_scored["raw_channel_original"] < 1e-9, (
+        "with native_convention='dod', a prediction sitting exactly on the "
+        "DOD-intended points must score ~0 raw_channel_original"
+    )
+    assert dod_scored["pairing_status"] == "intended_preferred"
+
+    xsort_scored = rescore_cell(data, d_vect, native_convention="xsort")["per_seed_per_image"][42]["x.png"]
+    assert xsort_scored["raw_channel_original"] > 0.9, (
+        "test construction error: expected a LARGE raw_channel_original under "
+        "the (wrong-for-this-method) x-sort assumption, to prove this test "
+        "actually distinguishes the two conventions rather than passing "
+        "vacuously regardless of native_convention"
+    )
+    print("[PASS] test_native_convention_dod_uses_dod_sorted_gt_as_intended")
+
+
+def test_pairing_tolerance_reports_approximately_tied():
+    """Regression test for the PAIRING_TOL fix (2026-08-07 review finding):
+    a near-exact tie between the intended and crossed pairing distances
+    must be reported as 'approximately_tied', not arbitrarily classified as
+    'crossed_preferred' by a strict `<` on floating-point noise."""
+    gt0, gt1 = (10.0, 10.0), (90.0, 10.0)
+    # A symmetric prediction pair (each equidistant from both GT points)
+    # makes E_intended and E_crossed mathematically IDENTICAL.
+    pred0, pred1 = (50.0, 10.0), (50.0, 10.0)
+    row = {"pred0": pred0, "pred1": pred1, "gt0": gt0, "gt1": gt1, "native_fixed_nme": 0.0}
+    data = {"filenames": ["tie.png"], "per_seed": {s: {"tie.png": dict(row)} for s in SEEDS}}
+    result = rescore_cell(data, ((0.0, 0.0), (1.0, 0.0)))["per_seed_per_image"][42]["tie.png"]
+    assert abs(result["raw_channel_original"] - result["cross_pairing"]) < PAIRING_TOL
+    assert result["pairing_status"] == "approximately_tied"
+    assert result["cross_pairing_preferred"] is False, (
+        "a genuine tie must not be classified as 'crossed preferred'"
+    )
+    print("[PASS] test_pairing_tolerance_reports_approximately_tied")
 
 
 def main():
@@ -664,6 +723,8 @@ def main():
     test_min_paired_max_abs_diff_picks_closer_pairing()
     test_raw_channel_vs_prediction_xsort_audit_detects_reversal()
     test_correspondence_diagnostic_distinguishes_reversal_from_true_swap()
+    test_native_convention_dod_uses_dod_sorted_gt_as_intended()
+    test_pairing_tolerance_reports_approximately_tied()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")

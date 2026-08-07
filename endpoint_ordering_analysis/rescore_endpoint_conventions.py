@@ -99,25 +99,48 @@ pairings (standard and swapped) and take whichever is closer -- see
 `_min_paired_max_abs_diff()` below.
 
 *** CORRESPONDENCE DIAGNOSTIC (2026-08-07, addresses what `prediction_x_
-reversed` alone could not answer) ***: `prediction_x_reversed` (raw pred0.x
-> pred1.x) only tells you whether the RAW prediction pair keeps a left-to-
-right order AMONG ITSELF -- it does NOT tell you whether p0 is actually
-closer to the LEFT GT and p1 actually closer to the RIGHT GT. On a
-near-vertical diameter (BPD/TAD), a tiny prediction error can flip which
-of p0/p1 has the smaller x-coordinate WITHOUT changing which physical GT
-point each one is actually closest to -- so a high `prediction_x_reversal_
-rate` on those tasks does not, by itself, mean p0/p1 are landing on the
-wrong side. The direct, convention-agnostic question is a per-image
-bipartite-distance comparison: does the AS-TRAINED pairing (p0<->left GT,
-p1<->right GT, i.e. `raw_channel_original`) have lower total distance than
-the CROSSED pairing (p0<->right GT, p1<->left GT)? `cross_pairing_
-preferred` answers exactly this, per image; `oracle_min` (the smaller of
-the two, DIAGNOSTIC ONLY -- it uses GT to choose the pairing after the
-fact and is never a valid inference-time metric) and `raw_minus_oracle_min`
-decompose how much of `raw_channel_original`'s own reported error is a
-"wrong side" (correspondence) problem versus genuine localisation error
-that persists under either pairing. See `correspondence_diagnostic_summary.tsv`
-and `rescore_cell()`'s own comment for the exact formulas.
+reversed` alone could not answer; refined same day per a review finding)
+***: `prediction_x_reversed` (raw pred0.x > pred1.x) only tells you whether
+the RAW prediction pair keeps a left-to-right order AMONG ITSELF -- it does
+NOT tell you whether p0 is actually closer to the intended-first GT and p1
+actually closer to the intended-second GT. On a near-vertical diameter
+(BPD/TAD), a tiny prediction error can flip which of p0/p1 has the smaller
+x-coordinate WITHOUT changing which physical GT point each one is actually
+closest to -- so a high `prediction_x_reversal_rate` on those tasks does
+not, by itself, mean p0/p1 are landing on the wrong side. The direct,
+convention-agnostic question is a per-image bipartite-distance comparison:
+does the AS-TRAINED pairing (p0<->intended-first GT, p1<->intended-second
+GT, i.e. `raw_channel_original`) have lower total distance than the
+CROSSED pairing (swapped)? `pairing_status`/`cross_pairing_preferred`
+answer exactly this, per image (`PAIRING_TOL`-gated into
+intended_preferred/crossed_preferred/approximately_tied, so a near-exact
+tie isn't arbitrarily assigned a side).
+
+**"Intended" is METHOD-SPECIFIC, not always x-sort**: EoMT's own training
+convention is x-sort, but HRNet's is DOD (`dod_vectors.py`) -- using
+x-sorted GT as "intended" for HRNet too (the first version of this
+diagnostic did, unconditionally) would structurally confound HRNet's own
+numbers with the already-known DOD-vs-x-sort disagreement rate, the exact
+same confound this diagnostic was built to escape for `prediction_x_
+reversal_rate`. `rescore_cell()`'s `native_convention` parameter fixes
+this: "xsort" for EoMT, "dod" for HRNet (set in `main()`'s per-method loop).
+
+**`oracle_min`/`raw_minus_oracle_min` are a correspondence-SENSITIVITY
+diagnostic, NOT a causal error decomposition** (do not overclaim this):
+`oracle_min` (the smaller of intended/crossed) uses GT to choose the
+pairing AFTER THE FACT -- never a valid inference-time metric, and picking
+the minimum of two noisy quantities is itself an optimistic estimator by
+construction. A large `raw_minus_oracle_min` means the current
+fixed-channel score is SENSITIVE to endpoint assignment; it does NOT, by
+itself, prove that sensitivity is CAUSED BY a genuine channel/query-
+identity swap, since (a) a badly localised prediction can happen to score
+lower under the opposite pairing by chance, (b) the two endpoints have no
+independent clinical identity to swap in the first place, and (c) no
+intervention has confirmed the model actually swapped anything. State
+findings as "the fixed-channel score is sensitive to endpoint assignment
+by X pp," not "X pp of error is caused by wrong correspondence." See
+`correspondence_diagnostic_summary.tsv` and `rescore_cell()`'s own comment
+for the exact formulas.
 
 The three canonicalisation rules, everything now genuinely in ORIGINAL
 image pixel coordinates for BOTH methods:
@@ -226,6 +249,13 @@ EOMT_HEATMAP_SIZE = 64  # verified via grep: every matched-protocol landmark con
 # a large relative (but tiny absolute) discrepancy.
 NATIVE_SANITY_RTOL = 1e-4
 NATIVE_SANITY_ATOL = 5e-8
+
+# Absolute tolerance (NME-fraction scale, i.e. before the x100 percentage
+# conversion) for classifying the intended-vs-crossed pairing comparison as
+# a genuine tie rather than arbitrarily assigning it to whichever side of
+# zero floating-point noise landed on. Not a physically-meaningful "close
+# enough" pixel threshold -- see rescore_cell()'s own comment.
+PAIRING_TOL = 1e-8
 
 # Cross-method GT consistency thresholds (2026-08-07, round 10, tightened
 # from an original single "> 5.0 -> warn" threshold that was judged too
@@ -534,13 +564,30 @@ def bootstrap_ci(values: np.ndarray, replicates: int, rng: np.random.Generator) 
     return float(lo), float(hi)
 
 
-def rescore_cell(data: dict, d_vect) -> dict:
+def rescore_cell(data: dict, d_vect, native_convention: str = "xsort") -> dict:
     """Given one method's `{"per_seed": {...}, "filenames": [...]}` -- ALL
     coordinates already in a common ORIGINAL-image-space representation --
     compute per-seed, per-image NME under the two unified conventions, plus
     GT-level x-sort-vs-DOD disagreement (and the per-filename disagreement
     flags themselves, so the caller can cross-check against another
-    method's GT for the same dataset/task)."""
+    method's GT for the same dataset/task).
+
+    `native_convention` ("xsort" or "dod", 2026-08-07 review finding):
+    the correspondence-diagnostic group below (`raw_channel_original`/
+    `cross_pairing`/`oracle_min`/`pairing_status`) needs to know which GT
+    ordering this METHOD was actually trained against, to use as the
+    "intended" pairing -- EoMT's own training/native convention is x-sort,
+    HRNet's is DOD (`dod_vectors.py`). Passing "xsort" for HRNet (the
+    original version of this function did, unconditionally, for both
+    methods) would make HRNet's own diagnostic numbers structurally
+    confounded with the already-known DOD-vs-x-sort disagreement rate --
+    the SAME confound this project already documented for
+    `prediction_x_reversal_rate`, just reintroduced into the new
+    diagnostic that was built specifically to fix that confound for EoMT.
+    The separate `xsort`/`dod` UNIFIED-convention scores below (answering
+    the different "which convention should RTMPose standardise on"
+    question) are unaffected by this parameter -- they always compute both,
+    for both methods, by design."""
     filenames = data["filenames"]
     per_seed = data["per_seed"]
     out_per_seed: dict[int, dict[str, dict]] = {}
@@ -556,49 +603,79 @@ def rescore_cell(data: dict, d_vect) -> dict:
             native_nme = row["native_fixed_nme"]
 
             gt_x0, gt_x1 = x_sort(gt0, gt1)
+            gt_d0, gt_d1 = dod_sort(gt0, gt1, d_vect)
+            gt_intended0, gt_intended1 = (
+                (gt_x0, gt_x1) if native_convention == "xsort" else (gt_d0, gt_d1)
+            )
             # Raw-channel evaluation in the SAME original-image coordinate
             # space as the unified scores.  This is deliberately distinct
             # from `native`: EoMT native NME was stored in its anisotropically
             # resized 512x512 space, so native-vs-xsort is not an interpretable
-            # paired difference.  Here the GT is canonicalised exactly as the
-            # training targets were (left-to-right), while prediction channels
-            # remain untouched: raw channel 0 -> left GT, raw channel 1 ->
-            # right GT.  It therefore tests localisation + channel assignment.
-            raw_channel_nme = fixed_channel_nme(pred0, pred1, gt_x0, gt_x1)
+            # paired difference.  The GT here is canonicalised under THIS
+            # METHOD's own training convention (`native_convention`), while
+            # prediction channels remain untouched: raw channel 0 -> the
+            # GT this method was trained to put there, raw channel 1 -> the
+            # other. It therefore tests localisation + channel assignment,
+            # on each method's own terms.
+            raw_channel_nme = fixed_channel_nme(pred0, pred1, gt_intended0, gt_intended1)
 
             # `prediction_x_reversed` (pred0.x > pred1.x) only answers
             # whether the RAW prediction pair keeps a left-to-right order
             # AMONG ITSELF -- it says nothing about whether p0 is actually
-            # the point closer to the LEFT GT and p1 closer to the RIGHT
-            # GT. Those are different questions: on a near-vertical
-            # diameter (BPD/TAD) a tiny prediction error can flip pred0.x
-            # vs pred1.x without changing which GT point each prediction
-            # is actually closest to. The direct, convention-agnostic
-            # answer to "did p0/p1 end up corresponding to the wrong GT
-            # side" is a per-image bipartite-distance comparison: does the
-            # AS-TRAINED pairing (p0<->left GT, p1<->right GT) have lower
-            # total distance than the CROSSED pairing (p0<->right GT,
-            # p1<->left GT)? `cross_pairing_preferred=True` means the
-            # crossed pairing is closer -- i.e. p0/p1 look, purely by
-            # distance, like they correspond to the opposite GT side from
-            # what raw_channel_original assumes. `oracle_min` (the smaller
-            # of the two) is DIAGNOSTIC ONLY -- it uses GT to pick the
-            # pairing after the fact, so it is never a valid inference-time
-            # metric, only a tool to decompose how much of
-            # raw_channel_original's error is "wrong side" (correspondence)
-            # versus genuine localisation error.
+            # the point closer to the intended-first GT and p1 closer to
+            # the intended-second GT. Those are different questions: on a
+            # near-vertical diameter (BPD/TAD) a tiny prediction error can
+            # flip pred0.x vs pred1.x without changing which GT point each
+            # prediction is actually closest to. The direct,
+            # convention-agnostic answer to "did p0/p1 end up
+            # corresponding to the wrong GT side" is a per-image
+            # bipartite-distance comparison: does the AS-TRAINED pairing
+            # (p0<->intended-first GT, p1<->intended-second GT) have lower
+            # total distance than the CROSSED pairing (swapped)?
+            #
+            # IMPORTANT INTERPRETATION LIMIT (2026-08-07 review finding --
+            # do not overclaim this as a causal decomposition): `oracle_min`
+            # (the smaller of the two) uses GT to pick the pairing AFTER
+            # THE FACT -- it is a GT-INFORMED REASSIGNMENT, never a valid
+            # inference-time metric, and picking the smaller of two noisy
+            # quantities is itself an optimistic (minimum-biased) estimator.
+            # `raw_minus_oracle_min` is therefore a CORRESPONDENCE-
+            # SENSITIVITY diagnostic (how much the fixed-channel score could
+            # shrink under oracle GT-informed reassignment) -- it does NOT
+            # prove that gap is "caused by" a channel/query-identity swap,
+            # nor decompose error into independent "correspondence" vs
+            # "localisation" components. A large value means the current
+            # fixed-channel score is SENSITIVE to endpoint assignment;
+            # it is not, by itself, evidence of what produced that
+            # sensitivity.
             prediction_x_reversed = bool(
                 (pred0[0] > pred1[0]) or
                 (pred0[0] == pred1[0] and pred0[1] > pred1[1])
             )
-            cross_pairing_nme = fixed_channel_nme(pred0, pred1, gt_x1, gt_x0)
-            cross_pairing_preferred = cross_pairing_nme < raw_channel_nme
+            cross_pairing_nme = fixed_channel_nme(pred0, pred1, gt_intended1, gt_intended0)
+            # Tolerance band (2026-08-07 review finding): comparing two
+            # continuous distances with a strict `<` classifies even a
+            # sub-floating-point-noise difference as "one pairing preferred"
+            # -- when raw_channel_original and cross_pairing are genuinely
+            # close (accurate predictions on a near-symmetric configuration),
+            # that classification is not meaningful. PAIRING_TOL is a small
+            # ABSOLUTE tolerance on the NME-fraction scale (not a
+            # physically-meaningful "close enough" pixel threshold) so
+            # near-exact ties are reported as such rather than assigned
+            # arbitrarily to whichever side of zero the noise landed on.
+            pairing_delta = raw_channel_nme - cross_pairing_nme
+            if pairing_delta > PAIRING_TOL:
+                pairing_status = "crossed_preferred"
+            elif pairing_delta < -PAIRING_TOL:
+                pairing_status = "intended_preferred"
+            else:
+                pairing_status = "approximately_tied"
+            cross_pairing_preferred = (pairing_status == "crossed_preferred")
             oracle_min_nme = min(raw_channel_nme, cross_pairing_nme)
 
             pred_x0, pred_x1 = x_sort(pred0, pred1)
             xsort_nme = fixed_channel_nme(pred_x0, pred_x1, gt_x0, gt_x1)
 
-            gt_d0, gt_d1 = dod_sort(gt0, gt1, d_vect)
             pred_d0, pred_d1 = dod_sort(pred0, pred1, d_vect)
             dod_nme = fixed_channel_nme(pred_d0, pred_d1, gt_d0, gt_d1)
 
@@ -611,6 +688,7 @@ def rescore_cell(data: dict, d_vect) -> dict:
                 "dod": dod_nme,
                 "prediction_x_reversed": prediction_x_reversed,
                 "cross_pairing_preferred": cross_pairing_preferred,
+                "pairing_status": pairing_status,
             }
 
             if seed == SEEDS[0]:
@@ -668,7 +746,10 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     with per_image_path.open("w", newline="", encoding="utf-8") as handle:
         fields = [
             "filename", "native_nme_pct", "raw_channel_original_nme_pct",
-            "cross_pairing_nme_pct", "cross_pairing_preferred_fraction_across_seeds",
+            "cross_pairing_nme_pct",
+            "intended_pairing_preferred_fraction_across_seeds",
+            "cross_pairing_preferred_fraction_across_seeds",
+            "approximately_tied_fraction_across_seeds",
             "oracle_min_nme_pct", "raw_minus_oracle_min_pp",
             "prediction_xsort_nme_pct", "raw_minus_prediction_xsort_pp",
             "prediction_x_reversal_fraction_across_seeds", "dod_nme_pct",
@@ -682,7 +763,9 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
                 "native_nme_pct": f"{per_image_avg['native'][i]:.8f}",
                 "raw_channel_original_nme_pct": f"{raw_vals[i]:.8f}",
                 "cross_pairing_nme_pct": f"{per_image_avg['cross_pairing'][i]:.8f}",
+                "intended_pairing_preferred_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['pairing_status'] == 'intended_preferred' for seed in SEEDS]):.8f}",
                 "cross_pairing_preferred_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['cross_pairing_preferred'] for seed in SEEDS]):.8f}",
+                "approximately_tied_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['pairing_status'] == 'approximately_tied' for seed in SEEDS]):.8f}",
                 "oracle_min_nme_pct": f"{oracle_min_vals[i]:.8f}",
                 "raw_minus_oracle_min_pp": f"{raw_minus_oracle_min[i]:.8f}",
                 "prediction_xsort_nme_pct": f"{xsort_vals[i]:.8f}",
@@ -710,12 +793,31 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     ])
     summary_row["prediction_x_reversal_rate_5seed_mean"] = f"{reversal_rates.mean():.8f}"
     summary_row["prediction_x_reversal_rate_5seed_sample_sd"] = f"{reversal_rates.std(ddof=1):.8f}"
+    # Three-way breakdown (2026-08-07 review finding): a strict `<` on two
+    # continuous distances forces even a near-exact tie into "one pairing
+    # preferred" -- report all three PAIRING_TOL-based categories so a tie
+    # rate can be distinguished from a genuine preference. `crossed_
+    # preferred_rate` (kept under its original name, `cross_pairing_
+    # preferred_rate`, for continuity) is the one referenced elsewhere in
+    # this project's docs as the correspondence-sensitivity signal.
+    intended_preferred_rates = np.array([
+        np.mean([per_seed[seed][fn]["pairing_status"] == "intended_preferred" for fn in filenames])
+        for seed in SEEDS
+    ])
     cross_pairing_preferred_rates = np.array([
         np.mean([per_seed[seed][fn]["cross_pairing_preferred"] for fn in filenames])
         for seed in SEEDS
     ])
+    approximately_tied_rates = np.array([
+        np.mean([per_seed[seed][fn]["pairing_status"] == "approximately_tied" for fn in filenames])
+        for seed in SEEDS
+    ])
+    summary_row["intended_pairing_preferred_rate_5seed_mean"] = f"{intended_preferred_rates.mean():.8f}"
+    summary_row["intended_pairing_preferred_rate_5seed_sample_sd"] = f"{intended_preferred_rates.std(ddof=1):.8f}"
     summary_row["cross_pairing_preferred_rate_5seed_mean"] = f"{cross_pairing_preferred_rates.mean():.8f}"
     summary_row["cross_pairing_preferred_rate_5seed_sample_sd"] = f"{cross_pairing_preferred_rates.std(ddof=1):.8f}"
+    summary_row["approximately_tied_rate_5seed_mean"] = f"{approximately_tied_rates.mean():.8f}"
+    summary_row["approximately_tied_rate_5seed_sample_sd"] = f"{approximately_tied_rates.std(ddof=1):.8f}"
     raw_seed_means = np.array([
         np.mean([per_seed[seed][fn]["raw_channel_original"] for fn in filenames]) * 100.0
         for seed in SEEDS
@@ -731,14 +833,20 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
     paired_seed_delta = raw_seed_means - xsort_seed_means
     summary_row["raw_minus_prediction_xsort_5seed_mean_pp"] = f"{paired_seed_delta.mean():.8f}"
     summary_row["raw_minus_prediction_xsort_5seed_sample_sd_pp"] = f"{paired_seed_delta.std(ddof=1):.8f}"
-    # "Correspondence penalty" (diagnostic only -- oracle_min uses GT to
-    # pick the better-scoring pairing after the fact, never a valid
-    # inference-time metric): how much of raw_channel_original's own error
-    # is attributable to p0/p1 landing closer to the OPPOSITE GT side,
-    # versus genuine localisation error that persists under either pairing.
-    correspondence_penalty_seed = raw_seed_means - oracle_min_seed_means
-    summary_row["raw_minus_oracle_min_5seed_mean_pp"] = f"{correspondence_penalty_seed.mean():.8f}"
-    summary_row["raw_minus_oracle_min_5seed_sample_sd_pp"] = f"{correspondence_penalty_seed.std(ddof=1):.8f}"
+    # "oracle-reassignment reduction" / correspondence-SENSITIVITY diagnostic
+    # (2026-08-07 review finding, corrects earlier causal language: this is
+    # NOT a proven "correspondence error" decomposition -- oracle_min picks
+    # the better-scoring pairing AFTER SEEING GT, which is both an
+    # unrealistic inference-time operation and an optimistic
+    # (minimum-of-two-noisy-quantities) estimator by construction. A large
+    # value means the current fixed-channel score is SENSITIVE to which
+    # endpoint assignment is used; it does not, by itself, prove that
+    # sensitivity is caused by a genuine channel/query-identity swap versus,
+    # e.g., poor localisation that happens to score slightly better under
+    # the opposite pairing on some images.
+    oracle_reassignment_reduction_seed = raw_seed_means - oracle_min_seed_means
+    summary_row["raw_minus_oracle_min_5seed_mean_pp"] = f"{oracle_reassignment_reduction_seed.mean():.8f}"
+    summary_row["raw_minus_oracle_min_5seed_sample_sd_pp"] = f"{oracle_reassignment_reduction_seed.std(ddof=1):.8f}"
     summary_row["xsort_minus_dod_mean_pp"] = f"{diff.mean():.8f}"
     summary_row["xsort_minus_dod_bootstrap_95ci_low_pp"] = f"{lo:.8f}"
     summary_row["xsort_minus_dod_bootstrap_95ci_high_pp"] = f"{hi:.8f}"
@@ -878,7 +986,15 @@ def main():
                     print(f"[EXCLUDED] {dataset}/{task}/{method_label}: {exc}")
                     continue
 
-                rescored = rescore_cell(data, d_vect)
+                # 2026-08-07 review finding: HRNet's own training/native
+                # channel-order convention is DOD, not x-sort -- the
+                # correspondence diagnostic must use EACH method's own
+                # native convention as "intended," or HRNet's numbers get
+                # structurally confounded with the already-known
+                # DOD-vs-x-sort disagreement rate (see rescore_cell()'s
+                # own docstring for why).
+                native_convention = "dod" if method == "hrnet" else "xsort"
+                rescored = rescore_cell(data, d_vect, native_convention=native_convention)
                 rescored_by_method[method_label] = rescored
                 seed_rows, summary_rows = summarize_and_write(
                     dataset, task, method_label, rescored, args.output_root,
@@ -936,22 +1052,26 @@ def main():
 
     # Compact supervisor-facing table for the DIFFERENT, more direct
     # question: on each image, are p0/p1 actually closer (by distance) to
-    # the LEFT/RIGHT GT the training convention assumes, or to the
+    # the GT side each method's OWN training convention assumes, or to the
     # OPPOSITE side? `prediction_x_reversal_rate` above only tells you
     # whether the raw prediction pair keeps its own left-to-right order --
     # it does NOT tell you whether that order matches which GT point each
     # prediction is actually closest to (see rescore_cell's own comment on
-    # this exact distinction). `oracle_min` is diagnostic ONLY -- it uses
+    # this exact distinction). `oracle_min` is DIAGNOSTIC ONLY -- it uses
     # GT to pick the better-scoring pairing after the fact and is never a
-    # valid inference-time metric; it exists solely to decompose
-    # raw_channel_original's own error into a "wrong side"
-    # (correspondence) component versus genuine localisation error.
+    # valid inference-time metric; `raw_minus_oracle_min` is a
+    # correspondence-SENSITIVITY diagnostic (how much the score could shrink
+    # under oracle GT-informed reassignment), NOT a causal "this much error
+    # is due to wrong correspondence" decomposition -- see rescore_cell's
+    # own comment for why that stronger claim is not supported.
     correspondence_path = args.output_root / "correspondence_diagnostic_summary.tsv"
     correspondence_fields = [
         "dataset", "task", "method", "n_images",
         "prediction_x_reversal_rate_5seed_mean",
+        "intended_pairing_preferred_rate_5seed_mean",
         "cross_pairing_preferred_rate_5seed_mean",
         "cross_pairing_preferred_rate_5seed_sample_sd",
+        "approximately_tied_rate_5seed_mean",
         "raw_channel_original_5seed_mean_pct",
         "raw_channel_original_5seed_sample_sd_pct",
         "oracle_min_5seed_mean_pct", "oracle_min_5seed_sample_sd_pct",

@@ -226,56 +226,83 @@ evidence of a channel-assignment defect in HRNet itself.
 
 `prediction_x_reversal_rate` only checks whether the RAW prediction pair
 keeps its own left-to-right order (`pred0.x > pred1.x`) -- it does NOT
-check whether p0 is actually the point closer to the LEFT GT and p1
-actually closer to the RIGHT GT. These are different questions. On a
-near-vertical diameter (BPD/TAD, where the two GT points differ by a
-fraction of a pixel in x but tens of pixels in y), a tiny prediction x
-error can flip `prediction_x_reversed` to `True` while p0/p1 are each
-still, unambiguously, closest to their own correct GT point -- reversal
-here is x-sort noise, not a correspondence error (see
+check whether p0 is actually the point closer to the intended-first GT and
+p1 actually closer to the intended-second GT. These are different
+questions. On a near-vertical diameter (BPD/TAD, where the two GT points
+differ by a fraction of a pixel in x but tens of pixels in y), a tiny
+prediction x error can flip `prediction_x_reversed` to `True` while p0/p1
+are each still, unambiguously, closest to their own correct GT point --
+reversal here is x-sort noise, not a correspondence error (see
 `test_correspondence_diagnostic_distinguishes_reversal_from_true_swap` in
 the test suite for a constructed example, and the real BPD/TAD d_vect
 geometry in `dod_vectors.py` for why this is the realistic regime, not an
 edge case, for exactly those two tasks).
 
+**"Intended" is METHOD-SPECIFIC, not always x-sort** (fixed 2026-08-07,
+review finding against the first version of this diagnostic): EoMT's own
+training convention is x-sort, but HRNet's is DOD. `rescore_cell()`'s
+`native_convention` parameter ("xsort" for EoMT, "dod" for HRNet, set in
+`main()`) picks which GT ordering counts as "intended" for each method --
+using x-sort as "intended" for HRNet too would structurally confound
+HRNet's own numbers with the already-known DOD-vs-x-sort disagreement
+rate, exactly the same confound this diagnostic exists to escape for
+`prediction_x_reversal_rate`. Do not interpret HRNet's and EoMT's columns
+here as "the same measurement" -- each is relative to that method's own
+training-time GT convention.
+
 The direct, convention-agnostic answer is a per-image bipartite-distance
 comparison, computed in `rescore_cell()`:
 
-- `raw_channel_original` (`E_intended`): `||p0-gt_left|| + ||p1-gt_right||`
+- `raw_channel_original` (`E_intended`): `||p0-g_intended0|| + ||p1-g_intended1||`
   -- the AS-TRAINED pairing, already described above.
-- `cross_pairing` (`E_crossed`): `||p0-gt_right|| + ||p1-gt_left||` -- the
-  OPPOSITE pairing.
-- `cross_pairing_preferred`: `True` when `E_crossed < E_intended`, i.e.
-  p0/p1 look, purely by distance, like they correspond to the opposite GT
-  side from what `raw_channel_original` assumes.
+- `cross_pairing` (`E_crossed`): `||p0-g_intended1|| + ||p1-g_intended0||` --
+  the OPPOSITE pairing.
+- `pairing_status` / `cross_pairing_preferred`: per image, one of
+  `intended_preferred`, `crossed_preferred`, or `approximately_tied`
+  (gated by `PAIRING_TOL`, an absolute tolerance on the NME-fraction scale
+  -- fixed 2026-08-07 so a near-exact tie between `E_intended` and
+  `E_crossed` isn't arbitrarily assigned to whichever side of zero
+  floating-point noise landed on). `cross_pairing_preferred` is `True` iff
+  `pairing_status == "crossed_preferred"`.
 - `oracle_min`: `min(E_intended, E_crossed)`. **DIAGNOSTIC ONLY -- never an
   inference-time metric.** It uses GT to pick the better-scoring pairing
   after the fact, which no real deployment could do.
-- `raw_minus_oracle_min`: how much of `raw_channel_original`'s own error is
-  a "wrong side" (correspondence) problem, versus genuine localisation
-  error that would persist under either pairing.
+- `raw_minus_oracle_min`: an **oracle-reassignment reduction / correspondence-
+  SENSITIVITY diagnostic** -- how much `raw_channel_original` could shrink
+  under GT-informed reassignment. **This is not a causal decomposition**
+  (tightened 2026-08-07, review finding: the original wording called this
+  "how much error is caused by wrong correspondence," which overclaims what
+  a post-hoc, minimum-biased statistic can prove). Report it as: "the
+  fixed-channel score is sensitive to endpoint assignment by X pp," never
+  as "X pp of error is caused by a channel/query-identity swap" -- a large
+  value does not, by itself, rule out (a) a badly localised prediction
+  scoring lower under the opposite pairing by chance, or (b) the fact that
+  these endpoints have no independent clinical identity to swap in the
+  first place.
 
 Reading the four combinations of `prediction_x_reversal_rate` vs
-`cross_pairing_preferred_rate`:
+`cross_pairing_preferred_rate` (within one method -- do not compare these
+rates ACROSS HRNet and EoMT directly, see the native-convention note above):
 
-- **Both low**: no evidence of a correspondence problem; `raw_channel_original`
-  is already close to `oracle_min` -- the reported error is genuine
-  localisation error.
+- **Both low**: no evidence of endpoint-assignment sensitivity;
+  `raw_channel_original` is already close to `oracle_min` -- the reported
+  error is not materially reducible by reassignment.
 - **`cross_pairing_preferred_rate` high, `raw_minus_oracle_min` large**:
   `raw_channel_original`/the currently-reported fixed-channel NME IS
-  materially inflated by p0/p1 landing on the wrong GT side -- this is the
-  scenario that would support "the gap is a correspondence problem, not
-  (only) localisation."
+  materially sensitive to which GT side p0/p1 are scored against -- this is
+  the scenario that would support "part of the gap is an endpoint-
+  assignment sensitivity issue, not (only) localisation," though see above
+  for why this still isn't a proven causal claim.
 - **`prediction_x_reversal_rate` high but `cross_pairing_preferred_rate`
   low**: the raw x-order looks flipped, but distance-wise the predictions
   are still corresponding correctly -- this is the near-vertical-diameter
   noise case above; do not use the reversal rate alone to conclude there is
-  a correspondence problem on BPD/TAD.
+  an assignment-sensitivity issue on BPD/TAD.
 - **`prediction_x_reversal_rate` low but `cross_pairing_preferred_rate`
   high**: rare, but possible when localisation error is large enough that
-  a "correctly-ordered-looking" prediction pair is nonetheless each closer
-  to the opposite GT point -- treat as a genuine correspondence problem the
-  x-order check alone would have missed entirely.
+  a "correctly-ordered-looking" prediction pair nonetheless scores lower
+  under the opposite pairing -- worth a closer per-image look, but still
+  subject to the same non-causal caveat above.
 
 ## Reading the summary for the supervisor conversation
 
@@ -300,9 +327,11 @@ coordinate-space evaluation issue, no retraining needed." Use
 `prediction_x_reversal_rate` -- see "Correspondence diagnostic" above for
 exactly why the reversal rate alone is an unreliable proxy on BPD/TAD's
 near-vertical diameters) alongside it to check the OTHER contributor: if
-`raw_minus_oracle_min` remains large after the coordinate-space fix, some
-of the remaining gap is a genuine channel-correspondence error, not
-(only) coordinate space or localisation. Compress into:
+`raw_minus_oracle_min` remains large after the coordinate-space fix, the
+remaining gap is at least SENSITIVE to endpoint assignment, not purely
+coordinate space -- but per the "Correspondence diagnostic" section's own
+caveat, this is a sensitivity signal, not proof of what caused it.
+Compress into:
 
 | Dataset | Task | Method | HRNet native | EoMT native (512-space, historical) | EoMT raw_channel_original (original-space) | cross_pairing_preferred_rate | raw_minus_oracle_min |
 |---|---|---|---|---|---|---|---|
