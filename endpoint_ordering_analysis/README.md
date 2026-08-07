@@ -218,7 +218,33 @@ evidence of a channel-assignment defect in HRNet itself.
 
 ## Reading the summary for the supervisor conversation
 
-Compress `endpoint_ordering_summary.tsv` into:
+This analysis answers TWO separate questions -- do not compress them into
+one table, they use different columns and support different conclusions.
+
+**Question 1 -- is EoMT's already-reported NME inflated by an evaluation
+coordinate-space artifact, not genuinely worse localisation?** (this is the
+question that motivated adding `raw_channel_original`): compare
+`raw_channel_original_5seed_mean_pct` directly against HRNet's own reported
+number for the same (dataset, task). This column is the SAME pred-channel-
+vs-x-sorted-GT pairing rule `training/landmark_detection.py`'s own
+`compute_nme` + `datasets/landmark_dataset.py`'s (unconditional, train-and-
+test-alike) load-time x-sort already use for EoMT's historical numbers --
+verified by direct code inspection and a 2000-trial randomised property
+check, not assumed -- just recomputed in true original-image pixel space
+instead of EoMT's own anisotropically-resized 512x512 space. If
+`raw_channel_original` comes out much closer to HRNet's number than the
+historical `native` figure did, that supports "the gap was mostly a
+coordinate-space evaluation issue, no retraining needed." Use
+`prediction_x_reversal_rate` alongside it to check the OTHER contributor:
+if reversal is also common, some of the remaining gap is genuine channel-
+assignment error, not (only) coordinate space. Compress into:
+
+| Dataset | Task | Method | HRNet native | EoMT native (512-space, historical) | EoMT raw_channel_original (original-space) | prediction_x_reversal_rate |
+|---|---|---|---|---|---|---|
+
+**Question 2 -- which external convention should RTMPose (and the final
+three-way comparison) use, given EoMT and HRNet were trained under
+different ones?** Compress `endpoint_ordering_summary.tsv` into:
 
 | Dataset | Task | Method | Native | Unified x-sort | Unified DOD | x-sort - DOD (95% CI) |
 |---|---|---|---|---|---|---|
@@ -226,9 +252,14 @@ Compress `endpoint_ordering_summary.tsv` into:
 and lead with the GT disagreement rate per task (`gt_xsort_vs_dod_disagreement_rate`)
 -- this is the single number that most directly answers "how much do the
 two rules actually differ on this task's own ground truth," independent of
-either method's prediction quality.
+either method's prediction quality. `xsort`/`dod` deliberately RE-SORT
+predictions on both sides -- this is the right tool for "which convention
+should we standardise on," but the wrong tool for question 1 above, since
+re-sorting a genuinely reversed prediction would mask exactly the effect
+question 1 is trying to isolate.
 
-Suggested framing (adapt the specifics to whatever the real numbers show):
+Suggested framing for question 2 (adapt the specifics to whatever the real
+numbers show):
 
 > I retrospectively re-evaluated the existing per-image predictions under
 > two common external endpoint conventions, without retraining: per-image
