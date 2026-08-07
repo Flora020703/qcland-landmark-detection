@@ -588,6 +588,10 @@ def rescore_cell(data: dict, d_vect, native_convention: str = "xsort") -> dict:
     the different "which convention should RTMPose standardise on"
     question) are unaffected by this parameter -- they always compute both,
     for both methods, by design."""
+    if native_convention not in {"xsort", "dod"}:
+        raise ValueError(
+            f"native_convention must be 'xsort' or 'dod', got {native_convention!r}"
+        )
     filenames = data["filenames"]
     per_seed = data["per_seed"]
     out_per_seed: dict[int, dict[str, dict]] = {}

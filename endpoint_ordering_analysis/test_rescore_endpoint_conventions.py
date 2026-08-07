@@ -710,6 +710,25 @@ def test_pairing_tolerance_reports_approximately_tied():
     print("[PASS] test_pairing_tolerance_reports_approximately_tied")
 
 
+def test_rescore_cell_rejects_invalid_native_convention():
+    """Regression test for a non-blocking review suggestion (2026-08-07):
+    rescore_cell() must reject an unrecognised native_convention explicitly
+    rather than silently falling through to the DOD branch for any
+    non-'xsort' value (e.g. a typo like 'Xsort' or 'DOD')."""
+    row = {
+        "pred0": (10.0, 10.0), "pred1": (90.0, 10.0),
+        "gt0": (10.0, 10.0), "gt1": (90.0, 10.0),
+        "native_fixed_nme": 0.0,
+    }
+    data = {"filenames": ["x.png"], "per_seed": {s: {"x.png": dict(row)} for s in SEEDS}}
+    try:
+        rescore_cell(data, ((0.0, 0.0), (1.0, 0.0)), native_convention="DOD")
+        raise AssertionError("expected ValueError for an invalid native_convention")
+    except ValueError as exc:
+        assert "native_convention" in str(exc)
+    print("[PASS] test_rescore_cell_rejects_invalid_native_convention")
+
+
 def main():
     test_hrnet_loader_and_native_nme_matches_stored_value()
     test_eomt_loader_joins_order_and_coords_correctly()
@@ -725,6 +744,7 @@ def main():
     test_correspondence_diagnostic_distinguishes_reversal_from_true_swap()
     test_native_convention_dod_uses_dod_sorted_gt_as_intended()
     test_pairing_tolerance_reports_approximately_tied()
+    test_rescore_cell_rejects_invalid_native_convention()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")
