@@ -303,19 +303,25 @@ PAIRING_TOL = 1e-8
 GT_CONSISTENCY_WARN_THRESHOLD_PX = 0.1
 GT_CONSISTENCY_FAIL_THRESHOLD_PX = 1.0
 
-# *** STRICT missing-cell allowlist (2026-08-07, review finding) ***: before
-# this, ANY load failure -- a genuinely-known gap (UCL BPD's EoMT
-# checkpoints) or a NEW, unrelated failure (a bad path, a truncated file, a
-# server-side regression) -- rendered identically as "Unavailable" in the
-# final table, so a brand-new bug could hide behind the one gap everyone
-# already expects. `main()` computes the SET of (dataset, task, method)
-# cells that actually failed to load and hard-fails the run (non-zero exit,
-# before generating the official table) unless it is EXACTLY this set --
-# not a subset, not a superset. If a cell in this set unexpectedly starts
-# loading successfully, that is also reported (loudly, non-fatally) as a
-# reminder to update this constant, since the table generator would
-# otherwise silently start reporting a real number for a cell every prior
-# run treated as categorically missing.
+# *** STRICT missing-cell allowlist (2026-08-07, review finding; wording
+# corrected in the second review round the same night to match the actual,
+# intentionally asymmetric behaviour below) ***: before this, ANY load
+# failure -- a genuinely-known gap (UCL BPD's EoMT checkpoints) or a NEW,
+# unrelated failure (a bad path, a truncated file, a server-side
+# regression) -- rendered identically as "Unavailable" in the final table,
+# so a brand-new bug could hide behind the one gap everyone already
+# expects. `main()` computes the SET of (dataset, task, method) cells that
+# actually failed to load this run (`actual_missing`) and enforces:
+#   - `actual_missing` must not contain anything OUTSIDE this allowlist --
+#     any such cell is a NEW, unexplained failure and hard-fails the run
+#     (non-zero exit) BEFORE the official table is generated;
+#   - `actual_missing` being a (possibly empty) SUBSET of this allowlist is
+#     ALLOWED, not an error: a previously-missing cell loading successfully
+#     this run is good news, not a failure. It is still reported (loudly,
+#     non-fatally) as a reminder to update this constant so it reflects
+#     reality, and the official table is generated USING that cell's real,
+#     freshly-recovered numbers rather than continuing to mark it
+#     "Unavailable" out of habit.
 EXPECTED_MISSING = {
     ("UCL", "bpd", "eomt_dinov2"),
     ("UCL", "bpd", "eomt_dinov3"),
@@ -653,6 +659,29 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     _check_native_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw)
 
     if eomt_swapmin_available:
+        # *** LIMITATION, state precisely, do not oversell (2026-08-07,
+        # third review round) ***: this call is made against `per_seed_raw`
+        # -- EoMT's RAW dumped coordinates, in its own 512x512 model-input
+        # space, BEFORE the anisotropic-resize inversion a few lines below.
+        # This matches the space the optional companion file's own
+        # `swap_min_nme`/native values would have been computed in (same
+        # convention as `native_fixed_nme`'s own native-sanity check just
+        # above), so it is the correct like-for-like comparison for THIS
+        # check -- but it means this check validates CSV alignment
+        # (index<->filename join), coordinate parsing, and the
+        # min(direct,crossed) assignment LOGIC, not the final NUMERIC
+        # permutation_invariant_nme value that ends up in the official
+        # table. That final value is computed AFTER inverting to true
+        # original-image pixel space (see the conversion below), and
+        # because that inversion is generally ANISOTROPIC (non-square
+        # original images, essentially always true here), neither the
+        # Euclidean NME magnitude NOR, in principle, the direct-vs-crossed
+        # assignment decision itself is guaranteed invariant between the
+        # two spaces. Do not describe this check as independently
+        # validating EoMT's final original-space official NME numbers --
+        # only HRNet's coordinates are already in original-image space, so
+        # only HRNet's equivalent check validates the number that actually
+        # appears in the final table.
         _check_permutation_invariant_sanity(f"EoMT({backbone})", dataset, task, per_seed_raw)
     else:
         print(f"  [permutation-invariant sanity SKIPPED] EoMT({backbone}) {dataset}/{task}: "
@@ -1221,7 +1250,40 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
     any other substitute -- see excluded_images.tsv for the exact reason.
     Writes both a machine-readable TSV and a ready-to-paste Markdown table
     with the exact caption this project's own supervisor-facing convention
-    requires."""
+    requires.
+
+    SELF-VALIDATES the common-subset precondition above (2026-08-07, third
+    review round) rather than merely trusting the caller/docstring: raises
+    ValueError if any row has `n_images <= 0` (an empty or invalid
+    intersection must never silently render as a real-looking cell), or if
+    two methods sharing a (dataset, task) report DIFFERENT `n_images` (the
+    exact signature of accidentally passing each method's own full-set
+    summary rows instead of the common-subset ones) -- so a future caller
+    mistake produces a loud crash here, not a final table that LOOKS
+    official but silently isn't."""
+    by_dataset_task_n: dict[tuple[str, str], set[int]] = {}
+    for r in summary_rows:
+        n = int(r["n_images"])
+        if n <= 0:
+            raise ValueError(
+                f"write_final_permutation_invariant_table: {r['dataset']}/{r['task']}/"
+                f"{r['method']} has n_images={n} -- an empty (or invalid) common-subset "
+                f"intersection must not silently produce a table cell; investigate before "
+                f"generating the official table."
+            )
+        by_dataset_task_n.setdefault((r["dataset"], r["task"]), set()).add(n)
+    for (dataset, task), ns in by_dataset_task_n.items():
+        if len(ns) > 1:
+            raise ValueError(
+                f"write_final_permutation_invariant_table: {dataset}/{task} has methods "
+                f"with DIFFERENT n_images ({sorted(ns)}) -- summary_rows passed to this "
+                f"function must be the COMMON-SUBSET summary rows (see this function's own "
+                f"docstring), where every method sharing a (dataset, task) is already "
+                f"re-aggregated on the identical cross-method filename intersection. Passing "
+                f"full-set (each method's own n) summary rows here would silently generate a "
+                f"table that LOOKS like the official comparison but is not."
+            )
+
     by_key = {(r["dataset"], r["task"], r["method"]): r for r in summary_rows}
 
     tsv_path = output_root / "permutation_invariant_nme_final_table.tsv"
@@ -1518,12 +1580,42 @@ def main():
         writer.writeheader()
         writer.writerows(gt_consistency_warnings)
 
+    # *** STRICT GT-consistency gate (2026-08-07, second review round) ***:
+    # a non-empty cross_method_gt_consistency_warnings.tsv previously only
+    # printed a warning and, for the `severe` (>1.0px) tier only, hard-failed
+    # at the very END of main() -- AFTER the official final table had
+    # already been written. Generating the official comparison on top of a
+    # known GT-recovery/matching inconsistency for that (dataset, task),
+    # even a non-severe one, undermines the table's reliability -- per
+    # explicit review guidance, ANY warning (not only the severe tier) now
+    # blocks official-table generation, checked BEFORE it is written.
+    if gt_consistency_warnings:
+        print(f"\n*** HARD FAILURE: {len(gt_consistency_warnings)} cross-method GT consistency "
+              f"warning(s) found -- see {consistency_path}. Refusing to generate the official "
+              f"final table: ANY warning here (not only the severe "
+              f">{GT_CONSISTENCY_FAIL_THRESHOLD_PX}px tier) means at least one (dataset, task) "
+              f"cell's cross-method GT recovery/matching is not fully clean, and the official "
+              f"comparison must not be built on top of that. ***")
+        for w in gt_consistency_warnings:
+            tier = "SEVERE" if w["severe"] == "true" else "warning"
+            print(f"  {tier}: {w['dataset']}/{w['task']} ({w['method_a']} vs {w['method_b']}): "
+                  f"max_gt_coord_diff_px={w['max_gt_coord_diff_px']}")
+        print(f"See {consistency_path} for full detail. Exiting non-zero.")
+        sys.exit(1)
+
     # *** STRICT missing-cell gate (2026-08-07 review finding) ***: any
     # load failure NOT in EXPECTED_MISSING is treated as a NEW, unexplained
     # failure -- generating the official table anyway would render it
     # identically to the already-known UCL-BPD-EoMT gap ("Unavailable"),
-    # silently hiding a real run problem. Checked AFTER all diagnostic
-    # outputs above are written, so the reasons are on disk either way.
+    # silently hiding a real run problem. An EXPECTED_MISSING cell
+    # unexpectedly loading successfully is NOT treated as a failure here --
+    # `actual_missing` becoming a (non-empty) SUBSET of EXPECTED_MISSING is
+    # allowed and only reported as a reminder below; only cells OUTSIDE
+    # EXPECTED_MISSING (actual_missing not a subset of it) hard-fail the
+    # run. The final table always reflects whatever actually loaded this
+    # run, including a freshly-recovered cell's real numbers. Checked AFTER
+    # all diagnostic outputs above are written, so the reasons are on disk
+    # either way.
     actual_missing = {(row["dataset"], row["task"], row["method"]) for row in excluded}
     unexpectedly_recovered = EXPECTED_MISSING - actual_missing
     unexpected_missing = actual_missing - EXPECTED_MISSING
@@ -1554,10 +1646,8 @@ def main():
     n_scored = len(all_summary_rows)
     n_excluded = len(excluded)
     print(f"\n[COMPLETE] {n_scored}/{n_task_cells} cells scored, {n_excluded}/{n_task_cells} excluded.")
-    if gt_consistency_warnings:
-        print(f"[WARNING] {len(gt_consistency_warnings)} cross-method GT consistency check(s) "
-              f"FAILED -- see {consistency_path}. Do not treat the affected (dataset, task) "
-              f"cells' 'unified' numbers as trustworthy until resolved.")
+    # gt_consistency_warnings is guaranteed empty here -- the hard gate
+    # above already exits before this point otherwise.
     for row in excluded:
         print(f"  excluded: {row['dataset']}/{row['task']}/{row['method']}")
     print(f"Wrote: {summary_path}, {audit_path}, {correspondence_path}, "
@@ -1589,19 +1679,6 @@ def main():
     print("for those specific (dataset, task) combinations, this analysis provides NO evidence")
     print("about endpoint-ordering sensitivity; state this explicitly, do not extrapolate from")
     print("other tasks. UCL BPD/EoMT is expected to be among these (checkpoints already gone).")
-
-    severe_warnings = [w for w in gt_consistency_warnings if w["severe"] == "true"]
-    if severe_warnings:
-        print(f"\n*** HARD FAILURE: {len(severe_warnings)} (dataset, task) cross-method GT "
-              f"comparison(s) exceed {GT_CONSISTENCY_FAIL_THRESHOLD_PX}px "
-              f"(max_gt_coord_diff_px) -- too large to be resize/rounding noise, and must "
-              f"reflect an actual coordinate-recovery or sample-matching bug. ***")
-        for w in severe_warnings:
-            print(f"  UNUSABLE: {w['dataset']}/{w['task']} ({w['method_a']} vs {w['method_b']}): "
-                  f"max_gt_coord_diff_px={w['max_gt_coord_diff_px']}")
-        print(f"Do NOT use these tasks' unified-convention results for anything -- see "
-              f"{consistency_path}. Exiting non-zero.")
-        sys.exit(1)
 
 
 if __name__ == "__main__":

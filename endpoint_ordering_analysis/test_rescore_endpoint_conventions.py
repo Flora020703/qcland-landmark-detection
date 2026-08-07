@@ -973,6 +973,63 @@ def test_write_final_permutation_invariant_table_marks_missing_cells_unavailable
         shutil.rmtree(tmp)
 
 
+def test_write_final_permutation_invariant_table_rejects_mismatched_n_across_methods():
+    """2026-08-07 review finding (third round): this function must
+    SELF-VALIDATE that `summary_rows` really is the common-subset input its
+    own docstring requires, not merely trust the caller. If two methods
+    sharing a (dataset, task) report DIFFERENT n_images -- the exact
+    signature of accidentally passing each method's own full-set summary
+    rows instead of the common-subset ones -- it must raise ValueError
+    rather than silently render a table that looks official but isn't."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        summary_rows = [
+            {
+                "dataset": "UCL", "task": "ofd", "method": "hrnet", "n_images": 3,
+                "permutation_invariant_nme_5seed_mean_pct": "5.00000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.10000000",
+            },
+            {
+                # Deliberately DIFFERENT n from hrnet above for the SAME
+                # (dataset, task) -- as if full-set rows were passed by
+                # mistake instead of common-subset ones.
+                "dataset": "UCL", "task": "ofd", "method": "eomt_dinov2", "n_images": 2,
+                "permutation_invariant_nme_5seed_mean_pct": "6.00000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.20000000",
+            },
+        ]
+        try:
+            write_final_permutation_invariant_table(summary_rows, tmp)
+            raise AssertionError("expected ValueError for mismatched n_images across methods")
+        except ValueError as exc:
+            assert "DIFFERENT n_images" in str(exc)
+        print("[PASS] test_write_final_permutation_invariant_table_rejects_mismatched_n_across_methods")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_write_final_permutation_invariant_table_rejects_zero_n():
+    """An empty (or otherwise invalid) common-subset intersection must not
+    silently render as a real-looking `0.00±0.00 (n=0)` table cell."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        summary_rows = [
+            {
+                "dataset": "UCL", "task": "ofd", "method": "hrnet", "n_images": 0,
+                "permutation_invariant_nme_5seed_mean_pct": "0.00000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.00000000",
+            },
+        ]
+        try:
+            write_final_permutation_invariant_table(summary_rows, tmp)
+            raise AssertionError("expected ValueError for n_images=0")
+        except ValueError as exc:
+            assert "n_images=0" in str(exc)
+        print("[PASS] test_write_final_permutation_invariant_table_rejects_zero_n")
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_restrict_to_filenames_filters_data_correctly():
     """`_restrict_to_filenames` (2026-08-07 review finding: the common-subset
     re-aggregation fix) must filter both `filenames` and every seed's
@@ -1046,6 +1103,8 @@ def main():
     test_permutation_invariant_nme_matches_oracle_min_regardless_of_native_convention()
     test_permutation_invariant_sanity_detects_mismatch_with_hrnet_native_swap_min()
     test_write_final_permutation_invariant_table_marks_missing_cells_unavailable()
+    test_write_final_permutation_invariant_table_rejects_mismatched_n_across_methods()
+    test_write_final_permutation_invariant_table_rejects_zero_n()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     test_restrict_to_filenames_filters_data_correctly()

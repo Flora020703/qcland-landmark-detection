@@ -113,6 +113,10 @@ different script (`baseline_reproduction/evaluate_hrnet_fixed.py`) --
 `load_hrnet_per_image` cross-checks this module's `permutation_invariant_nme`
 against it on every load (`_check_permutation_invariant_sanity`), a genuine
 cross-codebase check, not just two code paths in this same file agreeing.
+Because HRNet's coordinates are already in original-image space (no
+conversion needed), this check validates the ACTUAL number that ends up in
+the official table.
+
 `load_eomt_per_image` performs the SAME cross-check, best-effort, against
 an optional `*_final_swapmin_per_image.csv` companion file if one happens
 to exist next to the required fixed-channel dump -- but whether such a
@@ -121,9 +125,29 @@ When it is absent, the run prints
 `[permutation-invariant sanity SKIPPED] ...` and proceeds; in that case,
 `permutation_invariant_nme` for that EoMT cell is only verified against
 this module's own `oracle_min` (same script) and the 500-trial randomised
-property test in the test suite -- real but weaker evidence than HRNet's
-independent check. State this asymmetry explicitly if asked how thoroughly
-EoMT's official numbers were cross-validated.
+property test in the test suite.
+
+**When the companion file IS present and the check passes, do not overstate
+what it proves** (2026-08-07, third review round): the check runs against
+EoMT's RAW dumped coordinates, in its own 512x512 model-input space,
+BEFORE the anisotropic-resize inversion to true original-image pixel
+space -- the same space the companion file's own value would have been
+computed in. It therefore validates CSV alignment (index<->filename join),
+coordinate parsing, and the `min(direct, crossed)` assignment LOGIC, not
+the final NUMERIC `permutation_invariant_nme` value that actually appears
+in the official table. That final value is computed AFTER the anisotropic
+inversion (see the coordinate-space notes above), and because that
+inversion is generally anisotropic for these (essentially always
+non-square) ultrasound images, neither the Euclidean NME magnitude NOR, in
+principle, the direct-vs-crossed assignment decision itself is guaranteed
+invariant between the two spaces. So: EoMT's official original-space NME
+numbers are, today, verified against this module's own math (`oracle_min`
+equivalence + 500-trial property test) but NOT against an independent
+codebase's number IN THE SAME SPACE the official table reports -- weaker
+evidence than HRNet's equivalent check, which does verify the space that
+matters. State this precisely if asked how thoroughly EoMT's official
+numbers were cross-validated; do not describe the EoMT companion check as
+closing the same gap HRNet's does.
 
 **Explicitly out of scope for the main table, per the same decision**
 (kept fully computed below for the Appendix/audit trail, not deleted):
