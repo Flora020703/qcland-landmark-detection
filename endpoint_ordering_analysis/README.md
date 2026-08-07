@@ -158,8 +158,9 @@ python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
 endpoint_ordering_analysis/results/
   endpoint_ordering_summary.tsv               one row per (dataset, task, method): 5-seed
                                                mean+-SD for all 3 conventions, GT disagreement
-                                               rate, x-sort-vs-DOD mean difference + bootstrap
-                                               95% CI
+                                               rate, raw-channel-vs-prediction-x-sort audit,
+                                               prediction reversal rate, and x-sort-vs-DOD
+                                               mean difference + bootstrap 95% CI
   endpoint_ordering_seed_summary.tsv          one row per (dataset, task, method, seed, convention)
   ucl_*_per_image.csv                         per-image, 5-seed-averaged NME under all 3
                                                conventions, in unified original-image coordinates
@@ -174,7 +175,46 @@ endpoint_ordering_analysis/results/
                                                on location or on x-sort-vs-DOD disagreement rate --
                                                a non-empty file signals a coordinate-recovery or
                                                sample-matching bug, not a real dataset property
+  raw_channel_vs_prediction_xsort_summary.tsv a compact extract of endpoint_ordering_summary.tsv's
+                                               raw-channel/prediction-x-sort columns only (see
+                                               "For the supervisor's immediate ... question" below
+                                               for what these mean and, critically, for which
+                                               method they are and are not a meaningful diagnostic)
 ```
+
+For the supervisor's immediate training/inference correspondence question,
+use these columns from `endpoint_ordering_summary.tsv`:
+
+- `raw_channel_original_5seed_mean_pct` / `*_sample_sd_pct`: channel 0 and
+  channel 1 retained exactly as decoded, compared with left/right x-sorted
+  GT, all in original-image coordinates;
+- `xsort_5seed_mean_pct` / `*_sample_sd_pct`: predictions and GT both
+  deterministically x-sorted before the same fixed-channel NME;
+- `prediction_x_reversal_rate_5seed_mean` / `*_sample_sd`: fraction of test
+  predictions for which raw channel 0 lies to the right of raw channel 1;
+- `raw_minus_prediction_xsort_5seed_mean_pp` / `*_sample_sd_pp`: paired
+  seed-level numerical reduction associated with enforcing the training
+  left-to-right convention after decoding.
+
+`native_*` is retained only as a parser sanity check and must not be
+subtracted from unified x-sort for EoMT, because the historical native EoMT
+score was computed in the anisotropically resized 512x512 coordinate space.
+
+**Interpretation caveat, do not skip this when reading the raw-channel/
+reversal columns for HRNet**: `raw_channel_original`/`prediction_x_reversal_rate`
+compare each method's UNTOUCHED, as-decoded channel 0/1 against the
+x-sorted (left/right) GT. This is a genuine model-quality diagnostic for a
+method whose own TRAINING convention already is x-sort (EoMT) -- a nonzero
+gap there means the model itself assigned channels inconsistently. HRNet's
+own training/native convention is DOD, not x-sort (see `dod_vectors.py`),
+so for HRNet these same columns are EXPECTED to be large exactly on the
+`gt_xsort_vs_dod_disagreement_rate` fraction of images, REGARDLESS of how
+accurate HRNet's predictions are -- a perfectly-trained HRNet model will
+still show a high `prediction_x_reversal_rate` on any image where DOD and
+x-sort disagree, because its channel 0 is correctly the DOD-first point,
+not the x-sort-left point. Read HRNet's numbers here as "the cost of
+scoring HRNet under an x-sort assumption it was never trained for," not as
+evidence of a channel-assignment defect in HRNet itself.
 
 ## Reading the summary for the supervisor conversation
 

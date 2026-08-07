@@ -535,6 +535,19 @@ def rescore_cell(data: dict, d_vect) -> dict:
             native_nme = row["native_fixed_nme"]
 
             gt_x0, gt_x1 = x_sort(gt0, gt1)
+            # Raw-channel evaluation in the SAME original-image coordinate
+            # space as the unified scores.  This is deliberately distinct
+            # from `native`: EoMT native NME was stored in its anisotropically
+            # resized 512x512 space, so native-vs-xsort is not an interpretable
+            # paired difference.  Here the GT is canonicalised exactly as the
+            # training targets were (left-to-right), while prediction channels
+            # remain untouched: raw channel 0 -> left GT, raw channel 1 ->
+            # right GT.  It therefore tests localisation + channel assignment.
+            raw_channel_nme = fixed_channel_nme(pred0, pred1, gt_x0, gt_x1)
+            prediction_x_reversed = bool(
+                (pred0[0] > pred1[0]) or
+                (pred0[0] == pred1[0] and pred0[1] > pred1[1])
+            )
             pred_x0, pred_x1 = x_sort(pred0, pred1)
             xsort_nme = fixed_channel_nme(pred_x0, pred_x1, gt_x0, gt_x1)
 
@@ -542,7 +555,13 @@ def rescore_cell(data: dict, d_vect) -> dict:
             pred_d0, pred_d1 = dod_sort(pred0, pred1, d_vect)
             dod_nme = fixed_channel_nme(pred_d0, pred_d1, gt_d0, gt_d1)
 
-            out[fn] = {"native": native_nme, "xsort": xsort_nme, "dod": dod_nme}
+            out[fn] = {
+                "native": native_nme,
+                "raw_channel_original": raw_channel_nme,
+                "xsort": xsort_nme,
+                "dod": dod_nme,
+                "prediction_x_reversed": prediction_x_reversed,
+            }
 
             if seed == SEEDS[0]:
                 disagree_by_filename[fn] = (gt_x0 != gt_d0)
@@ -567,34 +586,47 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
 
     seed_rows = []
     for seed in SEEDS:
-        for conv in ("native", "xsort", "dod"):
+        for conv in ("native", "raw_channel_original", "xsort", "dod"):
             values = np.array([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
             seed_rows.append({
                 "dataset": dataset, "task": task, "method": method_label, "seed": seed,
                 "convention": conv, "n_images": len(filenames),
                 "mean_nme_pct": f"{values.mean():.8f}",
+                "prediction_x_reversal_rate": (
+                    f"{np.mean([per_seed[seed][fn]['prediction_x_reversed'] for fn in filenames]):.8f}"
+                ),
             })
 
     per_image_avg = {}
-    for conv in ("native", "xsort", "dod"):
+    for conv in ("native", "raw_channel_original", "xsort", "dod"):
         stacked = np.array([[per_seed[seed][fn][conv] for seed in SEEDS] for fn in filenames]) * 100.0
         per_image_avg[conv] = stacked.mean(axis=1)  # average across 5 seeds, per image
 
+    raw_vals = per_image_avg["raw_channel_original"]
     xsort_vals = per_image_avg["xsort"]
     dod_vals = per_image_avg["dod"]
+    raw_minus_xsort = raw_vals - xsort_vals
     diff = xsort_vals - dod_vals
     lo, hi = bootstrap_ci(diff, bootstrap_reps, rng) if len(diff) > 1 else (float("nan"), float("nan"))
 
     per_image_path = output_root / f"{dataset.lower()}_{task}_{method_label}_per_image.csv"
     with per_image_path.open("w", newline="", encoding="utf-8") as handle:
-        fields = ["filename", "native_nme_pct", "xsort_nme_pct", "dod_nme_pct", "xsort_minus_dod_pp"]
+        fields = [
+            "filename", "native_nme_pct", "raw_channel_original_nme_pct",
+            "prediction_xsort_nme_pct", "raw_minus_prediction_xsort_pp",
+            "prediction_x_reversal_fraction_across_seeds", "dod_nme_pct",
+            "xsort_minus_dod_pp",
+        ]
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
         for i, fn in enumerate(filenames):
             writer.writerow({
                 "filename": fn,
                 "native_nme_pct": f"{per_image_avg['native'][i]:.8f}",
-                "xsort_nme_pct": f"{xsort_vals[i]:.8f}",
+                "raw_channel_original_nme_pct": f"{raw_vals[i]:.8f}",
+                "prediction_xsort_nme_pct": f"{xsort_vals[i]:.8f}",
+                "raw_minus_prediction_xsort_pp": f"{raw_minus_xsort[i]:.8f}",
+                "prediction_x_reversal_fraction_across_seeds": f"{np.mean([per_seed[seed][fn]['prediction_x_reversed'] for seed in SEEDS]):.8f}",
                 "dod_nme_pct": f"{dod_vals[i]:.8f}",
                 "xsort_minus_dod_pp": f"{diff[i]:.8f}",
             })
@@ -604,13 +636,30 @@ def summarize_and_write(dataset: str, task: str, method_label: str,
         "n_images": len(filenames),
         "gt_xsort_vs_dod_disagreement_rate": f"{rescored['gt_disagreement_rate']:.6f}",
     }
-    for conv in ("native", "xsort", "dod"):
+    for conv in ("native", "raw_channel_original", "xsort", "dod"):
         seed_means = np.array([
             np.mean([per_seed[seed][fn][conv] for fn in filenames]) * 100.0
             for seed in SEEDS
         ])
         summary_row[f"{conv}_5seed_mean_pct"] = f"{seed_means.mean():.8f}"
         summary_row[f"{conv}_5seed_sample_sd_pct"] = f"{seed_means.std(ddof=1):.8f}"
+    reversal_rates = np.array([
+        np.mean([per_seed[seed][fn]["prediction_x_reversed"] for fn in filenames])
+        for seed in SEEDS
+    ])
+    summary_row["prediction_x_reversal_rate_5seed_mean"] = f"{reversal_rates.mean():.8f}"
+    summary_row["prediction_x_reversal_rate_5seed_sample_sd"] = f"{reversal_rates.std(ddof=1):.8f}"
+    raw_seed_means = np.array([
+        np.mean([per_seed[seed][fn]["raw_channel_original"] for fn in filenames]) * 100.0
+        for seed in SEEDS
+    ])
+    xsort_seed_means = np.array([
+        np.mean([per_seed[seed][fn]["xsort"] for fn in filenames]) * 100.0
+        for seed in SEEDS
+    ])
+    paired_seed_delta = raw_seed_means - xsort_seed_means
+    summary_row["raw_minus_prediction_xsort_5seed_mean_pp"] = f"{paired_seed_delta.mean():.8f}"
+    summary_row["raw_minus_prediction_xsort_5seed_sample_sd_pp"] = f"{paired_seed_delta.std(ddof=1):.8f}"
     summary_row["xsort_minus_dod_mean_pp"] = f"{diff.mean():.8f}"
     summary_row["xsort_minus_dod_bootstrap_95ci_low_pp"] = f"{lo:.8f}"
     summary_row["xsort_minus_dod_bootstrap_95ci_high_pp"] = f"{hi:.8f}"
@@ -787,6 +836,25 @@ def main():
         writer.writeheader()
         writer.writerows(all_summary_rows)
 
+    # Compact supervisor-facing table for the immediate question: does the
+    # raw query/channel order obey the left-to-right target convention, and
+    # how much does deterministic prediction-only x-sort change the score?
+    audit_path = args.output_root / "raw_channel_vs_prediction_xsort_summary.tsv"
+    audit_fields = [
+        "dataset", "task", "method", "n_images",
+        "prediction_x_reversal_rate_5seed_mean",
+        "prediction_x_reversal_rate_5seed_sample_sd",
+        "raw_channel_original_5seed_mean_pct",
+        "raw_channel_original_5seed_sample_sd_pct",
+        "xsort_5seed_mean_pct", "xsort_5seed_sample_sd_pct",
+        "raw_minus_prediction_xsort_5seed_mean_pp",
+        "raw_minus_prediction_xsort_5seed_sample_sd_pp",
+    ]
+    with audit_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=audit_fields, delimiter="\t")
+        writer.writeheader()
+        writer.writerows({field: row[field] for field in audit_fields} for row in all_summary_rows)
+
     dvect_path = args.output_root / "dod_vectors.tsv"
     with dvect_path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(dvect_rows[0]), delimiter="\t")
@@ -818,7 +886,7 @@ def main():
               f"cells' 'unified' numbers as trustworthy until resolved.")
     for row in excluded:
         print(f"  excluded: {row['dataset']}/{row['task']}/{row['method']}")
-    print(f"Wrote: {summary_path}, {seed_summary_path}, {dvect_path}, {excluded_path}, "
+    print(f"Wrote: {summary_path}, {audit_path}, {seed_summary_path}, {dvect_path}, {excluded_path}, "
           f"{consistency_path}, and {n_scored} per-image CSVs under {args.output_root}")
     print("\n*** LIMITATION, repeat to the supervisor alongside these numbers ***")
     print("This is a retrospective RE-SCORING of already-saved predictions under two")

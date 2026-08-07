@@ -570,6 +570,30 @@ def test_min_paired_max_abs_diff_picks_closer_pairing():
     print("[PASS] test_min_paired_max_abs_diff_picks_closer_pairing")
 
 
+def test_raw_channel_vs_prediction_xsort_audit_detects_reversal():
+    """A location-perfect but channel-reversed prediction must score badly
+    under raw-channel fixed correspondence and exactly zero after
+    prediction-only x-sort; the audit flag must identify the reversal."""
+    row = {
+        "pred0": (90.0, 10.0),
+        "pred1": (10.0, 10.0),
+        "gt0": (10.0, 10.0),
+        "gt1": (90.0, 10.0),
+        "native_fixed_nme": 1.0,
+    }
+    data = {
+        "filenames": ["reversed.png"],
+        "per_seed": {seed: {"reversed.png": dict(row)} for seed in SEEDS},
+    }
+    scored = rescore_cell(data, ((0.0, 0.0), (1.0, 0.0)))["per_seed_per_image"]
+    for seed in SEEDS:
+        result = scored[seed]["reversed.png"]
+        assert result["prediction_x_reversed"] is True
+        assert abs(result["raw_channel_original"] - 1.0) < 1e-12
+        assert abs(result["xsort"]) < 1e-12
+    print("[PASS] test_raw_channel_vs_prediction_xsort_audit_detects_reversal")
+
+
 def main():
     test_hrnet_loader_and_native_nme_matches_stored_value()
     test_eomt_loader_joins_order_and_coords_correctly()
@@ -581,6 +605,7 @@ def main():
     test_cross_method_gt_consistency_check_tolerates_channel_order_convention_difference()
     test_gt_consistency_threshold_tiers()
     test_min_paired_max_abs_diff_picks_closer_pairing()
+    test_raw_channel_vs_prediction_xsort_audit_detects_reversal()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()
     test_gt_disagreement_rate_detects_real_disagreement()
     print("[ALL ENDPOINT-ORDERING-ANALYSIS TESTS PASSED]")
