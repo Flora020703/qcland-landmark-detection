@@ -355,17 +355,51 @@ def _restrict_to_filenames(data: dict, keep: set[str]) -> dict:
     return {"per_seed": per_seed, "filenames": filenames}
 
 
-def _heatmap_dump_to_model_input_space(dumped_x: float, dumped_y: float) -> tuple[float, float]:
-    """Recovers true 512x512 model-input-space coordinates from EoMT's raw
-    per-image dump -- see this module's docstring ("SECOND CRITICAL FIX")
-    for the full derivation. `training/landmark_detection.py` dumps
-    heatmap-space coordinates via a naive scale multiply
-    (`coord_scale = img_size/heatmap_size`), which is NOT the exact inverse
-    of how `datasets/landmark_dataset.py` encoded them (pixel-centre-aligned:
-    `heatmap = (input + 0.5) * (heatmap_size/input_size) - 0.5`). The
-    residual is a constant offset, identical for every point in every
-    image: `dumped = input - 0.5 * (input_size/heatmap_size - 1)`."""
-    scale = EOMT_MODEL_INPUT_SIZE / EOMT_HEATMAP_SIZE
+def _heatmap_dump_to_model_input_space(
+    dumped_x: float, dumped_y: float, *,
+    pixel_center_align: bool = True,
+    model_input_size: float = EOMT_MODEL_INPUT_SIZE,
+    heatmap_size: float = EOMT_HEATMAP_SIZE,
+) -> tuple[float, float]:
+    """Recovers true model-input-space coordinates from EoMT's raw per-image
+    dump -- see this module's docstring ("SECOND CRITICAL FIX") for the
+    original derivation. `training/landmark_detection.py`'s dump ALWAYS
+    scales heatmap-space coordinates back via a naive multiply
+    (`coord_scale = img_size/heatmap_size`, unconditional, verified directly
+    from `LandmarkDetection.eval_step`'s `coord_scale = pred_coords.new_tensor(
+    [iw/hm_w, ih/hm_h])` -- no `pixel_center_align` branch there at all).
+    Whether this is the EXACT inverse of the encode step depends entirely on
+    which convention `datasets/landmark_dataset.py` used to encode
+    model-input-space coordinates INTO heatmap space for THAT run:
+
+    - `pixel_center_align=True` (UDP-style, e.g. the final +FPN+UDP
+      configuration and everything downstream of it): encode is
+      `heatmap = (input + 0.5) * (heatmap_size/input_size) - 0.5` -- NOT the
+      exact inverse of the dump's naive scale-back, leaving a residual
+      CONSTANT offset (2026-08-07 finding): `dumped = input - 0.5 *
+      (input_size/heatmap_size - 1)`, recovered here.
+    - `pixel_center_align=False` (2026-08-09 finding: EVERY earlier BPD
+      architecture rung -- original einsum head, DeconvHeadV2, +FPN --
+      predates the UDP addition and used this convention): encode is the
+      PLAIN naive multiply `heatmap = input * (heatmap_size/input_size)`,
+      verified directly from `LandmarkDataset.__getitem__`'s own `else`
+      branch (`datasets/landmark_dataset.py`, the `if self.pixel_center_align`
+      block around the heatmap-space mapping step). This is EXACTLY the
+      dump's own inverse -- composing them algebraically gives `dumped ==
+      input`, i.e. NO offset at all. Applying the UDP-case offset formula to
+      a `pixel_center_align=False` run's dump would silently INTRODUCE a
+      spurious constant error rather than correct one -- do not reuse the
+      default blindly for pre-UDP checkpoints.
+
+    `heatmap_size` must also match the ACTUAL heatmap resolution the run
+    used (e.g. 128 for a `128x128` heatmap variant, not this module's
+    128/64-agnostic UCL/Multicentre default of 64) -- the offset's magnitude
+    scales with `model_input_size/heatmap_size`, so reusing the wrong
+    constant silently produces the wrong correction even when
+    `pixel_center_align` is set correctly."""
+    if not pixel_center_align:
+        return dumped_x, dumped_y
+    scale = model_input_size / heatmap_size
     offset = 0.5 * scale - 0.5
     return dumped_x + offset, dumped_y + offset
 
@@ -539,7 +573,9 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
 
 
 def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
-                         image_size_cache: _ImageSizeCache) -> dict:
+                         image_size_cache: _ImageSizeCache, *,
+                         pixel_center_align: bool = True,
+                         heatmap_size: float = EOMT_HEATMAP_SIZE) -> dict:
     """Returns the same shape as load_hrnet_per_image, but with
     coordinates ALREADY CONVERTED to real original-image pixel space
     (see this module's own docstring for why this conversion is required
@@ -549,7 +585,20 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     test_nme_dump_path feature (introduced 2026-07-23/24) actually having
     been enabled for the run that produced these files -- if the
     coordinate columns are absent, this raises LoadError with a precise,
-    actionable message rather than silently falling back to NME-only."""
+    actionable message rather than silently falling back to NME-only.
+
+    `pixel_center_align`/`heatmap_size` (2026-08-09, added for the BPD
+    staged-development retrain): MUST match the `data.init_args.
+    pixel_center_align`/`heatmap_size` the SPECIFIC run being loaded
+    actually used, not necessarily this module's UCL/Multicentre-final-model
+    default (`True`/64) -- see `_heatmap_dump_to_model_input_space`'s own
+    docstring for why a pre-UDP BPD ablation rung (original einsum head,
+    DeconvHeadV2, +FPN -- all `pixel_center_align=False`) needs `False`
+    here, and why a 128x128-heatmap variant needs `heatmap_size=128`.
+    Passing the wrong value does not raise an error -- it silently produces
+    a subtly-wrong original-space coordinate, exactly the failure mode this
+    module's own `_check_native_sanity` cannot catch (that check validates
+    parsing of the RAW dump, before this conversion is even applied)."""
     is_multicentre = dataset == "MULTICENTRE"
     per_seed_raw: dict[int, dict[str, dict]] = {}
     # *** Best-effort independent EoMT-side swap-min cross-check (2026-08-07
@@ -715,7 +764,9 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
             width, height = sizes[fn]
 
             def _to_orig(point: tuple[float, float]) -> tuple[float, float]:
-                model_space = _heatmap_dump_to_model_input_space(*point)
+                model_space = _heatmap_dump_to_model_input_space(
+                    *point, pixel_center_align=pixel_center_align, heatmap_size=heatmap_size
+                )
                 return to_image_space(*model_space, width, height, EOMT_MODEL_INPUT_SIZE)
 
             converted[fn] = {

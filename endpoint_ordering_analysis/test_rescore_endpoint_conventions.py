@@ -97,6 +97,24 @@ def _simulate_real_eomt_dump(orig_point: tuple[float, float], width: float, heig
     return heatmap_x * dump_scale, heatmap_y * dump_scale
 
 
+def _simulate_real_eomt_dump_naive(orig_point: tuple[float, float], width: float, height: float) -> tuple[float, float]:
+    """2026-08-09 addition: reproduces the dump chain for a
+    `pixel_center_align=False` run (every pre-UDP BPD staged-development
+    rung: original einsum head, DeconvHeadV2, +FPN) -- the PLAIN naive
+    encode `heatmap = input * (heatmap_size/input_size)`
+    (`datasets/landmark_dataset.py`'s `else` branch, no +0.5/-0.5 terms),
+    composed with the dump's own always-naive scale-back. Unlike the
+    pixel-centre case, these two are EXACT inverses of each other -- this
+    function's return value must equal `to_model_space(*orig_point, ...)`
+    with NO residual offset, verified as its own regression test."""
+    input_x, input_y = to_model_space(*orig_point, width, height, EOMT_MODEL_INPUT_SIZE)
+    hm_scale = EOMT_HEATMAP_SIZE / EOMT_MODEL_INPUT_SIZE
+    heatmap_x = input_x * hm_scale
+    heatmap_y = input_y * hm_scale
+    dump_scale = EOMT_MODEL_INPUT_SIZE / EOMT_HEATMAP_SIZE
+    return heatmap_x * dump_scale, heatmap_y * dump_scale
+
+
 def _write_hrnet_synthetic(root: Path, dataset: str, task_tag: str, filenames_and_points):
     for seed in SEEDS:
         run_dir = root / f"fetal_landmark_hrnet_w18_{dataset}_{task_tag}_seed{seed}_512fixed"
@@ -467,6 +485,109 @@ def test_heatmap_dump_offset_recovery_matches_real_encode_chain():
         )
         print("[PASS] test_heatmap_dump_offset_recovery_matches_real_encode_chain "
               f"(naive-vs-fixed recovery error: {naive_err:.3f}px)")
+    finally:
+        shutil.rmtree(tmp)
+        shutil.rmtree(images_root)
+
+
+def test_heatmap_dump_recovery_zero_offset_when_pixel_center_align_false():
+    """2026-08-09 finding (BPD staged-development retrain planning): every
+    pre-UDP architecture rung (original einsum head, DeconvHeadV2, +FPN)
+    used `pixel_center_align=False`, whose encode (`datasets/
+    landmark_dataset.py`'s naive `heatmap = input * (heatmap_size/
+    input_size)`) IS the exact inverse of the dump's own always-naive
+    scale-back -- composing them gives `dumped == input` with NO residual
+    offset, unlike the `pixel_center_align=True` (UDP) case this module was
+    originally built for. `_heatmap_dump_to_model_input_space` must return
+    its input completely unchanged when told `pixel_center_align=False`;
+    silently applying the UDP-case offset formula here would INTRODUCE a
+    spurious error into data that has none."""
+    x, y = 123.456, 78.9
+    out = _heatmap_dump_to_model_input_space(x, y, pixel_center_align=False)
+    assert out == (x, y), f"expected exact passthrough, got {out!r}"
+    print("[PASS] test_heatmap_dump_recovery_zero_offset_when_pixel_center_align_false")
+
+
+def test_heatmap_dump_recovery_offset_scales_with_heatmap_size():
+    """A 128x128-heatmap variant needs a DIFFERENT offset magnitude than the
+    64x64 default (`scale = model_input_size/heatmap_size` changes) -- must
+    not reuse the 64x64-calibrated constant for a 128x128 run."""
+    x, y = 10.0, 10.0
+    out_64 = _heatmap_dump_to_model_input_space(x, y, pixel_center_align=True, heatmap_size=64)
+    out_128 = _heatmap_dump_to_model_input_space(x, y, pixel_center_align=True, heatmap_size=128)
+    assert out_64 != out_128, "64 and 128 heatmap sizes must not silently produce the same offset"
+    # Hand-derived: offset = 0.5*(model_input_size/heatmap_size) - 0.5
+    expected_64 = x + (0.5 * (512 / 64) - 0.5)
+    expected_128 = x + (0.5 * (512 / 128) - 0.5)
+    assert abs(out_64[0] - expected_64) < 1e-9
+    assert abs(out_128[0] - expected_128) < 1e-9
+    print("[PASS] test_heatmap_dump_recovery_offset_scales_with_heatmap_size")
+
+
+def test_eomt_loader_recovers_original_space_for_pixel_center_align_false_run():
+    """End-to-end version of the above two unit tests, through the actual
+    `load_eomt_per_image(..., pixel_center_align=False)` call a BPD
+    staged-development retrain (original einsum head/DeconvHeadV2/+FPN)
+    would use -- not just the isolated formula. Writes a per-image CSV
+    using the NAIVE (non-pixel-centre) dump chain
+    (`_simulate_real_eomt_dump_naive`) and confirms the loader recovers the
+    true original-space point when told the run did NOT use pixel-centre
+    alignment; a loader that defaulted to `pixel_center_align=True` here
+    would recover the WRONG point (this is checked explicitly as the
+    contrasting case)."""
+    tmp = Path(tempfile.mkdtemp())
+    images_root = Path(tempfile.mkdtemp())
+    try:
+        width, height = 300.0, 640.0
+        gt0, gt1 = (140.0, 600.0), (145.0, 30.0)
+        pred0, pred1 = (142.0, 598.0), (143.0, 32.0)
+        gt0_dump = _simulate_real_eomt_dump_naive(gt0, width, height)
+        gt1_dump = _simulate_real_eomt_dump_naive(gt1, width, height)
+        pred0_dump = _simulate_real_eomt_dump_naive(pred0, width, height)
+        pred1_dump = _simulate_real_eomt_dump_naive(pred1, width, height)
+        nme = fixed_channel_nme(pred0_dump, pred1_dump, gt0_dump, gt1_dump)
+        for seed in SEEDS:
+            run_dir = tmp / "bpd_einsum" / f"seed{seed}"
+            run_dir.mkdir(parents=True)
+            with (run_dir / "test_image_order.csv").open("w", newline="") as f:
+                writer = csv.writer(f)
+                writer.writerow(["index", "img_name"])
+                writer.writerow([0, "h.jpg"])
+            with (run_dir / "final_fixedchannel_per_image.csv").open("w", newline="") as f:
+                fields = ["index", "nme", "pixel_error", "pred_x0", "pred_y0", "gt_x0", "gt_y0",
+                          "pred_x1", "pred_y1", "gt_x1", "gt_y1"]
+                writer = csv.DictWriter(f, fieldnames=fields)
+                writer.writeheader()
+                writer.writerow({
+                    "index": 0, "nme": nme, "pixel_error": "",
+                    "pred_x0": pred0_dump[0], "pred_y0": pred0_dump[1],
+                    "gt_x0": gt0_dump[0], "gt_y0": gt0_dump[1],
+                    "pred_x1": pred1_dump[0], "pred_y1": pred1_dump[1],
+                    "gt_x1": gt1_dump[0], "gt_y1": gt1_dump[1],
+                })
+        _write_synthetic_image(images_root, "Head", "h.jpg", int(width), int(height))
+        cache = _ImageSizeCache(images_root, "Head")
+
+        data = load_eomt_per_image(tmp, "UCL", "bpd", "einsum", cache, pixel_center_align=False)
+        row = data["per_seed"][42]["h.jpg"]
+        assert abs(row["gt0"][0] - gt0[0]) < 1e-6 and abs(row["gt0"][1] - gt0[1]) < 1e-6, (
+            f"expected exact recovery with pixel_center_align=False, got {row['gt0']!r} vs {gt0!r}"
+        )
+        assert abs(row["gt1"][0] - gt1[0]) < 1e-6 and abs(row["gt1"][1] - gt1[1]) < 1e-6
+
+        # Contrast: loading the SAME naive-encoded dump with the (wrong,
+        # default) pixel_center_align=True must NOT recover the true point --
+        # proves this test would actually catch the bug if the parameter
+        # were ignored or defaulted incorrectly.
+        data_wrong = load_eomt_per_image(tmp, "UCL", "bpd", "einsum", cache, pixel_center_align=True)
+        row_wrong = data_wrong["per_seed"][42]["h.jpg"]
+        wrong_err = max(abs(row_wrong["gt0"][0] - gt0[0]), abs(row_wrong["gt0"][1] - gt0[1]))
+        assert wrong_err > 0.5, (
+            "test construction error: expected pixel_center_align=True to visibly "
+            "mis-recover a naive-encoded (pixel_center_align=False) dump"
+        )
+        print("[PASS] test_eomt_loader_recovers_original_space_for_pixel_center_align_false_run "
+              f"(wrong-flag recovery error: {wrong_err:.3f}px)")
     finally:
         shutil.rmtree(tmp)
         shutil.rmtree(images_root)
@@ -1146,6 +1267,9 @@ def main():
     test_eomt_loader_skips_swapmin_check_when_companion_absent()
     test_eomt_loader_inverts_anisotropic_coordinate_space_correctly()
     test_heatmap_dump_offset_recovery_matches_real_encode_chain()
+    test_heatmap_dump_recovery_zero_offset_when_pixel_center_align_false()
+    test_heatmap_dump_recovery_offset_scales_with_heatmap_size()
+    test_eomt_loader_recovers_original_space_for_pixel_center_align_false_run()
     test_eomt_loader_rejects_missing_images_root_file()
     test_native_sanity_check_detects_corrupted_stored_nme()
     test_cross_method_gt_consistency_check_detects_mismatch()
