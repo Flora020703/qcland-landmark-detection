@@ -1,0 +1,121 @@
+# ---------------------------------------------------------------
+# MODIFIED (2026-08-09): RECONSTRUCTED config for the "original einsum
+# head" rung of the BPD core architecture chain (einsum -> DeconvHeadV2 ->
+# +FPN -> +FPN+UDP).
+#
+# This is NOT the original Run 18/21 config file. That file was never
+# committed with correct values -- at the commit that created the 5-seed
+# einsum seed-ablation script (`daebe79`), the committed bpd_vit_small.yaml
+# still held leftover, abandoned Run-20a settings (loss_type: hybrid_awing,
+# lambda_coord: 1.0, no heatmap_head field), which do NOT match what that
+# same script's own runtime assertions require (loss_type=hybrid,
+# lambda_coord=0.1) -- the real per-run YAML actually used on the server
+# was hand-edited there and never committed back, so it cannot be
+# reconstructed byte-for-byte. This file instead sets every field to the
+# value CONSTANT across the whole 4-rung core architecture sequence
+# (verified directly from ablation/scripts/run_seed_ablation.sh's own
+# config-verification block, and cross-checked against the two rungs whose
+# configs DO survive cleanly, bpd_deconv_v2.yaml and bpd_deconv_v2_fpn.yaml
+# -- every field below except heatmap_head/use_fpn/fpn_layers is byte-for-
+# byte identical to those two files), with heatmap_head reverted to the
+# original ("einsum" -- also EoMT's own architecture default, set
+# explicitly here rather than relied on implicitly) and no FPN/no UDP.
+#
+# Held constant across all 4 rungs (do not change when retraining this
+# rung): loss_type=hybrid, alpha=5.0, temperature=10.0, lambda_coord=0.1,
+# sigma=4.0, heatmap_size=[64,64], img_size=[512,512], no rotation/scale
+# augmentation, DINOv2 ViT-S/14-reg4 backbone, val_split_seed=42,
+# batch_size=16, max_epochs=200. pixel_center_align is NOT set here
+# (defaults to False in datasets/landmark_dataset.py) -- this rung predates
+# the UDP fix, and must be scored with
+# `endpoint_ordering_analysis/rescore_endpoint_conventions.py`'s
+# `load_eomt_per_image(..., pixel_center_align=False)`, NOT the default
+# True used for the final +FPN+UDP model (see that function's own
+# docstring, 2026-08-09 finding).
+#
+# Usage (via script, sets seed_everything / loader_seed / wandb name /
+# checkpoint dirpath per run -- do not train directly off this file):
+#   bash ablation/scripts/run_bpd_core_chain_retrain_5seed.sh
+# ---------------------------------------------------------------
+
+seed_everything: 42
+
+trainer:
+  max_epochs: 200
+  check_val_every_n_epoch: 5
+  log_every_n_steps: 1
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        save_top_k: 1
+        save_last: true
+        dirpath: checkpoints/einsum-reconstructed/seed42
+        filename: einsum_seed42_best
+    - class_path: lightning.pytorch.callbacks.EarlyStopping
+      init_args:
+        monitor: metrics/val_nme
+        mode: min
+        patience: 20
+        min_delta: 0.005
+    - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+      init_args:
+        logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: einsum-reconstructed-seed42
+      save_dir: logs
+      log_model: false
+
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 2
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 1.0e-4
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps: [15, 30]
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 2
+        num_blocks: 3
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: einsum
+        heatmap_size: [64, 64]
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+
+data:
+  class_path: datasets.landmark_dataset.HeadLandmarkDataModule
+  init_args:
+    images_dir: /root/autodl-tmp/images/UCL/Head
+    ann_train_csv: /root/autodl-tmp/annotations/UCL/Head_Train.csv
+    ann_test_csv: /root/autodl-tmp/annotations/UCL/Head_Test.csv
+    task: bpd
+    img_size: [512, 512]
+    heatmap_size: [64, 64]
+    sigma: 4.0
+    val_fraction: 0.1
+    val_split_seed: 42
+    batch_size: 16
+    num_workers: 4
