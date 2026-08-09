@@ -575,6 +575,7 @@ def load_hrnet_per_image(hrnet_root: Path, dataset: str, task: str) -> dict[str,
 def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
                          image_size_cache: _ImageSizeCache, *,
                          pixel_center_align: bool = True,
+                         model_input_size: float = EOMT_MODEL_INPUT_SIZE,
                          heatmap_size: float = EOMT_HEATMAP_SIZE) -> dict:
     """Returns the same shape as load_hrnet_per_image, but with
     coordinates ALREADY CONVERTED to real original-image pixel space
@@ -587,14 +588,16 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
     coordinate columns are absent, this raises LoadError with a precise,
     actionable message rather than silently falling back to NME-only.
 
-    `pixel_center_align`/`heatmap_size` (2026-08-09, added for the BPD
+    `pixel_center_align`/`model_input_size`/`heatmap_size` (2026-08-09,
+    added for the BPD
     staged-development retrain): MUST match the `data.init_args.
     pixel_center_align`/`heatmap_size` the SPECIFIC run being loaded
     actually used, not necessarily this module's UCL/Multicentre-final-model
-    default (`True`/64) -- see `_heatmap_dump_to_model_input_space`'s own
+    default (`True`/512/64) -- see `_heatmap_dump_to_model_input_space`'s own
     docstring for why a pre-UDP BPD ablation rung (original einsum head,
     DeconvHeadV2, +FPN -- all `pixel_center_align=False`) needs `False`
-    here, and why a 128x128-heatmap variant needs `heatmap_size=128`.
+    here, why a 256x256-input run needs `model_input_size=256`, and why a
+    128x128-heatmap variant needs `heatmap_size=128`.
     Passing the wrong value does not raise an error -- it silently produces
     a subtly-wrong original-space coordinate, exactly the failure mode this
     module's own `_check_native_sanity` cannot catch (that check validates
@@ -765,9 +768,12 @@ def load_eomt_per_image(eomt_root: Path, dataset: str, task: str, backbone: str,
 
             def _to_orig(point: tuple[float, float]) -> tuple[float, float]:
                 model_space = _heatmap_dump_to_model_input_space(
-                    *point, pixel_center_align=pixel_center_align, heatmap_size=heatmap_size
+                    *point,
+                    pixel_center_align=pixel_center_align,
+                    model_input_size=model_input_size,
+                    heatmap_size=heatmap_size,
                 )
-                return to_image_space(*model_space, width, height, EOMT_MODEL_INPUT_SIZE)
+                return to_image_space(*model_space, width, height, model_input_size)
 
             converted[fn] = {
                 "pred0": _to_orig(row["pred0"]),

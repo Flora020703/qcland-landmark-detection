@@ -524,6 +524,22 @@ def test_heatmap_dump_recovery_offset_scales_with_heatmap_size():
     print("[PASS] test_heatmap_dump_recovery_offset_scales_with_heatmap_size")
 
 
+def test_heatmap_dump_recovery_offset_scales_with_model_input_size():
+    """Resolution screening uses 256x256 and 512x512 inputs with the same
+    64x64 heatmap.  Their UDP residual offsets must therefore differ."""
+    x, y = 10.0, 10.0
+    out_256 = _heatmap_dump_to_model_input_space(
+        x, y, pixel_center_align=True, model_input_size=256, heatmap_size=64
+    )
+    out_512 = _heatmap_dump_to_model_input_space(
+        x, y, pixel_center_align=True, model_input_size=512, heatmap_size=64
+    )
+    assert abs(out_256[0] - (x + 1.5)) < 1e-9
+    assert abs(out_512[0] - (x + 3.5)) < 1e-9
+    assert out_256 != out_512
+    print("[PASS] test_heatmap_dump_recovery_offset_scales_with_model_input_size")
+
+
 def test_eomt_loader_recovers_original_space_for_pixel_center_align_false_run():
     """End-to-end version of the above two unit tests, through the actual
     `load_eomt_per_image(..., pixel_center_align=False)` call a BPD
@@ -1269,6 +1285,7 @@ def main():
     test_heatmap_dump_offset_recovery_matches_real_encode_chain()
     test_heatmap_dump_recovery_zero_offset_when_pixel_center_align_false()
     test_heatmap_dump_recovery_offset_scales_with_heatmap_size()
+    test_heatmap_dump_recovery_offset_scales_with_model_input_size()
     test_eomt_loader_recovers_original_space_for_pixel_center_align_false_run()
     test_eomt_loader_rejects_missing_images_root_file()
     test_native_sanity_check_detects_corrupted_stored_nme()
