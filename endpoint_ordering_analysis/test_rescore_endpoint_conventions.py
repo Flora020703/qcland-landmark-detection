@@ -973,6 +973,56 @@ def test_write_final_permutation_invariant_table_marks_missing_cells_unavailable
         shutil.rmtree(tmp)
 
 
+def test_write_final_permutation_invariant_table_footnote_reflects_actual_missing_cells():
+    """2026-08-09 review finding: the old footnote unconditionally said
+    "UCL BPD EoMT cells are Unavailable", regardless of whether that was
+    still true for a given run -- once those cells were actually recovered
+    (real server run, 30/30 scored, 0 excluded), that sentence would keep
+    claiming a gap that no longer exists. The footnote must be DERIVED from
+    the actual missing cells for this specific call, not hardcoded."""
+    tmp = Path(tempfile.mkdtemp())
+    try:
+        # Case 1: exactly one missing cell -- footnote must name it exactly.
+        summary_rows_one_missing = [
+            {
+                "dataset": d, "task": t, "method": m, "n_images": 10,
+                "permutation_invariant_nme_5seed_mean_pct": "5.00000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.50000000",
+            }
+            for d in ("UCL", "MULTICENTRE")
+            for t in ("bpd", "ofd", "apad", "tad", "fl")
+            for m in ("hrnet", "eomt_dinov2", "eomt_dinov3")
+            if (d, t, m) != ("UCL", "bpd", "eomt_dinov2")
+        ]
+        _, md_path = write_final_permutation_invariant_table(summary_rows_one_missing, tmp)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "UCL/BPD/EoMT-DINOv2" in md_text, (
+            f"expected the footnote to name the exact missing cell, got: {md_text!r}"
+        )
+        # Must not claim a second EoMT-DINOv3 gap that isn't actually missing here.
+        assert "UCL/BPD/EoMT-DINOv3" not in md_text
+
+        # Case 2: nothing missing -- no "Unavailable" wording anywhere.
+        summary_rows_full = [
+            {
+                "dataset": d, "task": t, "method": m, "n_images": 10,
+                "permutation_invariant_nme_5seed_mean_pct": "5.00000000",
+                "permutation_invariant_nme_5seed_sample_sd_pct": "0.50000000",
+            }
+            for d in ("UCL", "MULTICENTRE")
+            for t in ("bpd", "ofd", "apad", "tad", "fl")
+            for m in ("hrnet", "eomt_dinov2", "eomt_dinov3")
+        ]
+        _, md_path_full = write_final_permutation_invariant_table(summary_rows_full, tmp)
+        md_text_full = md_path_full.read_text(encoding="utf-8")
+        assert "Unavailable" not in md_text_full, (
+            f"expected no 'Unavailable' wording when every cell is populated, got: {md_text_full!r}"
+        )
+        print("[PASS] test_write_final_permutation_invariant_table_footnote_reflects_actual_missing_cells")
+    finally:
+        shutil.rmtree(tmp)
+
+
 def test_write_final_permutation_invariant_table_rejects_mismatched_n_across_methods():
     """2026-08-07 review finding (third round): this function must
     SELF-VALIDATE that `summary_rows` really is the common-subset input its
@@ -1068,16 +1118,23 @@ def test_restrict_to_filenames_filters_data_correctly():
 
 def test_expected_missing_matches_known_ucl_bpd_eomt_gap():
     """EXPECTED_MISSING (2026-08-07 review finding: the strict missing-cell
-    gate) must name EXACTLY the one known, documented gap -- UCL BPD's two
-    EoMT backbones, whose checkpoints/per-image files are confirmed gone
-    from the server -- and nothing else. If this constant is ever widened
-    to silently tolerate more missing cells, that must be a deliberate,
-    reviewed change, not an accident; this test pins the current, real
-    known-gap set so any change to it is visible in a diff/test failure."""
-    assert EXPECTED_MISSING == {
-        ("UCL", "bpd", "eomt_dinov2"),
-        ("UCL", "bpd", "eomt_dinov3"),
-    }
+    gate) must name EXACTLY the currently-known set of permanently-missing
+    cells -- nothing else. If this constant is ever widened to silently
+    tolerate more missing cells, that must be a deliberate, reviewed
+    change, not an accident; this test pins the current, real known-gap
+    set so any change to it is visible in a diff/test failure.
+
+    UPDATED 2026-08-09: UCL BPD's two EoMT cells (the only entries this
+    constant ever held) were RECOVERED via a real server run -- five-seed
+    final checkpoints and per-image predictions were specifically
+    regenerated for those two configurations (not a re-run of the historical
+    ablation chain), and a real run confirmed 30/30 cells scored, 0 excluded
+    (see docs/supervisor_meeting_report_2026-08-08.md section 0.1.1). There
+    is currently no known permanently-missing cell, so the allowlist is
+    empty -- any future load failure is therefore treated as new/unexpected
+    and hard-fails by default, which is the correct posture now that no gap
+    is expected."""
+    assert EXPECTED_MISSING == set()
     print("[PASS] test_expected_missing_matches_known_ucl_bpd_eomt_gap")
 
 
@@ -1103,6 +1160,7 @@ def main():
     test_permutation_invariant_nme_matches_oracle_min_regardless_of_native_convention()
     test_permutation_invariant_sanity_detects_mismatch_with_hrnet_native_swap_min()
     test_write_final_permutation_invariant_table_marks_missing_cells_unavailable()
+    test_write_final_permutation_invariant_table_footnote_reflects_actual_missing_cells()
     test_write_final_permutation_invariant_table_rejects_mismatched_n_across_methods()
     test_write_final_permutation_invariant_table_rejects_zero_n()
     test_rescore_cell_recovers_x_sort_and_dod_correctly()

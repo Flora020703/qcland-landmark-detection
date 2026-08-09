@@ -322,10 +322,17 @@ GT_CONSISTENCY_FAIL_THRESHOLD_PX = 1.0
 #     reality, and the official table is generated USING that cell's real,
 #     freshly-recovered numbers rather than continuing to mark it
 #     "Unavailable" out of habit.
-EXPECTED_MISSING = {
-    ("UCL", "bpd", "eomt_dinov2"),
-    ("UCL", "bpd", "eomt_dinov3"),
-}
+#
+# *** UPDATED 2026-08-09: UCL BPD's two EoMT cells were RECOVERED ***
+# (five-seed final checkpoints + per-image predictions specifically
+# regenerated for these two configurations, not a re-run of the historical
+# ablation chain -- see docs/supervisor_meeting_report_2026-08-08.md
+# section 0.1.1). A real server run confirmed 30/30 cells scored, 0
+# excluded, using the exact same evaluator this constant gates. There is
+# currently no known permanently-missing cell, so the allowlist is empty --
+# ANY load failure on a future run is therefore treated as new/unexpected
+# and hard-fails, which is the correct default once no gap is expected.
+EXPECTED_MISSING: set[tuple[str, str, str]] = set()
 
 
 def _restrict_to_filenames(data: dict, keep: set[str]) -> dict:
@@ -1291,6 +1298,7 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
 
     header = ["dataset", "method"] + [t.upper() for t in _FINAL_TABLE_TASK_ORDER]
     data_rows = []
+    missing_cells: list[tuple[str, str, str]] = []
     for dataset in _FINAL_TABLE_DATASET_ORDER:
         for method in _FINAL_TABLE_METHOD_ORDER:
             row = [dataset, _FINAL_TABLE_METHOD_DISPLAY[method]]
@@ -1298,6 +1306,7 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
                 key = (dataset, task, method)
                 if key not in by_key:
                     row.append("Unavailable")
+                    missing_cells.append(key)
                     continue
                 r = by_key[key]
                 mean = float(r["permutation_invariant_nme_5seed_mean_pct"])
@@ -1319,11 +1328,21 @@ def write_final_permutation_invariant_table(summary_rows: list[dict], output_roo
         handle.write("|" + "---|" * len(header) + "\n")
         for row in data_rows:
             handle.write("| " + " | ".join(row) + " |\n")
-        handle.write(
-            "\nUCL BPD EoMT cells are `Unavailable`: retained per-image predictions/"
-            "checkpoints are confirmed absent from the server -- not backfilled with "
-            "any historical fixed-channel number.\n"
-        )
+        # *** Dynamic missing-cell footnote (2026-08-09 review finding) ***:
+        # previously a hardcoded sentence unconditionally named "UCL BPD
+        # EoMT cells" as Unavailable, regardless of whether that was still
+        # true this run -- once those cells were actually recovered (real
+        # server run, 30/30 scored, 0 excluded), the footnote would have
+        # kept claiming a gap that no longer existed. Now derived from the
+        # ACTUAL `missing_cells` list for this specific run.
+        if missing_cells:
+            cell_list = ", ".join(f"{d}/{t.upper()}/{_FINAL_TABLE_METHOD_DISPLAY[m]}"
+                                   for d, t, m in missing_cells)
+            handle.write(
+                f"\n`Unavailable` cell(s) this run: {cell_list} -- retained per-image "
+                f"predictions/checkpoints confirmed absent (see excluded_images.tsv for the "
+                f"exact reason); not backfilled with any historical fixed-channel number.\n"
+            )
         handle.write(
             "\n`n` is the size of the cross-method common image-filename intersection for "
             "that (dataset, task), NOT necessarily each method's own full available test-set "
