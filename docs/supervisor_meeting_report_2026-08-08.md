@@ -252,9 +252,9 @@ RTMPose 不复制成 DINOv2/DINOv3 两行，也不为了与 EoMT 行数一致而
 
 不重跑整个历史消融链。优先寻找本地 checkpoint 或可恢复的原始预测；若均不存在，才重新训练这十个最终配置 runs。每个 run 必须保存 checkpoint、原始两通道预测坐标、GT、文件名顺序、配置、seed、provenance 和逐图 permutation-invariant NME。补齐后重新运行同一 evaluator，使两格从 `Unavailable` 变成正式结果，再冻结完整 EoMT/HRNet 表。
 
-### 阶段 3：RTMPose-s UCL-BPD seed-42 canary
+### 阶段 3：RTMPose-s UCL-BPD seed-42 canary —— 已完成，导师已书面确认（2026-08-10）
 
-按以下顺序执行：
+按以下顺序执行，已全部完成：
 
 1. `PREFLIGHT_ONLY=1`；
 2. 独立 1-epoch engineering smoke（若当前服务器版本已通过，只需保留日志，不把 smoke 数字当实验结果）；
@@ -265,15 +265,21 @@ RTMPose 不复制成 DINOv2/DINOv3 两行，也不为了与 EoMT 行数一致而
 
 RTMPose 训练仍输出两个通道，但最终主评估把两 endpoint 当作无序点对，因此不需要为了主指标在推理时加入 prediction x-sort 或 frozen-DOD 后处理。
 
-### 阶段 4：RTMPose-s 完整实验
+**导师回复（2026-08-10，原文节选，逐字记录）**：
 
-导师确认 canary 后：
+> I think the seed-42 canary is technically valid based on the checks you have performed. In particular, the coordinate round-trip, SimCC encoding/decoding, gradient flow, pretrained-weight loading and full training-pipeline verification give me confidence that there is no obvious implementation issue. The fact that the fixed-channel and permutation-invariant NME are identical also confirms that the relatively high Test NME is not caused by endpoint assignment. ... as long as the implementation and experimental protocol are sound, I don't think we need to be concerned that its performance is lower than EoMT. We should report the result as obtained under the same evaluation protocol rather than trying to optimize the baseline based on the Test performance. Please proceed with the remaining four UCL BPD seeds using exactly the same configuration, so that we can obtain a reliable five-seed mean and seed-level standard deviation. Once we have the five-seed BPD result, we can proceed with the remaining measurements using the same RTMPose-s configuration.
 
-1. 完成 UCL BPD 其余四个 seeds；
+要点：导师明确认可 RTMPose-s 作为"公平实现的 baseline"这一定位——它的分数比 proposed model 低不构成担忧，也**不应该为了让 Test 表现更好而反过来调整 baseline**，只需要在相同协议下如实报告。canary 阶段正式关闭，进入阶段 4。
+
+### 阶段 4：RTMPose-s 完整实验 —— 已启动（2026-08-10）
+
+导师已确认 canary，按批准的顺序推进：
+
+1. **当前步骤**：完成 UCL BPD 其余四个 seeds（`rtmpose_reproduction/run_rtmpose_bpd_remaining_seeds.sh`，新增脚本，2026-08-10）——复用 seed-42 canary 已生成的 internal-split/Test COCO json（不重新生成，避免与 seed 42 的划分产生哪怕理论上的偏差，确保五个 seed 严格在"相同配置"下比较），只对 seeds `0,123,2024,3407` 各跑一次完整的 config 生成→provenance→preflight→200-epoch 训练→final checkpoint 校验→推理→评分。完成后需要把 5 个 seed（含 seed 42）的 per-image CSV 聚合成 five-seed mean ± seed-level sample SD——`evaluate_rtmpose_fixed.py` 的逐图 CSV schema与 HRNet 的完全一致，可以直接复用 `endpoint_ordering_analysis/` 里已经审过多轮的聚合逻辑，不需要新写解析代码。
 2. 完成 UCL OFD/APAD/TAD/FL，各五 seeds；
 3. 完成 Multicentre BPD/OFD/APAD/TAD/FL，各五 seeds。
 
-总计为 `2 datasets × 5 tasks × 5 seeds = 50 RTMPose-s runs`，每个 cell 只有一个 RTMPose-s 方法结果，不存在 DINOv2/DINOv3 分支。
+总计为 `2 datasets × 5 tasks × 5 seeds = 50 RTMPose-s runs`（UCL BPD 的 5 个已经算在内：canary 1 个 + 本次 4 个），每个 cell 只有一个 RTMPose-s 方法结果，不存在 DINOv2/DINOv3 分支。
 
 ### 阶段 5：统一修改论文
 
