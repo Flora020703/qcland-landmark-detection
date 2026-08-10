@@ -275,7 +275,15 @@ RTMPose 训练仍输出两个通道，但最终主评估把两 endpoint 当作�
 
 导师已确认 canary，按批准的顺序推进：
 
-1. **当前步骤**：完成 UCL BPD 其余四个 seeds（`rtmpose_reproduction/run_rtmpose_bpd_remaining_seeds.sh`，新增脚本，2026-08-10）——复用 seed-42 canary 已生成的 internal-split/Test COCO json（不重新生成，避免与 seed 42 的划分产生哪怕理论上的偏差，确保五个 seed 严格在"相同配置"下比较），只对 seeds `0,123,2024,3407` 各跑一次完整的 config 生成→provenance→preflight→200-epoch 训练→final checkpoint 校验→推理→评分。完成后需要把 5 个 seed（含 seed 42）的 per-image CSV 聚合成 five-seed mean ± seed-level sample SD——`evaluate_rtmpose_fixed.py` 的逐图 CSV schema与 HRNet 的完全一致，可以直接复用 `endpoint_ordering_analysis/` 里已经审过多轮的聚合逻辑，不需要新写解析代码。
+1. **当前步骤**：完成 UCL BPD 其余四个 seeds，随后（同一脚本、显式确认后）继续完成全部 50 个 RTMPose-s run。
+
+**2026-08-10 更新，脚本合并**：一个相关审阅发现原计划的 `run_rtmpose_bpd_remaining_seeds.sh`（只覆盖 BPD 4 个 seed）在防覆盖、共享 split 完整性、"完全相同配置"强制锁定这三方面都弱于本项目已有的 HRNet 50-run driver（`baseline_reproduction/run_hrnet_512_fixed_5seed.sh`）范式。与其维护两个各自实现同一套加固逻辑、容易互相漂移的脚本，不如直接按 HRNet driver 的成熟模式（resumable TSV、拒绝静默 resume 半成品目录、磁盘预检查）写一个覆盖全部 2 datasets × 5 tasks × 5 seeds = 50 run 的统一脚本，`run_rtmpose_bpd_remaining_seeds.sh` 已删除，替换为 `rtmpose_reproduction/run_rtmpose_full_sweep.sh`：
+
+- **防覆盖**（相关审阅问题 1）：复用 HRNet driver 的 `RESULTS_TSV` + `is_recorded()` 跳过已完成项模式；若某 run 的工作目录存在但没有对应的 `summary.json`，直接报错要求人工检查/归档该目录，绝不自动 resume。
+- **共享 split 完整性**（问题 2）：每个 (dataset, task) 的 internal-split/Train/Val/Test COCO json 只生成一次，生成时做内容自检（internal-train/internal-val/Test 三者互不重叠）并记录四个文件的 SHA-256 到独立 manifest；同一 cell 后续每个 seed 开跑前都会重新核对这份 manifest，一旦文件被改动/损坏立刻报错，不会静默用不同数据训练剩下的 seed。UCL/BPD 这一 cell 直接复用 seed-42 canary 已生成的四个文件（不重新生成任何"看起来一样"的副本）。
+- **"完全相同配置"锁定**（问题 3）：`MAX_EPOCHS` 硬编码为 200（不再是可被环境变量覆盖的默认值）；预训练 checkpoint SHA-256 硬编码为 canary provenance 记录的 `aa7d9335bf422ad02a803e36f357dfc6abb807eca42d79e8b3b6e7c5bd1f446b`，每个 run 都强制核对；每个生成的 config 都会用 `mmengine.Config.fromfile` 读回后逐字段断言（`randomness.seed`、`train_cfg.max_epochs`、`backbone.init_cfg.checkpoint`、`codec.input_size` 等），比对存量 config 文件的文本 diff 更明确、也不依赖能找到某个历史 config 文件。
+
+脚本按 UCL BPD 五个 seed（含预置的 seed-42 canary 结果）优先处理，处理完打印 five-seed mean ± seed-level sample SD 后默认停止，需要显式设置 `PROCEED_PAST_BPD=1` 才会继续跑剩下 45 个 run——对应导师"先看 BPD 五-seed 结果，再继续其余 measurements"的分阶段要求。`evaluate_rtmpose_fixed.py` 的逐图 CSV schema 与 HRNet 的完全一致（`swap_min_nme` 列即 permutation-invariant NME），最终聚合直接复用这一列，不需要额外解析逻辑。
 2. 完成 UCL OFD/APAD/TAD/FL，各五 seeds；
 3. 完成 Multicentre BPD/OFD/APAD/TAD/FL，各五 seeds。
 
