@@ -341,6 +341,26 @@ PY
   echo "$split_json|$train_json|$val_json|$test_json"
 }
 
+# --- Canary naming special-case (2026-08-10, third review round finding --
+#     BLOCKING, caught the sweep exiting on its very first seed): the
+#     seed-42 UCL/BPD canary (run_rtmpose_canary.sh) used the "_canary"
+#     suffix throughout (UCL_BPD_seed42_canary_summary.json, work_dir
+#     "UCL_BPD_seed42_canary/", etc), NOT this script's own "_run" suffix.
+#     Pre-seeding the TSV alone is not enough -- every place that computes
+#     a run's file naming MUST go through this one function, or the state
+#     machine looks for "UCL_BPD_seed42_run_*" (which was never written),
+#     sees the TSV row but 0/5 files, and reports "inconsistent" on the
+#     very first seed of the very first cell. Keep in sync with the
+#     identical special-case in backup_and_clean_cell.sh.
+run_name_for() {
+  local dataset="$1" task="$2" seed="$3"
+  if [ "$dataset" = "UCL" ] && [ "$task" = "BPD" ] && [ "$seed" = "42" ]; then
+    echo "UCL_BPD_seed42_canary"
+  else
+    echo "${dataset}_${task}_seed${seed}_run"
+  fi
+}
+
 # --- Fix A: 4-state artifact/TSV consistency check, replacing the old
 #     TSV-only is_recorded() + "work_dir exists but no summary" partial
 #     check (which missed the case where work_dir AND summary.json both
@@ -348,7 +368,7 @@ PY
 #     fresh / recoverable / complete / inconsistent. ------------------------
 run_artifacts_status() {
   local dataset="$1" task="$2" seed="$3"
-  local run_name="${dataset}_${task}_seed${seed}_run"
+  local run_name; run_name="$(run_name_for "$dataset" "$task" "$seed")"
   local work_dir="$ARTIFACT_ROOT/$run_name"
   local config_path="$ARTIFACT_ROOT/configs/${run_name}.py"
   local provenance_json="$ARTIFACT_ROOT/${run_name}_provenance.json"
@@ -382,7 +402,7 @@ run_artifacts_status() {
 
 run_one() {
   local dataset="$1" task="$2" anatomy="$3" seed="$4"
-  local run_name="${dataset}_${task}_seed${seed}_run"
+  local run_name; run_name="$(run_name_for "$dataset" "$task" "$seed")"
   local work_dir="$ARTIFACT_ROOT/$run_name"
   local config_path="$ARTIFACT_ROOT/configs/${run_name}.py"
   local provenance_json="$ARTIFACT_ROOT/${run_name}_provenance.json"
@@ -391,37 +411,84 @@ run_one() {
   local summary_json="$ARTIFACT_ROOT/${run_name}_summary.json"
 
   run_artifacts_status "$dataset" "$task" "$seed"
-  case "$RUN_STATUS" in
-    complete)
-      echo "[SKIP] ${dataset}/${task} seed=${seed} (already in $RESULTS_TSV, all output files present)"
-      return
-      ;;
-    recoverable)
-      # "严格恢复" (strict recovery): existence of all 5 files is not enough
-      # on its own -- cross-check their CONTENT agrees with each other and
-      # with the expected seed before trusting them into the TSV, so a
-      # stale/mismatched file from an earlier aborted attempt cannot be
-      # silently accepted as this seed's real result.
-      local values
-      values=$("$PY" - "$summary_json" "$per_image_csv" "$config_path" "$seed" <<'PY'
+  if [ "$RUN_STATUS" = "complete" ]; then
+    echo "[SKIP] ${dataset}/${task} seed=${seed} (already in $RESULTS_TSV, all output files present)"
+    return
+  fi
+  if [ "$RUN_STATUS" = "inconsistent" ]; then
+    echo "ERROR: inconsistent state for ${dataset}/${task} seed=${seed}: $RUN_STATUS_DETAIL" >&2
+    echo "Refusing to auto-resolve -- manually inspect $work_dir and the *_${run_name}_* files, either" >&2
+    echo "complete/restore whatever is missing or archive+remove them, then re-run." >&2
+    exit 1
+  fi
+
+  # RUN_STATUS is now "recoverable" or "fresh" -- both need the shared
+  # per-cell artifacts (recoverable needs test_json to re-score against;
+  # fresh needs all three to actually train/infer).
+  check_disk
+  local artifacts train_json val_json test_json
+  artifacts="$(ensure_shared_artifacts "$dataset" "$task" "$anatomy")"
+  IFS='|' read -r _ train_json val_json test_json <<< "$artifacts"
+
+  if [ "$RUN_STATUS" = "recoverable" ]; then
+    # "严格恢复" (strict recovery, third review round): checking that 5
+    # files exist and their row counts/seed roughly agree is NOT the same
+    # as verifying the recorded numbers are actually correct. Independently
+    # RE-RUNS the evaluator against the SAME already-saved predictions.json
+    # + GT, into a throwaway location, and requires it to be BYTE-IDENTICAL
+    # to the existing summary/per-image CSV (both are pure/deterministic
+    # functions of predictions+GT, so two correct runs must agree exactly)
+    # before trusting the existing files into the TSV -- never retrains.
+    echo "--- [recoverable] ${dataset}/${task} seed=${seed}: re-scoring the existing predictions.json against GT to verify the on-disk summary/per-image CSV, not just checking they exist ---"
+    local tmp_dir
+    tmp_dir="$(mktemp -d)"
+    "$PY" evaluate_rtmpose_fixed.py \
+      --gt-json "$test_json" \
+      --predictions-json "$pred_json" \
+      --per-image-csv "$tmp_dir/per_image.csv" \
+      --summary-json "$tmp_dir/summary.json"
+
+    local values
+    values=$("$PY" - "$summary_json" "$tmp_dir/summary.json" "$per_image_csv" "$tmp_dir/per_image.csv" "$config_path" "$seed" <<'PY'
 import csv, json, sys
 from mmengine.config import Config
 from mmengine.registry import init_default_scope
 
-summary_path, per_image_path, config_path, seed = sys.argv[1:5]
+(existing_summary_path, fresh_summary_path, existing_per_image_path,
+ fresh_per_image_path, config_path, seed) = sys.argv[1:7]
 seed = int(seed)
 
-x = json.load(open(summary_path, encoding="utf-8"))
+existing = json.load(open(existing_summary_path, encoding="utf-8"))
+fresh = json.load(open(fresh_summary_path, encoding="utf-8"))
 for key in ("n", "fixed_channel_mean_pct", "swap_min_mean_pct"):
-    if key not in x:
-        raise SystemExit(f"ERROR: {summary_path} is missing expected key {key!r}")
+    if key not in existing:
+        raise SystemExit(f"ERROR: {existing_summary_path} is missing expected key {key!r}")
+    if existing[key] != fresh[key]:
+        raise SystemExit(
+            f"ERROR: existing summary.json disagrees with a fresh re-score of the SAME "
+            f"predictions.json against the SAME GT for key {key!r}: "
+            f"existing={existing[key]!r} fresh={fresh[key]!r} -- refusing to recover"
+        )
 
-with open(per_image_path, newline="", encoding="utf-8") as f:
-    per_image_rows = list(csv.DictReader(f))
-if len(per_image_rows) != x["n"]:
+def load_csv(p):
+    with open(p, newline="", encoding="utf-8") as f:
+        return {row["filename"]: row for row in csv.DictReader(f)}
+
+existing_rows = load_csv(existing_per_image_path)
+fresh_rows = load_csv(fresh_per_image_path)
+if set(existing_rows) != set(fresh_rows):
+    raise SystemExit("ERROR: existing per-image CSV filenames do not match a fresh re-score's own filenames -- refusing to recover")
+mismatches = []
+for fn, fresh_row in fresh_rows.items():
+    existing_row = existing_rows[fn]
+    for col in ("gt0_x", "gt0_y", "gt1_x", "gt1_y", "pred0_x", "pred0_y", "pred1_x", "pred1_y",
+                "fixed_channel_nme", "swap_min_nme"):
+        if existing_row[col] != fresh_row[col]:
+            mismatches.append((fn, col))
+if mismatches:
     raise SystemExit(
-        f"ERROR: {per_image_path} has {len(per_image_rows)} rows but "
-        f"{summary_path} reports n={x['n']} -- inconsistent, refusing to recover"
+        f"ERROR: {len(mismatches)} (filename, column) mismatch(es) between the existing "
+        f"per-image CSV and a fresh re-score, e.g. {mismatches[:5]} -- refusing to recover"
     )
 
 init_default_scope("mmpose")
@@ -429,32 +496,22 @@ cfg = Config.fromfile(config_path)
 if cfg.randomness["seed"] != seed:
     raise SystemExit(
         f"ERROR: {config_path}'s own randomness.seed={cfg.randomness['seed']} "
-        f"does not match the expected seed={seed} for this run -- refusing to recover"
+        f"does not match the expected seed={seed} -- refusing to recover"
     )
 
-print(f'{x["n"]} {x["fixed_channel_mean_pct"]:.6f} {x["swap_min_mean_pct"]:.6f}')
+print(f'{existing["n"]} {existing["fixed_channel_mean_pct"]:.6f} {existing["swap_min_mean_pct"]:.6f}')
 PY
 )
-      local n fixed swap
-      read -r n fixed swap <<< "$values"
-      append_result_row "$dataset" "$task" "$seed" "$n" "$fixed" "$swap"
-      echo "[RECOVERED] ${dataset}/${task} seed=${seed}: all 5 output files were already present but missing from $RESULTS_TSV -- content cross-checked (per-image row count matches n, config's own seed matches) and recovered WITHOUT retraining (n=$n fixed=${fixed}% swap_min=${swap}%)"
-      return
-      ;;
-    inconsistent)
-      echo "ERROR: inconsistent state for ${dataset}/${task} seed=${seed}: $RUN_STATUS_DETAIL" >&2
-      echo "Refusing to auto-resolve -- manually inspect $work_dir and the *_${run_name}_* files, either" >&2
-      echo "complete/restore whatever is missing or archive+remove them, then re-run." >&2
-      exit 1
-      ;;
-    fresh) ;;
-  esac
-
-  check_disk
-
-  local artifacts train_json val_json test_json
-  artifacts="$(ensure_shared_artifacts "$dataset" "$task" "$anatomy")"
-  IFS='|' read -r _ train_json val_json test_json <<< "$artifacts"
+    rm -rf "$tmp_dir"
+    local n fixed swap
+    read -r n fixed swap <<< "$values"
+    append_result_row "$dataset" "$task" "$seed" "$n" "$fixed" "$swap"
+    echo "[RECOVERED] ${dataset}/${task} seed=${seed}: independently re-scored predictions.json"
+    echo "  against GT and confirmed byte-identical to the existing summary/per-image CSV before"
+    echo "  trusting them -- recovered WITHOUT retraining (n=$n fixed=${fixed}% swap_min=${swap}%)"
+    CELL_DID_WORK=1
+    return
+  fi
 
   echo ""
   echo "============================================================"
@@ -535,6 +592,7 @@ PY
   read -r n fixed swap <<< "$values"
   append_result_row "$dataset" "$task" "$seed" "$n" "$fixed" "$swap"
   echo "[DONE] ${run_name}: n=$n fixed=${fixed}% swap_min(=PI-NME)=${swap}%"
+  CELL_DID_WORK=1
 }
 
 # --- Fix B: exhaustive config-field verification, every value read
@@ -553,6 +611,8 @@ init_default_scope("mmpose")
 seed, max_epochs = int(seed), int(max_epochs)
 cfg = Config.fromfile(cfg_path)
 
+import json as _json
+
 m = cfg.model
 backbone = m["backbone"]
 head = m["head"]
@@ -565,6 +625,18 @@ expected_train_pipeline_types = [
     "FetalRotateScaleColorJitter", "GenerateTarget", "PackPoseInputs",
 ]
 expected_val_pipeline_types = ["LoadImage", "PixelCentreResize", "PackPoseInputs"]
+
+# Independently recompute what make_config.py's own real formula (read
+# directly from its source, not assumed) must have produced for THIS
+# cell's actual internal-train image count, so training_recipe_summary
+# and the param_scheduler list can be checked against real expected
+# numbers rather than just "some list exists".
+n_train_images = len(_json.load(open(train_json, encoding="utf-8"))["images"])
+batch_size = cfg.train_dataloader["batch_size"]
+iters_per_epoch = -(-n_train_images // batch_size)  # ceil division
+warmup_epochs = min(5, max(1, max_epochs // 20))     # == 5 for max_epochs=200
+expected_warmup_end_iters = warmup_epochs * iters_per_epoch
+expected_cosine_begin_epoch = max_epochs // 2         # == 100 for max_epochs=200
 
 checks = [
     # --- randomness / schedule ---
@@ -646,6 +718,42 @@ checks = [
     # --- augmentation pipeline: exact ordering, nothing extra/missing ---
     ("train_pipeline types", [t["type"] for t in cfg.train_pipeline], expected_train_pipeline_types),
     ("val_pipeline types", [t["type"] for t in cfg.val_pipeline], expected_val_pipeline_types),
+    # FetalRandomFlipAndCanonicalize's flip_prob IS a real config-level
+    # parameter (unlike FetalRotateScaleColorJitter's rotation/scale/colour
+    # ranges, which are hardcoded inside that transform class itself --
+    # transforms.py's own __init__ only takes input_size, nothing else is
+    # exposed at the config level to assert here).
+    ("train_pipeline[1].flip_prob", cfg.train_pipeline[1]["flip_prob"], 0.5),
+    # Deliberately NOT set anywhere in make_config.py (see that file's own
+    # comment: avoids double-scaling lr if --auto-scale-lr is ever passed
+    # to tools/train.py) -- must be absent, not merely False.
+    ("auto_scale_lr key absent", "auto_scale_lr" in cfg, False),
+    # --- LR schedule: exact scheduler count/types/boundaries, independently
+    #     recomputed from make_config.py's own real formula above, not just
+    #     "a list exists" ---
+    ("param_scheduler count", len(cfg.param_scheduler), 2),
+    ("param_scheduler[0].type", cfg.param_scheduler[0]["type"], "LinearLR"),
+    ("param_scheduler[0].start_factor", cfg.param_scheduler[0]["start_factor"], 1e-5),
+    ("param_scheduler[0].by_epoch", cfg.param_scheduler[0]["by_epoch"], False),
+    ("param_scheduler[0].begin", cfg.param_scheduler[0]["begin"], 0),
+    ("param_scheduler[0].end", cfg.param_scheduler[0]["end"], expected_warmup_end_iters),
+    ("param_scheduler[1].type", cfg.param_scheduler[1]["type"], "CosineAnnealingLR"),
+    ("param_scheduler[1].eta_min", cfg.param_scheduler[1]["eta_min"], scaled_lr * 0.05),
+    ("param_scheduler[1].begin", cfg.param_scheduler[1]["begin"], expected_cosine_begin_epoch),
+    ("param_scheduler[1].end", cfg.param_scheduler[1]["end"], max_epochs),
+    ("param_scheduler[1].T_max", cfg.param_scheduler[1]["T_max"], max_epochs - expected_cosine_begin_epoch),
+    ("param_scheduler[1].by_epoch", cfg.param_scheduler[1]["by_epoch"], True),
+    ("param_scheduler[1].convert_to_iter_based", cfg.param_scheduler[1]["convert_to_iter_based"], True),
+    # --- training_recipe_summary: independently cross-checked against the
+    #     real internal-train image count and the same formula above, not
+    #     just "the key exists" ---
+    ("training_recipe_summary.n_train_images", cfg.training_recipe_summary["n_train_images"], n_train_images),
+    ("training_recipe_summary.batch_size", cfg.training_recipe_summary["batch_size"], batch_size),
+    ("training_recipe_summary.iters_per_epoch", cfg.training_recipe_summary["iters_per_epoch"], iters_per_epoch),
+    ("training_recipe_summary.effective_lr", cfg.training_recipe_summary["effective_lr"], scaled_lr),
+    ("training_recipe_summary.warmup_end_iters", cfg.training_recipe_summary["warmup_end_iters"], expected_warmup_end_iters),
+    ("training_recipe_summary.cosine_begin_epoch", cfg.training_recipe_summary["cosine_begin_epoch"], expected_cosine_begin_epoch),
+    ("training_recipe_summary.max_epochs", cfg.training_recipe_summary["max_epochs"], max_epochs),
 ]
 
 all_ok = True
@@ -696,28 +804,46 @@ for (dataset, task), cell_rows in sorted(by_cell.items()):
 PY
 }
 
+# CELL_DID_WORK (global, reset per cell): 2026-08-10 third-round fix for a
+# real blocking bug -- the previous version paused (exit 0) after EVERY
+# cell unconditionally, including a cell whose 5 seeds were ALL already
+# [SKIP]ped (e.g. re-running the sweep after UCL/BPD was backed up and
+# cleaned). That meant the sweep could NEVER progress past the first cell
+# across multiple invocations: re-running always re-processed UCL/BPD
+# (all 5 instant skips) and paused again before ever reaching UCL/OFD.
+# run_one() now sets CELL_DID_WORK=1 whenever it actually does something
+# (trains fresh, or strictly recovers a result) -- a cell where every seed
+# was a plain [SKIP] leaves it at 0, and the outer loop below continues
+# straight to the next cell without pausing, only stopping once a cell
+# that needed real work has been processed.
 process_cell() {
   local dataset="$1" task="$2" anatomy="$3"
+  CELL_DID_WORK=0
   for SEED in "${SEEDS[@]}"; do
     run_one "$dataset" "$task" "$anatomy" "$SEED"
   done
   aggregate_and_report
-  if [ "$STOP_AFTER_EACH_CELL" = "1" ]; then
-    echo ""
-    echo "=== ${dataset}/${task} five-seed result above -- STOPPING here (STOP_AFTER_EACH_CELL=1, default) ==="
-    echo "Before continuing: back up this cell's checkpoints/logs/predictions to local storage and verify"
-    echo "the backup, THEN free the server disk (see backup_and_clean_cell.sh) -- do NOT just lower"
-    echo "MIN_FREE_GB or re-run with STOP_AFTER_EACH_CELL=0 to push through; this server's disk genuinely"
-    echo "cannot hold many cells' worth of artifacts at once (see this script's own Fix D comment)."
-    echo "Re-run this same script (STOP_AFTER_EACH_CELL=1) to process the next remaining cell; already-"
-    echo "complete cells are skipped via $RESULTS_TSV, so no progress is lost."
-    exit 0
-  fi
 }
 
 for CELL in "${CELLS[@]}"; do
   IFS=':' read -r DATASET TASK ANATOMY <<< "$CELL"
   process_cell "$DATASET" "$TASK" "$ANATOMY"
+  if [ "$CELL_DID_WORK" != "1" ]; then
+    echo ""
+    echo "=== ${DATASET}/${TASK}: all 5 seeds were already complete, nothing new done -- continuing to the next cell without pausing ==="
+    continue
+  fi
+  if [ "$STOP_AFTER_EACH_CELL" = "1" ]; then
+    echo ""
+    echo "=== ${DATASET}/${TASK} five-seed result above -- STOPPING here (STOP_AFTER_EACH_CELL=1, default) ==="
+    echo "Before continuing: back up this cell's checkpoints/logs/predictions to local storage and verify"
+    echo "the backup, THEN free the server disk (see backup_and_clean_cell.sh) -- do NOT just lower"
+    echo "MIN_FREE_GB or re-run with STOP_AFTER_EACH_CELL=0 to push through; this server's disk genuinely"
+    echo "cannot hold many cells' worth of artifacts at once (see this script's own Fix D comment)."
+    echo "Re-run this same script (STOP_AFTER_EACH_CELL=1) to process the next remaining cell; already-"
+    echo "complete cells are skipped via $RESULTS_TSV and won't trigger another pause on their own."
+    exit 0
+  fi
 done
 
 echo ""
