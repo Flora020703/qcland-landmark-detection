@@ -303,7 +303,18 @@ RTMPose 训练仍输出两个通道，但最终主评估把两 endpoint 当作�
 - **额外，"strict recovery" 名不副实**：`recoverable` 状态原来只做浅层核对（summary 有 3 个 key、逐图行数等于 n、config 里的 seed 匹配），不是真正重新核实数字正确。现在改为对 `recoverable` 状态重新纯打分：拿现有 predictions JSON + GT JSON 独立跑一遍 `evaluate_rtmpose_fixed.py` 到临时目录，与已有 summary/per-image 逐项（全部 summary key、全部逐图 CSV 列，按文件名对齐）核对一致后才把结果写回 TSV，不需要重新训练。
 - **额外，配置断言文档超过代码**：注释曾声称锁定了 scheduler，但代码里没有任何 `param_scheduler` 断言；augmentation 检查也只覆盖 pipeline 步骤类型和顺序，没有覆盖实际参数值。现在 `verify_config()` 新增了 `param_scheduler`（LinearLR + CosineAnnealingLR 两项，逐字段核对，数值全部从 `make_config.py` 真实公式独立重新推导，不是照抄）、`auto_scale_lr` 确实不存在的断言、`train_pipeline` 里 `flip_prob` 的断言，以及 `training_recipe_summary` 全部 7 个字段的内部一致性核对。经过核实 `FetalRotateScaleColorJitter` 的旋转/缩放/颜色抖动具体范围是硬编码在 transform 类内部、根本不是 config 参数，因此没有为这部分再加断言——这些已经是 config 层面能核对的全部内容。
 
-以上两个脚本的全部改动均已 `bash -n` 语法检查通过，提交到 `master`（commit `b15d799`）。RTMPose 完整 50-run 扫描尚未在服务器上真正启动，下一步是先跑 UCL/BPD 剩余 4 个 seed。
+以上两个脚本的全部改动均已 `bash -n` 语法检查通过，提交到 `master`（commit `b15d799`）。
+
+**2026-08-10 第四轮加固（相关审阅第三轮修复后又发现 3 个真实但更小的问题，正式训练前一并修完）**：
+
+- **备份没有真正验证 epoch_200.pth**：原来的 checkpoint 检查只是"`epoch_*.pth` 数量恰好为 1"，如果目录里只有 `epoch_195.pth`（训练中途失败），一样能通过，静默备份一个没跑完 200 epoch 的 run。新增 `rtmpose_common.sh` 里的 `verify_final_checkpoint()`：要求 `epoch_200.pth` 存在且非空、目录内没有其它 `epoch_*.pth`、`last_checkpoint` 指针确实指向这个文件——两个脚本（训练完成时的确认、备份前的确认）统一调用同一个函数。
+- **complete 状态仍然只检查文件存在**：四态状态机原来只统计 5 个文件是否都在，从不重新核对内容——如果一个"complete"的 cell 被后续拷贝/手动操作/磁盘故障破坏，会被永久静默信任并跳过。`recoverable` 恢复时也只核对了 config 的 seed 字段（没跑完整的 ~45 项配置断言），且逐图 CSV 是直接读进 `{filename: row}` 字典，重复文件名会被静默覆盖、不会报错。新增 `validate_run_content.py`，是配置断言 + 独立重新评分一致性 + 逐图 CSV 行数与 n 一致/无重复文件名 + provenance 交叉核对的唯一实现，`run_rtmpose_full_sweep.sh`（训练前的 config-only 模式；"recoverable"和现在也包括"complete"的 full 模式，跳过前会重新核实一遍）和 `backup_and_clean_cell.sh`（备份前的 full 模式）统一调用同一份代码，不再各自维护一份可能走样的逻辑。
+- **cell 归档缺少两类轻量证据**：原来的 archive 里没有 results TSV、没有 COCO 转换时的 `*_excluded.json`、也没有软件版本记录。`do_backup()` 现在同时归档完整版和该 cell 单独提取的 results TSV、3 个 excluded-image 日志、以及两个 driver 脚本自身的副本；`record_run_provenance.py` 新增记录 python/torch/mmcv/mmengine/mmpose 版本号（向后兼容的新增字段，不需要重新跑已批准的 canary）。
+- **清理不是 all-or-nothing**：`do_clean()` 原来是边验证边删除（每个 seed 验证通过就立刻删），如果第三个目录验证失败，前两个已经删了，形成部分清理状态。现在改为先验证全部 5 个 work_dir + archive 本身，全部通过后再统一进入第二个循环删除。
+- **额外清理**：`run_name_for()`/共享 COCO json 路径/excluded-log 路径的计算逻辑现在都在共用的 `rtmpose_common.sh` 里，两个脚本 source 同一份，不再各自维护一份容易漂移的拷贝（第三轮就因为这个模式踩过一次真实 bug）；删除了本轮重构后完全废弃的 ~370 行历史代码（`legacy_run_one_unused`/`legacy_verify_config_unused`）。
+- **新增 `test_sweep_lifecycle_synthetic.sh`**：按相关审阅的建议，做了一次不训练的端到端合成测试，覆盖 backup→本地式 manifest 校验→clean 全流程，使用真实的 `make_config.py`/`validate_run_content.py`/`record_run_provenance.py`/`evaluate_rtmpose_fixed.py`/`backup_and_clean_cell.sh` 代码路径，只有需要 GPU 的训练/推理两步是伪造的（predictions 直接等于 GT，确定性地产生 0% NME，只为验证机制而非产出有意义的数字）。`run_rtmpose_full_sweep.sh` 自身的 fresh/recoverable/complete 四态转换和跨调用的暂停/继续循环不在这次合成测试的覆盖范围内（该脚本顶层会立即执行本地测试套件/导入 mmpose/做真实磁盘检查，不能安全地当作库来 source）——建议直接让脚本处理第一个真实 seed 来验证这部分：它会立刻走到"recoverable"路径去恢复已批准的 seed-42 canary，这本身就是一次真实的生产行为验证。
+
+以上全部改动已 `bash -n`/`python -m py_compile` 语法检查通过，提交到 `master`（commit `b142db3`）。RTMPose 完整 50-run 扫描尚未在服务器上真正启动；建议先在服务器上跑一次 `test_sweep_lifecycle_synthetic.sh` 确认 backup/clean 生命周期无误，再正式启动 UCL/BPD 剩余 4 个 seed。
 
 2. 完成 UCL OFD/APAD/TAD/FL，各五 seeds；
 3. 完成 Multicentre BPD/OFD/APAD/TAD/FL，各五 seeds。
