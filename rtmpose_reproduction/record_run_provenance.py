@@ -116,6 +116,12 @@ def main():
             f"actual file to hash and diff against."
         )
 
+    import platform
+    import sys
+
+    import mmcv
+    import mmengine
+    import mmpose
     import torch
     from mmengine.config import Config
     from mmengine.registry import init_default_scope
@@ -229,7 +235,22 @@ def main():
     # source to explain the training setup to the supervisor.
     training_recipe_summary = dict(cfg.get("training_recipe_summary", {}))
 
+    # 2026-08-10, fourth review round (backup-archive audit gap): a cell's
+    # archive previously carried no record of which MMPose/MMCV/MMEngine/
+    # PyTorch/Python versions actually produced it -- added here (not a
+    # separate file) since provenance.json is already generated once per
+    # run and already archived by backup_and_clean_cell.sh.
+    software_versions = {
+        "python": sys.version.split()[0],
+        "platform": platform.platform(),
+        "torch": torch.__version__,
+        "mmcv": mmcv.__version__,
+        "mmengine": mmengine.__version__,
+        "mmpose": mmpose.__version__,
+    }
+
     record = {
+        "software_versions": software_versions,
         "official_config_name": "rtmpose-s_8xb256-420e_coco-256x192 (adapted, see make_config.py)",
         "generated_config_path": str(args.config),
         "training_recipe_summary": training_recipe_summary,

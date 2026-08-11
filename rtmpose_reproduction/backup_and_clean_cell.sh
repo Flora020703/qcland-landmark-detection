@@ -81,9 +81,15 @@
 
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/rtmpose_common.sh"
+PY="${PY:-/root/autodl-tmp/rtmpose_env/bin/python}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/root/autodl-tmp/rtmpose_reproduction}"
 RESULTS_TSV="${RESULTS_TSV:-$ARTIFACT_ROOT/rtmpose_full_sweep_results.tsv}"
 BACKUP_ROOT="${BACKUP_ROOT:-$ARTIFACT_ROOT/cell_backups}"
+PRETRAINED_CKPT_PATH="${PRETRAINED_CKPT_PATH:-/root/autodl-tmp/rtmpose_pretrained/cspnext-s_udp-aic-coco_210e-256x192-92f5a029_20230130.pth}"
+readonly MAX_EPOCHS=200
+readonly EXPECTED_PRETRAINED_SHA256="aa7d9335bf422ad02a803e36f357dfc6abb807eca42d79e8b3b6e7c5bd1f446b"
 SEEDS=(42 0 123 2024 3407)
 readonly VALID_DATASETS=("UCL" "MULTICENTRE")
 readonly VALID_TASKS=("BPD" "OFD" "APAD" "TAD" "FL")
@@ -122,18 +128,6 @@ validate_dataset_task() {
 }
 validate_dataset_task
 
-# --- Canary naming special-case -- MUST stay in sync with the identical
-#     function in run_rtmpose_full_sweep.sh, or this script will look for
-#     files under the wrong name for UCL/BPD/seed=42. ----------------------
-run_name_for() {
-  local dataset="$1" task="$2" seed="$3"
-  if [ "$dataset" = "UCL" ] && [ "$task" = "BPD" ] && [ "$seed" = "42" ]; then
-    echo "UCL_BPD_seed42_canary"
-  else
-    echo "${dataset}_${task}_seed${seed}_run"
-  fi
-}
-
 # --- Fix (a): every one of a seed's 5 state-machine files AND exactly one
 #     final checkpoint are REQUIRED, not soft-checked. ----------------------
 verify_cell_complete() {
@@ -152,7 +146,17 @@ verify_cell_complete() {
     exit 1
   fi
 
+  local shared_paths split_json train_json val_json test_json manifest
+  shared_paths="$(shared_json_paths_for "$ARTIFACT_ROOT" "$DATASET" "$TASK")"
+  IFS='|' read -r split_json train_json val_json test_json manifest <<< "$shared_paths"
+  local excluded_paths train_excluded val_excluded test_excluded
+  excluded_paths="$(excluded_log_paths_for "$ARTIFACT_ROOT" "$DATASET" "$TASK")"
+  IFS='|' read -r train_excluded val_excluded test_excluded <<< "$excluded_paths"
   local incomplete=()
+  for f in "$split_json" "$train_json" "$val_json" "$test_json" "$manifest" \
+           "$train_excluded" "$val_excluded" "$test_excluded"; do
+    [ -f "$f" ] || incomplete+=("missing shared audit artifact $f")
+  done
   for SEED in "${SEEDS[@]}"; do
     local run_name; run_name="$(run_name_for "$DATASET" "$TASK" "$SEED")"
     local work_dir="$ARTIFACT_ROOT/$run_name"
@@ -167,11 +171,8 @@ verify_cell_complete() {
     if [ ! -d "$work_dir" ]; then
       incomplete+=("seed=$SEED missing work_dir $work_dir")
     else
-      local n_ckpt
-      n_ckpt=$(find "$work_dir" -maxdepth 1 -name 'epoch_*.pth' | wc -l)
-      if [ "$n_ckpt" -ne 1 ]; then
-        incomplete+=("seed=$SEED has $n_ckpt epoch_*.pth checkpoint(s) in $work_dir, expected exactly 1")
-      fi
+      verify_final_checkpoint "$work_dir" "$MAX_EPOCHS" >/dev/null || \
+        incomplete+=("seed=$SEED final checkpoint verification failed in $work_dir")
     fi
   done
   if [ "${#incomplete[@]}" -gt 0 ]; then
@@ -180,7 +181,44 @@ verify_cell_complete() {
     echo "Refusing to back up an incomplete cell -- investigate before proceeding." >&2
     exit 1
   fi
-  echo "[OK] ${DATASET}/${TASK}: all 5 seeds recorded, all 5 state-machine files present, exactly 1 final checkpoint each"
+  for SEED in "${SEEDS[@]}"; do
+    local run_name; run_name="$(run_name_for "$DATASET" "$TASK" "$SEED")"
+    "$PY" "$SCRIPT_DIR/validate_run_content.py" \
+      --mode full --config "$ARTIFACT_ROOT/configs/${run_name}.py" --seed "$SEED" \
+      --max-epochs "$MAX_EPOCHS" --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
+      --expected-pretrained-sha256 "$EXPECTED_PRETRAINED_SHA256" \
+      --train-json "$train_json" --val-json "$val_json" --test-json "$test_json" \
+      --summary-json "$ARTIFACT_ROOT/${run_name}_summary.json" \
+      --per-image-csv "$ARTIFACT_ROOT/${run_name}_per_image.csv" \
+      --predictions-json "$ARTIFACT_ROOT/${run_name}_predictions.json" \
+      --provenance-json "$ARTIFACT_ROOT/${run_name}_provenance.json"
+  done
+  "$PY" - "$RESULTS_TSV" "$ARTIFACT_ROOT" "$DATASET" "$TASK" <<'PY'
+import csv, json, math, sys
+from pathlib import Path
+
+tsv, artifact_root, dataset, task = sys.argv[1:]
+expected_seeds = {"42", "0", "123", "2024", "3407"}
+with open(tsv, newline="", encoding="utf-8") as handle:
+    rows = [r for r in csv.DictReader(handle, delimiter="\t")
+            if r["dataset"] == dataset and r["task"] == task]
+if len(rows) != 5 or {r["seed"] for r in rows} != expected_seeds:
+    raise SystemExit(
+        f"ERROR: results TSV must contain exactly one row for each of five seeds; got "
+        f"{[r['seed'] for r in rows]}")
+for row in rows:
+    seed = row["seed"]
+    run_name = ("UCL_BPD_seed42_canary" if dataset == "UCL" and task == "BPD" and seed == "42"
+                else f"{dataset}_{task}_seed{seed}_run")
+    summary = json.loads((Path(artifact_root) / f"{run_name}_summary.json").read_text(encoding="utf-8"))
+    if int(row["n"]) != int(summary["n"]):
+        raise SystemExit(f"ERROR: seed {seed} TSV n does not match summary")
+    for key in ("fixed_channel_mean_pct", "swap_min_mean_pct"):
+        if not math.isclose(float(row[key]), float(summary[key]), rel_tol=0.0, abs_tol=1e-6):
+            raise SystemExit(f"ERROR: seed {seed} TSV {key} does not match summary")
+print("[OK] five unique results-TSV rows agree with the five verified summaries")
+PY
+  echo "[OK] ${DATASET}/${TASK}: all five runs and shared audit artifacts fully verified"
 }
 
 do_backup() {
@@ -197,7 +235,11 @@ do_backup() {
 
   local staging
   staging="$(mktemp -d)"
-  trap 'rm -rf "$staging"' EXIT
+  # Expand the mktemp path while the local variable is still in scope.
+  # A single-quoted trap would defer "$staging" until shell exit, after
+  # this function's local variable has disappeared; under `set -u` that
+  # produced `staging: unbound variable` and leaked the staged copy.
+  trap "rm -rf -- '$staging'" EXIT
 
   echo "=== staging ${DATASET}/${TASK}'s 5 seeds for archiving (every file required, none optional) ==="
   for SEED in "${SEEDS[@]}"; do
@@ -234,6 +276,17 @@ do_backup() {
   fi
   [ -f "$ARTIFACT_ROOT/coco/manifests/${DATASET}_${TASK}.sha256.tsv" ] && \
     cp "$ARTIFACT_ROOT/coco/manifests/${DATASET}_${TASK}.sha256.tsv" "$staging/shared/"
+
+  local excluded_paths train_excluded val_excluded test_excluded
+  excluded_paths="$(excluded_log_paths_for "$ARTIFACT_ROOT" "$DATASET" "$TASK")"
+  IFS='|' read -r train_excluded val_excluded test_excluded <<< "$excluded_paths"
+  cp "$train_excluded" "$val_excluded" "$test_excluded" "$staging/shared/"
+
+  cp "$RESULTS_TSV" "$staging/rtmpose_full_sweep_results.tsv"
+  awk -F'\t' -v d="$DATASET" -v t="$TASK" \
+    'NR==1 || ($1==d && $2==t)' "$RESULTS_TSV" > "$staging/${DATASET}_${TASK}_results.tsv"
+  cp "$SCRIPT_DIR/run_rtmpose_full_sweep.sh" "$SCRIPT_DIR/backup_and_clean_cell.sh" \
+     "$SCRIPT_DIR/rtmpose_common.sh" "$SCRIPT_DIR/validate_run_content.py" "$staging/"
 
   local n_ckpts
   n_ckpts=$(find "$staging" -name 'epoch_*.pth' | wc -l)
@@ -306,29 +359,28 @@ do_clean() {
   local artifact_root_real
   artifact_root_real="$(realpath "$ARTIFACT_ROOT")"
 
-  echo "=== deleting work_dir (checkpoint + training logs) for ${DATASET}/${TASK}'s 5 seeds ==="
+  echo "=== validating every deletion target before deleting anything ==="
   echo "(keeping: results TSV, config, provenance JSON, predictions JSON, per-image CSV, summary"
   echo " JSON, shared-artifact manifests -- run_rtmpose_full_sweep.sh's own run_artifacts_status()"
   echo " state machine requires ALL FIVE of {config, provenance, predictions, per-image CSV,"
   echo " summary} to still be present to correctly report a cell as 'complete' on a future"
   echo " invocation.)"
+  local deletion_targets=()
   for SEED in "${SEEDS[@]}"; do
     local run_name; run_name="$(run_name_for "$DATASET" "$TASK" "$SEED")"
     local work_dir="$ARTIFACT_ROOT/$run_name"
-    if [ -d "$work_dir" ]; then
-      local work_dir_real
-      work_dir_real="$(realpath "$work_dir")"
-      case "$work_dir_real" in
-        "$artifact_root_real"/*) ;;
-        *) echo "ERROR: refusing to delete $work_dir_real -- not strictly inside $artifact_root_real" >&2; exit 1 ;;
-      esac
-      if [ "$(basename "$work_dir_real")" != "$run_name" ]; then
-        echo "ERROR: refusing to delete $work_dir_real -- basename does not exactly match expected run_name '$run_name'" >&2
-        exit 1
-      fi
-      rm -rf "$work_dir_real"
-      echo "  removed: $work_dir_real"
+    [ -d "$work_dir" ] || { echo "ERROR: expected deletion target is missing: $work_dir" >&2; exit 1; }
+    local work_dir_real
+    work_dir_real="$(realpath "$work_dir")"
+    case "$work_dir_real" in
+      "$artifact_root_real"/*) ;;
+      *) echo "ERROR: refusing to delete $work_dir_real -- not strictly inside $artifact_root_real" >&2; exit 1 ;;
+    esac
+    if [ "$(basename "$work_dir_real")" != "$run_name" ]; then
+      echo "ERROR: refusing to delete $work_dir_real -- basename does not exactly match expected run_name '$run_name'" >&2
+      exit 1
     fi
+    deletion_targets+=("$work_dir_real")
   done
 
   # --- Fix (c): also remove the server-side archive + its hash file now
@@ -340,6 +392,14 @@ do_clean() {
     "$artifact_root_real"/*) ;;
     *) echo "ERROR: refusing to delete $archive_real -- not strictly inside $artifact_root_real" >&2; exit 1 ;;
   esac
+  echo "[OK] all five work directories and the archive passed containment/name checks"
+
+  echo "=== deleting verified work directories and server-side archive ==="
+  local target
+  for target in "${deletion_targets[@]}"; do
+    rm -rf "$target"
+    echo "  removed: $target"
+  done
   rm -f "$archive_real" "$outer_hash_path"
   echo "  removed: $archive_real"
   echo "  removed: $outer_hash_path"

@@ -32,7 +32,8 @@
 # checkpoint policy (save_last/max_keep_ckpts/no save_best), augmentation
 # pipeline ordering, and the internal-train/val/Test annotation paths
 # actually wired into each dataloader -- see the exhaustive `checks` list
-# in `verify_config()` below, each one read directly from
+# in validate_run_content.py's build_config_checks() (moved there in the
+# fourth hardening round below), each one read directly from
 # rtmpose_reproduction/make_config.py's real TEMPLATE, not assumed.
 #
 # Fix C ("UCL BPD manifest仍不是canary时期的原始锁定值"): the seed-42
@@ -72,6 +73,42 @@
 # the per-cell pause additionally satisfies this without a BPD-specific
 # special case in the control flow.
 #
+# 2026-08-10, FOURTH hardening round (a relayed review of the THIRD round
+# found 3 more real gaps, smaller than before but worth closing before real
+# training starts):
+#
+# Fix E ("complete状态仍然只检查文件存在"): the 4-state check only ever
+# confirmed the 5 expected files EXIST, never that their CONTENT was still
+# correct -- a "complete" cell corrupted by a bad copy, manual edit, or
+# partial disk write after being recorded would be silently trusted and
+# skipped forever. Config verification (previously a bash heredoc,
+# `verify_config()`) and the "recoverable" re-scoring logic (previously an
+# ad hoc python heredoc) are now BOTH implemented in exactly one place --
+# validate_run_content.py -- called identically for the pre-training
+# "fresh" config (--mode config-only), and for "recoverable"/"complete"
+# re-verification AND backup_and_clean_cell.sh's own pre-archive check
+# (--mode full: config checks + independent re-score agreement + per-image
+# CSV row-count-matches-n + no-duplicate-filenames). "complete" now
+# re-verifies content on every invocation before skipping, not just before
+# the first time it was recorded.
+#
+# Fix F (recoverable's own two remaining gaps, folded into the same fix):
+# the per-image CSV was previously read straight into a {filename: row}
+# dict, which would silently collapse duplicate filenames without ever
+# being noticed; validate_run_content.py now checks the RAW row count
+# against summary.json's own "n" and checks for duplicate filenames BEFORE
+# any dict keying. Recovery also now runs the FULL config assertion suite
+# (previously only checked randomness.seed) before trusting a recovered
+# result.
+#
+# Fix G (shared naming/path logic no longer duplicated by hand): run_name_for()
+# and the per-(dataset,task) shared-COCO-json / excluded-log path
+# conventions are now in rtmpose_common.sh, sourced by both this script and
+# backup_and_clean_cell.sh -- the third round already had to fix one real
+# bug from these two standalone scripts keeping separate copies of
+# run_name_for() that drifted out of sync; this removes that whole class of
+# bug going forward.
+#
 # Prerequisites (same as run_rtmpose_canary.sh -- see ENVIRONMENT.md):
 #   - a pinned MMPose/MMEngine/MMCV install in its own venv, verified importable
 #   - the CSPNeXt-s checkpoint downloaded locally (PRETRAINED_CKPT_PATH)
@@ -84,6 +121,7 @@ set -euo pipefail
 export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/rtmpose_common.sh"
 PY="${PY:?set PY to the RTMPose venv python interpreter}"
 DATA_ROOT="${DATA_ROOT:-/root/autodl-tmp}"
 ARTIFACT_ROOT="${ARTIFACT_ROOT:-/root/autodl-tmp/rtmpose_reproduction}"
@@ -96,7 +134,6 @@ readonly MAX_EPOCHS=200
 readonly EXPECTED_PRETRAINED_SHA256="aa7d9335bf422ad02a803e36f357dfc6abb807eca42d79e8b3b6e7c5bd1f446b"
 
 RESULTS_TSV="${RESULTS_TSV:-$ARTIFACT_ROOT/rtmpose_full_sweep_results.tsv}"
-CANARY_SUMMARY_JSON="$ARTIFACT_ROOT/UCL_BPD_seed42_canary_summary.json"
 CANARY_PER_IMAGE_CSV="$ARTIFACT_ROOT/UCL_BPD_seed42_canary_per_image.csv"
 MANIFEST_DIR="$ARTIFACT_ROOT/coco/manifests"
 MIN_FREE_GB="${MIN_FREE_GB:-6}"
@@ -216,6 +253,11 @@ is_recorded() {
   awk -F'\t' -v d="$1" -v t="$2" -v s="$3" 'NR>1 && $1==d && $2==t && $3==s {f=1} END{exit !f}' "$RESULTS_TSV"
 }
 
+recorded_row_count() {
+  awk -F'\t' -v d="$1" -v t="$2" -v s="$3" \
+    'NR>1 && $1==d && $2==t && $3==s {n++} END{print n+0}' "$RESULTS_TSV"
+}
+
 append_result_row() {
   local dataset="$1" task="$2" seed="$3" n="$4" fixed="$5" swap="$6"
   if is_recorded "$dataset" "$task" "$seed"; then
@@ -225,22 +267,9 @@ append_result_row() {
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$dataset" "$task" "$seed" "$n" "$fixed" "$swap" >> "$RESULTS_TSV"
 }
 
-# Pre-seed the already-approved UCL/BPD/seed=42 canary result rather than
-# re-running it under a different file-naming scheme.
-if ! is_recorded "UCL" "BPD" "42"; then
-  if [ ! -f "$CANARY_SUMMARY_JSON" ]; then
-    echo "ERROR: $CANARY_SUMMARY_JSON not found -- this script requires the seed-42 canary to already be complete (see run_rtmpose_canary.sh)." >&2
-    exit 1
-  fi
-  read -r CANARY_N CANARY_FIXED CANARY_SWAP <<< "$("$PY" - "$CANARY_SUMMARY_JSON" <<'PY'
-import json, sys
-s = json.load(open(sys.argv[1], encoding="utf-8"))
-print(s['n'], f"{s['fixed_channel_mean_pct']:.6f}", f"{s['swap_min_mean_pct']:.6f}")
-PY
-)"
-  append_result_row "UCL" "BPD" "42" "$CANARY_N" "$CANARY_FIXED" "$CANARY_SWAP"
-  echo "[OK] pre-seeded UCL/BPD/seed=42 from the already-approved canary: n=$CANARY_N, PI-NME(swap_min)=${CANARY_SWAP}%"
-fi
+# The approved UCL/BPD/seed-42 canary is deliberately not inserted into the
+# TSV here. Its complete saved artifacts first pass the same full validator
+# as every other run; only then does run_one append a recoverable row.
 
 check_disk() {
   local free_gb
@@ -256,11 +285,13 @@ check_disk() {
 #     internal-split/Train/Val/Test COCO artifacts. -------------------------
 ensure_shared_artifacts() {
   local dataset="$1" task="$2" anatomy="$3"
-  local split_json="$ARTIFACT_ROOT/coco/${dataset}_${task}_internal_split.json"
-  local train_json="$ARTIFACT_ROOT/coco/${dataset}_${task}_internal_train.json"
-  local val_json="$ARTIFACT_ROOT/coco/${dataset}_${task}_internal_val.json"
-  local test_json="$ARTIFACT_ROOT/coco/${dataset}_${task}_test.json"
-  local manifest="$MANIFEST_DIR/${dataset}_${task}.sha256.tsv"
+  local is_approved_canary_cell=0
+  local shared_paths split_json train_json val_json test_json manifest
+  shared_paths="$(shared_json_paths_for "$ARTIFACT_ROOT" "$dataset" "$task")"
+  IFS='|' read -r split_json train_json val_json test_json manifest <<< "$shared_paths"
+  local excluded_paths train_excluded val_excluded test_excluded
+  excluded_paths="$(excluded_log_paths_for "$ARTIFACT_ROOT" "$dataset" "$task")"
+  IFS='|' read -r train_excluded val_excluded test_excluded <<< "$excluded_paths"
   local train_csv="$DATA_ROOT/annotations/${dataset}/${anatomy}_Train.csv"
   local test_csv="$DATA_ROOT/annotations/${dataset}/${anatomy}_Test.csv"
   local images_dir="$DATA_ROOT/images/${dataset}/${anatomy}"
@@ -271,14 +302,12 @@ ensure_shared_artifacts() {
   # plain stdout, so the capture isn't corrupted with multi-line noise.
 
   if [ "$dataset" = "UCL" ] && [ "$task" = "BPD" ]; then
+    is_approved_canary_cell=1
     # Reuse the seed-42 canary's own artifacts byte-for-byte -- do not
     # regenerate even a "matching" copy. Content already cross-validated
     # against the canary's own per-image CSV above (Fix C).
-    split_json="$ARTIFACT_ROOT/coco/UCL_BPD_internal_split.json"
-    train_json="$ARTIFACT_ROOT/coco/UCL_BPD_internal_train.json"
-    val_json="$ARTIFACT_ROOT/coco/UCL_BPD_internal_val.json"
-    test_json="$ARTIFACT_ROOT/coco/UCL_BPD_test.json"
-    for f in "$split_json" "$train_json" "$val_json" "$test_json"; do
+    for f in "$split_json" "$train_json" "$val_json" "$test_json" \
+             "$train_excluded" "$val_excluded" "$test_excluded"; do
       [ -f "$f" ] || { echo "ERROR: $f not found -- the seed-42 canary's own shared artifacts are required for UCL/BPD, not regenerated here." >&2; exit 1; }
     done
   fi
@@ -288,23 +317,27 @@ ensure_shared_artifacts() {
       "$PY" make_internal_val_split.py \
         --csv "$train_csv" --images-dir "$images_dir" --task "$task" \
         --out-json "$split_json" 1>&2
+    fi
+    if [ "$is_approved_canary_cell" -eq 0 ] && \
+       { [ ! -f "$train_json" ] || [ ! -f "$val_json" ] || [ ! -f "$test_json" ] || \
+         [ ! -f "$train_excluded" ] || [ ! -f "$val_excluded" ] || [ ! -f "$test_excluded" ]; }; then
       "$PY" convert_csv_to_coco.py \
         --csv "$train_csv" --images-dir "$images_dir" \
         --dataset "$dataset" --task "$task" \
         --out-json "$train_json" \
-        --excluded-log "$ARTIFACT_ROOT/coco/${dataset}_${task}_internal_train_excluded.json" \
+        --excluded-log "$train_excluded" \
         --internal-split-json "$split_json" --internal-split-part internal_train 1>&2
       "$PY" convert_csv_to_coco.py \
         --csv "$train_csv" --images-dir "$images_dir" \
         --dataset "$dataset" --task "$task" \
         --out-json "$val_json" \
-        --excluded-log "$ARTIFACT_ROOT/coco/${dataset}_${task}_internal_val_excluded.json" \
+        --excluded-log "$val_excluded" \
         --internal-split-json "$split_json" --internal-split-part internal_val 1>&2
       "$PY" convert_csv_to_coco.py \
         --csv "$test_csv" --images-dir "$images_dir" \
         --dataset "$dataset" --task "$task" \
         --out-json "$test_json" \
-        --excluded-log "$ARTIFACT_ROOT/coco/${dataset}_${task}_test_excluded.json" 1>&2
+        --excluded-log "$test_excluded" 1>&2
     fi
 
     echo "--- [content sanity] ${dataset}/${task}: internal-train/internal-val/Test disjoint ---" >&2
@@ -328,12 +361,20 @@ PY
       sha256sum "$train_json"
       sha256sum "$val_json"
       sha256sum "$test_json"
+      sha256sum "$train_excluded"
+      sha256sum "$val_excluded"
+      sha256sum "$test_excluded"
     } > "$manifest"
     echo "[OK] recorded shared-artifact manifest: $manifest" >&2
   else
     if ! sha256sum -c "$manifest" --quiet 1>&2 2>&1; then
       echo "ERROR: shared artifact(s) for ${dataset}/${task} changed since first generation (manifest: $manifest) -- refusing to train a seed against possibly-different data than earlier seeds of this same cell used." >&2
       sha256sum -c "$manifest" 1>&2 2>&1 || true
+      exit 1
+    fi
+    if [ "$(wc -l < "$manifest")" -ne 7 ]; then
+      echo "ERROR: $manifest must contain exactly 7 hashes (split/train/val/test plus 3 exclusion logs)." >&2
+      echo "Refusing to silently upgrade an incomplete historical manifest; inspect the shared artifacts first." >&2
       exit 1
     fi
   fi
@@ -352,15 +393,6 @@ PY
 #     sees the TSV row but 0/5 files, and reports "inconsistent" on the
 #     very first seed of the very first cell. Keep in sync with the
 #     identical special-case in backup_and_clean_cell.sh.
-run_name_for() {
-  local dataset="$1" task="$2" seed="$3"
-  if [ "$dataset" = "UCL" ] && [ "$task" = "BPD" ] && [ "$seed" = "42" ]; then
-    echo "UCL_BPD_seed42_canary"
-  else
-    echo "${dataset}_${task}_seed${seed}_run"
-  fi
-}
-
 # --- Fix A: 4-state artifact/TSV consistency check, replacing the old
 #     TSV-only is_recorded() + "work_dir exists but no summary" partial
 #     check (which missed the case where work_dir AND summary.json both
@@ -381,7 +413,12 @@ run_artifacts_status() {
     [ -f "$f" ] && n_present=$((n_present + 1))
   done
 
-  if is_recorded "$dataset" "$task" "$seed"; then
+  local tsv_rows
+  tsv_rows="$(recorded_row_count "$dataset" "$task" "$seed")"
+  if [ "$tsv_rows" -gt 1 ]; then
+    RUN_STATUS="inconsistent"
+    RUN_STATUS_DETAIL="results TSV contains ${tsv_rows} duplicate rows for ${dataset}/${task}/seed=${seed}"
+  elif [ "$tsv_rows" -eq 1 ]; then
     if [ "$n_present" -eq 5 ]; then
       RUN_STATUS="complete"
     else
@@ -400,6 +437,42 @@ run_artifacts_status() {
   fi
 }
 
+verify_recorded_row_matches_summary() {
+  local dataset="$1" task="$2" seed="$3" summary_json="$4"
+  "$PY" - "$RESULTS_TSV" "$dataset" "$task" "$seed" "$summary_json" <<'PY'
+import csv, json, math, sys
+tsv, dataset, task, seed, summary_path = sys.argv[1:]
+with open(tsv, newline="", encoding="utf-8") as handle:
+    rows = [r for r in csv.DictReader(handle, delimiter="\t")
+            if r["dataset"] == dataset and r["task"] == task and r["seed"] == seed]
+if len(rows) != 1:
+    raise SystemExit(f"ERROR: expected exactly one TSV row, found {len(rows)}")
+summary = json.load(open(summary_path, encoding="utf-8"))
+row = rows[0]
+if int(row["n"]) != int(summary["n"]):
+    raise SystemExit(f"ERROR: TSV n={row['n']} != summary n={summary['n']}")
+for column, key in (("fixed_channel_mean_pct", "fixed_channel_mean_pct"),
+                    ("swap_min_mean_pct", "swap_min_mean_pct")):
+    if not math.isclose(float(row[column]), float(summary[key]), rel_tol=0.0, abs_tol=1e-6):
+        raise SystemExit(
+            f"ERROR: TSV {column}={row[column]} != summary {key}={summary[key]}")
+print("[OK] unique results-TSV row agrees with the independently verified summary")
+PY
+}
+
+validate_saved_run() {
+  local config_path="$1" seed="$2" train_json="$3" val_json="$4" test_json="$5"
+  local summary_json="$6" per_image_csv="$7" pred_json="$8" provenance_json="$9"
+  "$PY" "$SCRIPT_DIR/validate_run_content.py" \
+    --mode full --config "$config_path" --seed "$seed" \
+    --max-epochs "$MAX_EPOCHS" \
+    --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
+    --expected-pretrained-sha256 "$EXPECTED_PRETRAINED_SHA256" \
+    --train-json "$train_json" --val-json "$val_json" --test-json "$test_json" \
+      --summary-json "$summary_json" --per-image-csv "$per_image_csv" \
+      --predictions-json "$pred_json" --provenance-json "$provenance_json"
+}
+
 run_one() {
   local dataset="$1" task="$2" anatomy="$3" seed="$4"
   local run_name; run_name="$(run_name_for "$dataset" "$task" "$seed")"
@@ -411,361 +484,89 @@ run_one() {
   local summary_json="$ARTIFACT_ROOT/${run_name}_summary.json"
 
   run_artifacts_status "$dataset" "$task" "$seed"
-  if [ "$RUN_STATUS" = "complete" ]; then
-    echo "[SKIP] ${dataset}/${task} seed=${seed} (already in $RESULTS_TSV, all output files present)"
-    return
-  fi
   if [ "$RUN_STATUS" = "inconsistent" ]; then
     echo "ERROR: inconsistent state for ${dataset}/${task} seed=${seed}: $RUN_STATUS_DETAIL" >&2
-    echo "Refusing to auto-resolve -- manually inspect $work_dir and the *_${run_name}_* files, either" >&2
-    echo "complete/restore whatever is missing or archive+remove them, then re-run." >&2
     exit 1
   fi
 
-  # RUN_STATUS is now "recoverable" or "fresh" -- both need the shared
-  # per-cell artifacts (recoverable needs test_json to re-score against;
-  # fresh needs all three to actually train/infer).
-  check_disk
   local artifacts train_json val_json test_json
   artifacts="$(ensure_shared_artifacts "$dataset" "$task" "$anatomy")"
   IFS='|' read -r _ train_json val_json test_json <<< "$artifacts"
 
-  if [ "$RUN_STATUS" = "recoverable" ]; then
-    # "严格恢复" (strict recovery, third review round): checking that 5
-    # files exist and their row counts/seed roughly agree is NOT the same
-    # as verifying the recorded numbers are actually correct. Independently
-    # RE-RUNS the evaluator against the SAME already-saved predictions.json
-    # + GT, into a throwaway location, and requires it to be BYTE-IDENTICAL
-    # to the existing summary/per-image CSV (both are pure/deterministic
-    # functions of predictions+GT, so two correct runs must agree exactly)
-    # before trusting the existing files into the TSV -- never retrains.
-    echo "--- [recoverable] ${dataset}/${task} seed=${seed}: re-scoring the existing predictions.json against GT to verify the on-disk summary/per-image CSV, not just checking they exist ---"
-    local tmp_dir
-    tmp_dir="$(mktemp -d)"
-    "$PY" evaluate_rtmpose_fixed.py \
-      --gt-json "$test_json" \
-      --predictions-json "$pred_json" \
-      --per-image-csv "$tmp_dir/per_image.csv" \
-      --summary-json "$tmp_dir/summary.json"
-
-    local values
-    values=$("$PY" - "$summary_json" "$tmp_dir/summary.json" "$per_image_csv" "$tmp_dir/per_image.csv" "$config_path" "$seed" <<'PY'
-import csv, json, sys
-from mmengine.config import Config
-from mmengine.registry import init_default_scope
-
-(existing_summary_path, fresh_summary_path, existing_per_image_path,
- fresh_per_image_path, config_path, seed) = sys.argv[1:7]
-seed = int(seed)
-
-existing = json.load(open(existing_summary_path, encoding="utf-8"))
-fresh = json.load(open(fresh_summary_path, encoding="utf-8"))
-for key in ("n", "fixed_channel_mean_pct", "swap_min_mean_pct"):
-    if key not in existing:
-        raise SystemExit(f"ERROR: {existing_summary_path} is missing expected key {key!r}")
-    if existing[key] != fresh[key]:
-        raise SystemExit(
-            f"ERROR: existing summary.json disagrees with a fresh re-score of the SAME "
-            f"predictions.json against the SAME GT for key {key!r}: "
-            f"existing={existing[key]!r} fresh={fresh[key]!r} -- refusing to recover"
-        )
-
-def load_csv(p):
-    with open(p, newline="", encoding="utf-8") as f:
-        return {row["filename"]: row for row in csv.DictReader(f)}
-
-existing_rows = load_csv(existing_per_image_path)
-fresh_rows = load_csv(fresh_per_image_path)
-if set(existing_rows) != set(fresh_rows):
-    raise SystemExit("ERROR: existing per-image CSV filenames do not match a fresh re-score's own filenames -- refusing to recover")
-mismatches = []
-for fn, fresh_row in fresh_rows.items():
-    existing_row = existing_rows[fn]
-    for col in ("gt0_x", "gt0_y", "gt1_x", "gt1_y", "pred0_x", "pred0_y", "pred1_x", "pred1_y",
-                "fixed_channel_nme", "swap_min_nme"):
-        if existing_row[col] != fresh_row[col]:
-            mismatches.append((fn, col))
-if mismatches:
-    raise SystemExit(
-        f"ERROR: {len(mismatches)} (filename, column) mismatch(es) between the existing "
-        f"per-image CSV and a fresh re-score, e.g. {mismatches[:5]} -- refusing to recover"
-    )
-
-init_default_scope("mmpose")
-cfg = Config.fromfile(config_path)
-if cfg.randomness["seed"] != seed:
-    raise SystemExit(
-        f"ERROR: {config_path}'s own randomness.seed={cfg.randomness['seed']} "
-        f"does not match the expected seed={seed} -- refusing to recover"
-    )
-
-print(f'{existing["n"]} {existing["fixed_channel_mean_pct"]:.6f} {existing["swap_min_mean_pct"]:.6f}')
+  if [ "$RUN_STATUS" = "complete" ] || [ "$RUN_STATUS" = "recoverable" ]; then
+    echo "--- [${RUN_STATUS}] full content validation for ${dataset}/${task} seed=${seed} ---"
+    validate_saved_run "$config_path" "$seed" "$train_json" "$val_json" "$test_json" \
+      "$summary_json" "$per_image_csv" "$pred_json" "$provenance_json"
+    if [ "$RUN_STATUS" = "complete" ]; then
+      verify_recorded_row_matches_summary "$dataset" "$task" "$seed" "$summary_json"
+      echo "[SKIP] ${dataset}/${task} seed=${seed} (TSV row and saved content re-verified)"
+      return
+    fi
+    local values n fixed swap
+    values=$("$PY" - "$summary_json" <<'PY'
+import json, sys
+x = json.load(open(sys.argv[1], encoding="utf-8"))
+print(f'{x["n"]} {x["fixed_channel_mean_pct"]:.6f} {x["swap_min_mean_pct"]:.6f}')
 PY
 )
-    rm -rf "$tmp_dir"
-    local n fixed swap
     read -r n fixed swap <<< "$values"
     append_result_row "$dataset" "$task" "$seed" "$n" "$fixed" "$swap"
-    echo "[RECOVERED] ${dataset}/${task} seed=${seed}: independently re-scored predictions.json"
-    echo "  against GT and confirmed byte-identical to the existing summary/per-image CSV before"
-    echo "  trusting them -- recovered WITHOUT retraining (n=$n fixed=${fixed}% swap_min=${swap}%)"
+    echo "[RECOVERED] ${dataset}/${task} seed=${seed} without retraining"
     CELL_DID_WORK=1
     return
   fi
 
+  check_disk
   echo ""
   echo "============================================================"
   echo "  START: ${run_name}"
   echo "============================================================"
 
-  echo "=== [1/N] generate config ==="
   "$PY" make_config.py \
     --dataset "$dataset" --task "$task" --seed "$seed" \
-    --data-root "$DATA_ROOT" \
-    --images-dir "$DATA_ROOT/images/${dataset}/${anatomy}" \
-    --internal-train-ann "$train_json" \
-    --internal-val-ann "$val_json" \
-    --test-ann "$test_json" \
-    --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
-    --work-dir "$work_dir" \
-    --max-epochs "$MAX_EPOCHS" \
-    --out "$config_path"
+    --data-root "$DATA_ROOT" --images-dir "$DATA_ROOT/images/${dataset}/${anatomy}" \
+    --internal-train-ann "$train_json" --internal-val-ann "$val_json" \
+    --test-ann "$test_json" --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
+    --work-dir "$work_dir" --max-epochs "$MAX_EPOCHS" --out "$config_path"
 
-  echo "--- Verifying config for ${run_name} (Fix B: exhaustive field assertions) ---"
-  verify_config "$config_path" "$seed" "$train_json" "$val_json" "$test_json"
-
-  echo "=== [1a/N] regression test: generated config avoids MMEngine's lazy-import mode ==="
+  "$PY" "$SCRIPT_DIR/validate_run_content.py" \
+    --mode config-only --config "$config_path" --seed "$seed" \
+    --max-epochs "$MAX_EPOCHS" --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
+    --train-json "$train_json" --val-json "$val_json" --test-json "$test_json"
   "$PY" test_make_config_real_load.py
-
-  echo "=== [1b/N] record + VERIFY pretrained-weight provenance ==="
   "$PY" record_run_provenance.py \
-    --config "$config_path" \
-    --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
+    --config "$config_path" --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
     --out-json "$provenance_json"
-  GOT_RUN_SHA256=$("$PY" -c "import json; print(json.load(open('$provenance_json'))['pretrained_checkpoint_local_sha256'])")
-  if [ "$GOT_RUN_SHA256" != "$EXPECTED_PRETRAINED_SHA256" ]; then
-    echo "ERROR: ${run_name}'s own provenance record does not match the expected pretrained-checkpoint SHA-256." >&2
-    exit 1
-  fi
+  local got_run_sha256
+  got_run_sha256=$("$PY" -c "import json; print(json.load(open('$provenance_json'))['pretrained_checkpoint_local_sha256'])")
+  [ "$got_run_sha256" = "$EXPECTED_PRETRAINED_SHA256" ] || {
+    echo "ERROR: ${run_name} provenance checkpoint SHA-256 mismatch" >&2; exit 1; }
+  "$PY" live_preflight.py --config "$config_path"
 
-  echo "=== [1c/N] MANDATORY live preflight gate ==="
-  "$PY" live_preflight.py --config "$config_path" \
-    || { echo "ERROR: live_preflight.py failed for ${run_name} -- refusing to start training." >&2; exit 1; }
-
-  echo "=== [2/N] train ==="
   "$PY" "$MMPOSE_TRAIN_TOOL" "$config_path" --work-dir "$work_dir"
-
-  echo "=== [2a/N] verify the true final checkpoint ==="
-  local last_ckpt_pointer="$work_dir/last_checkpoint"
-  [ -f "$last_ckpt_pointer" ] || { echo "ERROR: $last_ckpt_pointer not found for ${run_name}" >&2; exit 1; }
   local final_ckpt
-  final_ckpt="$(cat "$last_ckpt_pointer")"
-  [ -f "$final_ckpt" ] || final_ckpt="$work_dir/$(basename "$final_ckpt")"
-  [ -f "$final_ckpt" ] || { echo "ERROR: checkpoint path in $last_ckpt_pointer does not exist: $final_ckpt" >&2; exit 1; }
-  case "$(basename "$final_ckpt")" in
-    epoch_${MAX_EPOCHS}.pth) ;;
-    *) echo "ERROR: last_checkpoint points at $(basename "$final_ckpt"), not epoch_${MAX_EPOCHS}.pth for ${run_name}" >&2; exit 1 ;;
-  esac
+  final_ckpt="$(verify_final_checkpoint "$work_dir" "$MAX_EPOCHS")"
   echo "using verified final checkpoint: $final_ckpt"
 
-  echo "=== [3/N] inference + score ==="
-  "$PY" run_inference.py \
-    --config "$config_path" \
-    --checkpoint "$final_ckpt" \
-    --gt-json "$test_json" \
-    --out-predictions-json "$pred_json"
-
-  "$PY" evaluate_rtmpose_fixed.py \
-    --gt-json "$test_json" \
-    --predictions-json "$pred_json" \
-    --per-image-csv "$per_image_csv" \
+  "$PY" run_inference.py --config "$config_path" --checkpoint "$final_ckpt" \
+    --gt-json "$test_json" --out-predictions-json "$pred_json"
+  "$PY" evaluate_rtmpose_fixed.py --gt-json "$test_json" \
+    --predictions-json "$pred_json" --per-image-csv "$per_image_csv" \
     --summary-json "$summary_json"
+  validate_saved_run "$config_path" "$seed" "$train_json" "$val_json" "$test_json" \
+    "$summary_json" "$per_image_csv" "$pred_json" "$provenance_json"
 
-  local values
+  local values n fixed swap
   values=$("$PY" - "$summary_json" <<'PY'
 import json, sys
 x = json.load(open(sys.argv[1], encoding="utf-8"))
 print(f'{x["n"]} {x["fixed_channel_mean_pct"]:.6f} {x["swap_min_mean_pct"]:.6f}')
 PY
 )
-  local n fixed swap
   read -r n fixed swap <<< "$values"
   append_result_row "$dataset" "$task" "$seed" "$n" "$fixed" "$swap"
   echo "[DONE] ${run_name}: n=$n fixed=${fixed}% swap_min(=PI-NME)=${swap}%"
   CELL_DID_WORK=1
-}
-
-# --- Fix B: exhaustive config-field verification, every value read
-#     directly from rtmpose_reproduction/make_config.py's real TEMPLATE. ---
-verify_config() {
-  local config_path="$1" seed="$2" train_json="$3" val_json="$4" test_json="$5"
-  "$PY" - "$config_path" "$seed" "$MAX_EPOCHS" "$PRETRAINED_CKPT_PATH" \
-        "$train_json" "$val_json" "$test_json" <<'PYEOF'
-import sys
-from mmengine.config import Config
-from mmengine.registry import init_default_scope
-init_default_scope("mmpose")
-
-(cfg_path, seed, max_epochs, pretrained,
- train_json, val_json, test_json) = sys.argv[1:8]
-seed, max_epochs = int(seed), int(max_epochs)
-cfg = Config.fromfile(cfg_path)
-
-import json as _json
-
-m = cfg.model
-backbone = m["backbone"]
-head = m["head"]
-optim = cfg.optim_wrapper
-ckpt_hook = cfg.default_hooks["checkpoint"]
-scaled_lr = 4e-3 * (cfg.train_dataloader["batch_size"] / 1024.0)
-
-expected_train_pipeline_types = [
-    "LoadImage", "FetalRandomFlipAndCanonicalize", "PixelCentreResize",
-    "FetalRotateScaleColorJitter", "GenerateTarget", "PackPoseInputs",
-]
-expected_val_pipeline_types = ["LoadImage", "PixelCentreResize", "PackPoseInputs"]
-
-# Independently recompute what make_config.py's own real formula (read
-# directly from its source, not assumed) must have produced for THIS
-# cell's actual internal-train image count, so training_recipe_summary
-# and the param_scheduler list can be checked against real expected
-# numbers rather than just "some list exists".
-n_train_images = len(_json.load(open(train_json, encoding="utf-8"))["images"])
-batch_size = cfg.train_dataloader["batch_size"]
-iters_per_epoch = -(-n_train_images // batch_size)  # ceil division
-warmup_epochs = min(5, max(1, max_epochs // 20))     # == 5 for max_epochs=200
-expected_warmup_end_iters = warmup_epochs * iters_per_epoch
-expected_cosine_begin_epoch = max_epochs // 2         # == 100 for max_epochs=200
-
-checks = [
-    # --- randomness / schedule ---
-    ("randomness.seed", cfg.randomness["seed"], seed),
-    ("randomness.deterministic", cfg.randomness["deterministic"], True),
-    ("train_cfg.by_epoch", cfg.train_cfg["by_epoch"], True),
-    ("train_cfg.max_epochs", cfg.train_cfg["max_epochs"], max_epochs),
-    # --- SimCC codec ---
-    ("codec.type", cfg.codec["type"], "SimCCLabel"),
-    ("codec.input_size", tuple(cfg.codec["input_size"]), (512, 512)),
-    ("codec.sigma", tuple(cfg.codec["sigma"]), (8.0, 8.0)),
-    ("codec.simcc_split_ratio", cfg.codec["simcc_split_ratio"], 2.0),
-    ("codec.normalize", cfg.codec["normalize"], False),
-    ("codec.use_dark", cfg.codec["use_dark"], False),
-    # --- model / preprocessor ---
-    ("model.type", m["type"], "TopdownPoseEstimator"),
-    ("data_preprocessor.bgr_to_rgb", m["data_preprocessor"]["bgr_to_rgb"], True),
-    ("data_preprocessor.mean", list(m["data_preprocessor"]["mean"]), [123.675, 116.28, 103.53]),
-    ("data_preprocessor.std", list(m["data_preprocessor"]["std"]), [58.395, 57.12, 57.375]),
-    # --- backbone: CSPNeXt-s ---
-    ("backbone.type", backbone["type"], "CSPNeXt"),
-    ("backbone.arch", backbone["arch"], "P5"),
-    ("backbone.expand_ratio", backbone["expand_ratio"], 0.5),
-    ("backbone.deepen_factor", backbone["deepen_factor"], 0.33),
-    ("backbone.widen_factor", backbone["widen_factor"], 0.5),
-    ("backbone.channel_attention", backbone["channel_attention"], True),
-    ("backbone.init_cfg.type", backbone["init_cfg"]["type"], "Pretrained"),
-    ("backbone.init_cfg.prefix", backbone["init_cfg"]["prefix"], "backbone."),
-    ("backbone.init_cfg.checkpoint", backbone["init_cfg"]["checkpoint"], pretrained),
-    # --- head: RTMCCHead ---
-    ("head.type", head["type"], "RTMCCHead"),
-    ("head.in_channels", head["in_channels"], 512),
-    ("head.out_channels", head["out_channels"], 2),
-    ("head.input_size", tuple(head["input_size"]), (512, 512)),
-    ("head.in_featuremap_size", tuple(head["in_featuremap_size"]), (16, 16)),
-    ("head.simcc_split_ratio", head["simcc_split_ratio"], 2.0),
-    ("head.final_layer_kernel_size", head["final_layer_kernel_size"], 7),
-    ("head.loss.type", head["loss"]["type"], "KLDiscretLoss"),
-    ("head.loss.beta", head["loss"]["beta"], 10.0),
-    ("head.loss.label_softmax", head["loss"]["label_softmax"], True),
-    ("test_cfg.flip_test", m["test_cfg"]["flip_test"], False),
-    # --- dataloaders: batch size + exact annotation files wired in ---
-    ("train_dataloader.batch_size", cfg.train_dataloader["batch_size"], 16),
-    ("train_dataloader.sampler.shuffle", cfg.train_dataloader["sampler"]["shuffle"], True),
-    ("train_dataloader.sampler.seed", cfg.train_dataloader["sampler"]["seed"], seed),
-    ("train_dataloader.dataset.ann_file", cfg.train_dataloader["dataset"]["ann_file"], train_json),
-    ("internal_val_dataloader.batch_size", cfg.internal_val_dataloader["batch_size"], 16),
-    ("internal_val_dataloader.sampler.shuffle", cfg.internal_val_dataloader["sampler"]["shuffle"], False),
-    ("internal_val_dataloader.dataset.ann_file", cfg.internal_val_dataloader["dataset"]["ann_file"], val_json),
-    ("inference_dataloader.dataset.ann_file", cfg.inference_dataloader["dataset"]["ann_file"], test_json),
-    # --- val/test loop genuinely disabled (see make_config.py's own long
-    #     comment on why: no bbox metadata for a stock predict() path) ---
-    ("val_dataloader", cfg.val_dataloader, None),
-    ("val_evaluator", cfg.val_evaluator, None),
-    ("val_cfg", cfg.val_cfg, None),
-    ("test_dataloader", cfg.test_dataloader, None),
-    ("test_evaluator", cfg.test_evaluator, None),
-    ("test_cfg", cfg.test_cfg, None),
-    # --- optimizer / scheduler ---
-    ("optim_wrapper.type", optim["type"], "OptimWrapper"),
-    ("optim_wrapper.optimizer.type", optim["optimizer"]["type"], "AdamW"),
-    ("optim_wrapper.optimizer.lr", optim["optimizer"]["lr"], scaled_lr),
-    ("optim_wrapper.optimizer.weight_decay", optim["optimizer"]["weight_decay"], 0.0),
-    ("optim_wrapper.clip_grad.max_norm", optim["clip_grad"]["max_norm"], 35),
-    ("optim_wrapper.clip_grad.norm_type", optim["clip_grad"]["norm_type"], 2),
-    ("optim_wrapper.paramwise_cfg.norm_decay_mult", optim["paramwise_cfg"]["norm_decay_mult"], 0),
-    ("optim_wrapper.paramwise_cfg.bias_decay_mult", optim["paramwise_cfg"]["bias_decay_mult"], 0),
-    ("optim_wrapper.paramwise_cfg.bypass_duplicate", optim["paramwise_cfg"]["bypass_duplicate"], True),
-    # --- checkpoint policy: final/last only, never best ---
-    ("default_hooks.checkpoint.type", ckpt_hook["type"], "CheckpointHook"),
-    ("default_hooks.checkpoint.interval", ckpt_hook["interval"], 5),
-    ("default_hooks.checkpoint.save_last", ckpt_hook["save_last"], True),
-    ("default_hooks.checkpoint.max_keep_ckpts", ckpt_hook["max_keep_ckpts"], 1),
-    ("default_hooks.checkpoint has no save_best", "save_best" in ckpt_hook, False),
-    # --- internal fixed-channel NME monitoring hook ---
-    ("custom_hooks[0].type", cfg.custom_hooks[0]["type"], "InternalFixedChannelNMEHook"),
-    ("custom_hooks[0].internal_val_ann", cfg.custom_hooks[0]["internal_val_ann"], val_json),
-    ("custom_hooks[0].interval", cfg.custom_hooks[0]["interval"], 5),
-    # --- augmentation pipeline: exact ordering, nothing extra/missing ---
-    ("train_pipeline types", [t["type"] for t in cfg.train_pipeline], expected_train_pipeline_types),
-    ("val_pipeline types", [t["type"] for t in cfg.val_pipeline], expected_val_pipeline_types),
-    # FetalRandomFlipAndCanonicalize's flip_prob IS a real config-level
-    # parameter (unlike FetalRotateScaleColorJitter's rotation/scale/colour
-    # ranges, which are hardcoded inside that transform class itself --
-    # transforms.py's own __init__ only takes input_size, nothing else is
-    # exposed at the config level to assert here).
-    ("train_pipeline[1].flip_prob", cfg.train_pipeline[1]["flip_prob"], 0.5),
-    # Deliberately NOT set anywhere in make_config.py (see that file's own
-    # comment: avoids double-scaling lr if --auto-scale-lr is ever passed
-    # to tools/train.py) -- must be absent, not merely False.
-    ("auto_scale_lr key absent", "auto_scale_lr" in cfg, False),
-    # --- LR schedule: exact scheduler count/types/boundaries, independently
-    #     recomputed from make_config.py's own real formula above, not just
-    #     "a list exists" ---
-    ("param_scheduler count", len(cfg.param_scheduler), 2),
-    ("param_scheduler[0].type", cfg.param_scheduler[0]["type"], "LinearLR"),
-    ("param_scheduler[0].start_factor", cfg.param_scheduler[0]["start_factor"], 1e-5),
-    ("param_scheduler[0].by_epoch", cfg.param_scheduler[0]["by_epoch"], False),
-    ("param_scheduler[0].begin", cfg.param_scheduler[0]["begin"], 0),
-    ("param_scheduler[0].end", cfg.param_scheduler[0]["end"], expected_warmup_end_iters),
-    ("param_scheduler[1].type", cfg.param_scheduler[1]["type"], "CosineAnnealingLR"),
-    ("param_scheduler[1].eta_min", cfg.param_scheduler[1]["eta_min"], scaled_lr * 0.05),
-    ("param_scheduler[1].begin", cfg.param_scheduler[1]["begin"], expected_cosine_begin_epoch),
-    ("param_scheduler[1].end", cfg.param_scheduler[1]["end"], max_epochs),
-    ("param_scheduler[1].T_max", cfg.param_scheduler[1]["T_max"], max_epochs - expected_cosine_begin_epoch),
-    ("param_scheduler[1].by_epoch", cfg.param_scheduler[1]["by_epoch"], True),
-    ("param_scheduler[1].convert_to_iter_based", cfg.param_scheduler[1]["convert_to_iter_based"], True),
-    # --- training_recipe_summary: independently cross-checked against the
-    #     real internal-train image count and the same formula above, not
-    #     just "the key exists" ---
-    ("training_recipe_summary.n_train_images", cfg.training_recipe_summary["n_train_images"], n_train_images),
-    ("training_recipe_summary.batch_size", cfg.training_recipe_summary["batch_size"], batch_size),
-    ("training_recipe_summary.iters_per_epoch", cfg.training_recipe_summary["iters_per_epoch"], iters_per_epoch),
-    ("training_recipe_summary.effective_lr", cfg.training_recipe_summary["effective_lr"], scaled_lr),
-    ("training_recipe_summary.warmup_end_iters", cfg.training_recipe_summary["warmup_end_iters"], expected_warmup_end_iters),
-    ("training_recipe_summary.cosine_begin_epoch", cfg.training_recipe_summary["cosine_begin_epoch"], expected_cosine_begin_epoch),
-    ("training_recipe_summary.max_epochs", cfg.training_recipe_summary["max_epochs"], max_epochs),
-]
-
-all_ok = True
-for key, got, expected in checks:
-    ok = got == expected
-    print(f'  {"[OK]  " if ok else "[FAIL]"} {key}: {got!r}' + ("" if ok else f"  expected={expected!r}"))
-    if not ok:
-        all_ok = False
-if not all_ok:
-    sys.exit("ERROR: config verification failed -- aborting")
-print(f"[OK] all {len(checks)} config checks passed")
-PYEOF
 }
 
 aggregate_and_report() {
@@ -811,7 +612,7 @@ PY
 # cleaned). That meant the sweep could NEVER progress past the first cell
 # across multiple invocations: re-running always re-processed UCL/BPD
 # (all 5 instant skips) and paused again before ever reaching UCL/OFD.
-# run_one() now sets CELL_DID_WORK=1 whenever it actually does something
+# run_one() sets CELL_DID_WORK=1 whenever it actually does something
 # (trains fresh, or strictly recovers a result) -- a cell where every seed
 # was a plain [SKIP] leaves it at 0, and the outer loop below continues
 # straight to the next cell without pausing, only stopping once a cell
