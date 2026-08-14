@@ -42,7 +42,10 @@ model:
     alpha: 5.0
     temperature: 10.0
     lambda_coord: 0.1
-    endpoint_order_invariant_nme: true
+    # Must remain false during training to match the historical
+    # FPN+UDP+augmentation runs' fixed-channel validation/early-stopping
+    # signal. PI-NME is enabled only by the test-time CLI override.
+    endpoint_order_invariant_nme: false
     attn_mask_annealing_enabled: false
     attn_mask_annealing_start_steps: null
     attn_mask_annealing_end_steps: null

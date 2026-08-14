@@ -26,6 +26,11 @@ def main() -> None:
     parser.add_argument("--run-root", type=Path, required=True)
     parser.add_argument("--images-root", type=Path, required=True)
     parser.add_argument("--output-root", type=Path, required=True)
+    parser.add_argument(
+        "--condition-name",
+        default="deconv_v2_rotate_scale_fixedval",
+        help="Directory suffix under run-root: bpd_<condition-name>/seed*/.",
+    )
     parser.add_argument("--bootstrap-replicates", type=int, default=20000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260814)
     args = parser.parse_args()
@@ -39,7 +44,7 @@ def main() -> None:
             args.run_root,
             "UCL",
             "bpd",
-            "deconv_v2_rotate_scale",
+            args.condition_name,
             _ImageSizeCache(args.images_root, "Head"),
             pixel_center_align=False,
             model_input_size=512.0,
@@ -50,7 +55,7 @@ def main() -> None:
 
     rescored = rescore_cell(loaded, get_d_vect("UCL", "BPD"), native_convention="xsort")
     _, rows = summarize_and_write(
-        "UCL", "bpd", "deconv_v2_rotate_scale", rescored, args.output_root,
+        "UCL", "bpd", args.condition_name, rescored, args.output_root,
         args.bootstrap_replicates, np.random.default_rng(args.bootstrap_seed),
     )
     path = args.output_root / "bpd_deconv_v2_rotate_scale_summary.tsv"
