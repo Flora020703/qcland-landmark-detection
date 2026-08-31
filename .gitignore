@@ -203,6 +203,7 @@ data/
 /thesis.zip
 /thesis_overleaf_upload.zip
 /thesis 初稿*.zip
+/thesis/
 *.tar
 *.tar.gz
 final_comparison/eomt_reuse_audit.md

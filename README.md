@@ -7,9 +7,9 @@ landmark-query tokens and a dedicated spatial decoding head, **DeconvHeadV2**.
 This repository contains the implementation, training/evaluation configs, and
 experiment-reproduction scripts for the MSc thesis *"QCLand: Query-Conditioned
 Landmark Localisation with Vision Foundation Models for Fetal Biometry"*
-(UCL Department of Computer Science). The full dissertation, including the
-complete methodology, experimental protocol, and reproducibility appendix, is
-in [`thesis/`](thesis/).
+(UCL Department of Computer Science). The dissertation itself (full
+methodology, experimental protocol, and reproducibility appendix) is not
+included in this repository; see the Citation section below.
 
 ## Overview
 
@@ -74,8 +74,7 @@ statistical testing with Holm correction).
 *Five-seed mean ± sample SD, permutation-invariant NME (%), lower is better,
 bold = lowest mean per row. Full paired significance results (bootstrap CIs,
 Wilcoxon, Holm-60) are in
-[`final_comparison/four_model_freeze_20260812_v1/`](final_comparison/four_model_freeze_20260812_v1/)
-and `thesis/chapters/05_results.tex`.*
+[`final_comparison/four_model_freeze_20260812_v1/`](final_comparison/four_model_freeze_20260812_v1/).*
 
 A QCLand variant records the lowest mean PI-NME in 8 of the 10
 dataset–measurement settings, with QCLand-DINOv3 lowest on all five UCL
@@ -83,10 +82,9 @@ measurements. HRNet-W18 retains a clear advantage on the two Multicentre head
 measurements (BPD, OFD). A staged ablation on BPD further shows that
 replacing the inherited dot-product decoder with DeconvHeadV2 produces the
 largest single reduction in localisation error among the evaluated
-architectural changes. See `thesis/chapters/05_results.tex` and the
-conclusion (`thesis/chapters/07_conclusion.tex`) for the full, appropriately
-qualified findings — the advantages above are task- and dataset-dependent,
-not universal.
+architectural changes. See the thesis for the full, appropriately qualified
+findings — the advantages above are task- and dataset-dependent, not
+universal.
 
 ## Repository structure
 
@@ -112,9 +110,6 @@ rtmpose_reproduction/      Locally reproduced RTMPose-s baseline: locked
 landmark_ordering_analysis/  Landmark-canonicalisation / correspondence checks
 final_comparison/          Frozen four-model comparison: paired statistics,
                            per-image results, SHA-256-manifested evidence
-
-thesis/                    Full LaTeX thesis source (chapters, figures,
-                           bibliography) and the reproducibility appendix
 ```
 
 ## Setup
@@ -159,10 +154,8 @@ five fixed seeds (42, 0, 123, 2024, 3407) used throughout this thesis.
 This project uses the pooled Multicentre fetal-biometry benchmark (UCL, FP,
 and HC18 cohorts) released by Di Vece et al., licensed under
 CC BY-NC-SA 4.0. **No dataset images or annotations are redistributed in this
-repository** — see `thesis/chapters/04_experimental_setup.tex` (Section on
-data sources, ethics, and licensing) for the data access procedure, and
-`thesis/chapters/appendix_a_reproducibility.tex` for full licensing and
-provenance detail.
+repository.** See the thesis for the data access procedure and full
+licensing/provenance detail.
 
 ## Reproducibility
 
@@ -177,10 +170,9 @@ in this repository:
   driver script behind every reported checkpoint.
 - **[`baseline_reproduction/`](baseline_reproduction/)** and
   **[`rtmpose_reproduction/`](rtmpose_reproduction/)** — audited,
-  version-pinned reproductions of the HRNet-W18 and RTMPose-s baselines.
-- **`thesis/chapters/appendix_a_reproducibility.tex`** — software/hardware
-  environments, seeding methodology, and the authoritative per-run
-  configuration convention for all three trained model families.
+  version-pinned reproductions of the HRNet-W18 and RTMPose-s baselines,
+  including the exact software/hardware environments and seeding
+  methodology used.
 
 ## Citation
 
