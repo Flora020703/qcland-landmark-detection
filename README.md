@@ -120,8 +120,8 @@ thesis/                    Full LaTeX thesis source (chapters, figures,
 ## Setup
 
 ```bash
-git clone https://github.com/Flora020703/qcland.git
-cd qcland
+git clone https://github.com/Flora020703/qcland-landmark-detection.git
+cd qcland-landmark-detection
 pip install -r requirements.txt
 ```
 
