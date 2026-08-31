@@ -1,0 +1,29 @@
+
+libgomp: Invalid value for environment variable OMP_NUM_THREADS
+Seed set to 42
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+wandb: WARNING The anonymous setting has no effect and will be removed in a future version.
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /root/.netrc.
+wandb: Currently logged in as: ucabnx1 (ucabnx1-ucl) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run f0ogecd1
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in logs/wandb/run-20260715_025347-f0ogecd1
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run face300w-baseline
+wandb: ⭐️ View project at https://wandb.ai/ucabnx1-ucl/eomt-landmark
+wandb: 🚀 View run at https://wandb.ai/ucabnx1-ucl/eomt-landmark/runs/f0ogecd1
+Restoring states from the checkpoint path at checkpoints/face300w-baseline/face300w-baseline_best.ckpt
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Loaded model weights from the checkpoint at checkpoints/face300w-baseline/face300w-baseline_best.ckpt
+Testing: |          | 0/? [00:00<?, ?it/s]Testing:   0%|          | 0/34 [00:00<?, ?it/s]Testing DataLoader 0:   0%|          | 0/34 [00:00<?, ?it/s]Testing DataLoader 0:   3%|▎         | 1/34 [00:00<00:25,  1.28it/s]Testing DataLoader 0:   6%|▌         | 2/34 [00:00<00:13,  2.43it/s]Testing DataLoader 0:   9%|▉         | 3/34 [00:00<00:08,  3.48it/s]Testing DataLoader 0:  12%|█▏        | 4/34 [00:00<00:06,  4.44it/s]Testing DataLoader 0:  15%|█▍        | 5/34 [00:00<00:05,  5.28it/s]Testing DataLoader 0:  18%|█▊        | 6/34 [00:00<00:04,  6.09it/s]Testing DataLoader 0:  21%|██        | 7/34 [00:01<00:03,  6.84it/s]Testing DataLoader 0:  24%|██▎       | 8/34 [00:01<00:03,  7.54it/s]Testing DataLoader 0:  26%|██▋       | 9/34 [00:01<00:03,  8.20it/s]Testing DataLoader 0:  29%|██▉       | 10/34 [00:01<00:02,  8.80it/s]Testing DataLoader 0:  32%|███▏      | 11/34 [00:01<00:02,  9.37it/s]Testing DataLoader 0:  35%|███▌      | 12/34 [00:01<00:02,  9.90it/s]Testing DataLoader 0:  38%|███▊      | 13/34 [00:01<00:02, 10.41it/s]Testing DataLoader 0:  41%|████      | 14/34 [00:01<00:01, 10.88it/s]Testing DataLoader 0:  44%|████▍     | 15/34 [00:01<00:01, 11.31it/s]Testing DataLoader 0:  47%|████▋     | 16/34 [00:01<00:01, 11.72it/s]Testing DataLoader 0:  50%|█████     | 17/34 [00:01<00:01, 12.12it/s]Testing DataLoader 0:  53%|█████▎    | 18/34 [00:01<00:01, 12.50it/s]Testing DataLoader 0:  56%|█████▌    | 19/34 [00:01<00:01, 12.85it/s]Testing DataLoader 0:  59%|█████▉    | 20/34 [00:01<00:01, 13.19it/s]Testing DataLoader 0:  62%|██████▏   | 21/34 [00:01<00:00, 13.50it/s]Testing DataLoader 0:  65%|██████▍   | 22/34 [00:01<00:00, 13.81it/s]Testing DataLoader 0:  68%|██████▊   | 23/34 [00:01<00:00, 14.11it/s]Testing DataLoader 0:  71%|███████   | 24/34 [00:01<00:00, 14.38it/s]Testing DataLoader 0:  74%|███████▎  | 25/34 [00:01<00:00, 14.63it/s]Testing DataLoader 0:  76%|███████▋  | 26/34 [00:01<00:00, 14.89it/s]Testing DataLoader 0:  79%|███████▉  | 27/34 [00:01<00:00, 15.14it/s]Testing DataLoader 0:  82%|████████▏ | 28/34 [00:01<00:00, 15.38it/s]Testing DataLoader 0:  85%|████████▌ | 29/34 [00:01<00:00, 15.61it/s]Testing DataLoader 0:  88%|████████▊ | 30/34 [00:01<00:00, 15.83it/s]Testing DataLoader 0:  91%|█████████ | 31/34 [00:01<00:00, 16.04it/s]Testing DataLoader 0:  94%|█████████▍| 32/34 [00:01<00:00, 16.25it/s]Testing DataLoader 0:  97%|█████████▋| 33/34 [00:02<00:00, 16.44it/s]Testing DataLoader 0: 100%|██████████| 34/34 [00:02<00:00, 16.58it/s][1;32mTest NME: 7.75%[0m
+Testing DataLoader 0: 100%|██████████| 34/34 [00:02<00:00, 16.53it/s]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+       Test metric             DataLoader 0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    metrics/test_nme        0.0775039792060852
+        test/mse           0.002379651879891753
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mface300w-baseline[0m at: [34mhttps://wandb.ai/ucabnx1-ucl/eomt-landmark/runs/f0ogecd1[0m

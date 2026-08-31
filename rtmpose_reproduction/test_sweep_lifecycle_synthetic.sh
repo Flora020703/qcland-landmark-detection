@@ -1,10 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
-# test_sweep_lifecycle_synthetic.sh -- a NOT-training end-to-end rehearsal of
-# the backup/clean half of the RTMPose sweep lifecycle, requested by the
-# 2026-08-10 fourth review round: "修完后建议先用合成目录做一次不训练的端到
-# 端测试...backup -> 本地式manifest校验 -> clean" (do a non-training synthetic
-# end-to-end test before starting the real 4-seed UCL/BPD run).
+# test_sweep_lifecycle_synthetic.sh -- a non-training end-to-end rehearsal of
+# the RTMPose backup -> archive-manifest verification -> clean lifecycle.
 #
 # What this DOES exercise, for real, against a throwaway isolated
 # ARTIFACT_ROOT (never the real one -- see ISOLATED_ROOT below):
@@ -27,12 +24,11 @@
 # What this does NOT exercise (skipped deliberately, requires either real
 # GPU training or an invasive refactor of run_rtmpose_full_sweep.sh to make
 # its train/inference tool paths stubbable -- neither done here):
-#   - actual `tools/train.py` / `run_inference.py` calls -- the checkpoint
-#     and predictions.json for each synthetic seed are FABRICATED directly
-#     (checkpoint is a dummy non-empty file; predictions are set exactly
-#     equal to GT for a deterministic, internally-consistent 0% NME, so the
-#     REAL evaluator and REAL validator still have something genuine to
-#     agree on).
+#   - actual `tools/train.py` / `run_inference.py` calls. Each synthetic seed
+#     instead receives a small genuine `torch.save` checkpoint that passes
+#     PyTorch-ZIP structure/CRC checks, plus fabricated predictions equal to
+#     GT for a deterministic, internally consistent 0% NME. This exercises
+#     artifact integrity and scoring, not learned model semantics.
 #   - run_rtmpose_full_sweep.sh's own run_artifacts_status() 4-state
 #     transitions (fresh/recoverable/complete/inconsistent) and its
 #     CELL_DID_WORK pause-then-resume-at-next-cell loop -- these live
@@ -62,6 +58,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/rtmpose_common.sh"
+cd "$SCRIPT_DIR"
 
 PY="${PY:?set PY to the RTMPose venv python interpreter}"
 PRETRAINED_CKPT_PATH="${PRETRAINED_CKPT_PATH:?set PRETRAINED_CKPT_PATH to the locally-downloaded CSPNeXt-s checkpoint file}"
@@ -141,7 +138,7 @@ PY
 echo "[OK] wrote shared-artifact manifest: $MANIFEST"
 
 echo ""
-echo "=== [2/4] per seed: real config + real provenance, fabricated checkpoint/predictions, real scoring + real validation ==="
+echo "=== [2/4] per seed: real config/provenance, valid synthetic checkpoint, fabricated predictions, real scoring/validation ==="
 for SEED in "${SEEDS[@]}"; do
   RUN_NAME="$(run_name_for "$DATASET" "$TASK" "$SEED")"
   WORK_DIR="$ISOLATED_ROOT/$RUN_NAME"
@@ -173,9 +170,22 @@ for SEED in "${SEEDS[@]}"; do
     --config "$CONFIG_PATH" --pretrained-checkpoint-path "$PRETRAINED_CKPT_PATH" \
     --out-json "$PROVENANCE_JSON"
 
-  echo "--- seed=$SEED: fabricating checkpoint (no real training) ---"
+  echo "--- seed=$SEED: creating a small genuine torch.save checkpoint (no real training) ---"
   mkdir -p "$WORK_DIR"
-  printf 'synthetic placeholder checkpoint, not a real torch state_dict\n' > "$WORK_DIR/epoch_${MAX_EPOCHS}.pth"
+  "$PY" - "$WORK_DIR/epoch_${MAX_EPOCHS}.pth" "$SEED" <<'PY'
+import sys
+import torch
+
+path, seed = sys.argv[1], int(sys.argv[2])
+torch.save(
+    {
+        "meta": {"synthetic": True, "seed": seed, "epoch": 200},
+        "state_dict": {"synthetic.weight": torch.tensor([float(seed)])},
+    },
+    path,
+)
+print(f"[OK] wrote structurally valid synthetic PyTorch checkpoint: {path}")
+PY
   printf 'epoch_%s.pth\n' "$MAX_EPOCHS" > "$WORK_DIR/last_checkpoint"
   verify_final_checkpoint "$WORK_DIR" "$MAX_EPOCHS" >/dev/null
 

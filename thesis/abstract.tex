@@ -1,0 +1,50 @@
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+\begin{spacing}{1.4}
+
+Accurate fetal biometry depends on the localisation of anatomical
+landmarks on standard ultrasound planes, from which measurements of
+fetal growth are derived. Manual landmark placement is subject to
+inter-observer variability, motivating automated landmark localisation.
+Existing approaches are largely based on task-specific convolutional
+architectures, whereas recent self-supervised vision foundation models
+offer general-purpose visual representations learned through
+large-scale pretraining. Yet adapting such representations to precise
+anatomical landmark predictions without sacrificing the spatial
+accuracy required for fetal biometry remains underexplored.
+
+This thesis introduces \textbf{QCLand} (Query-Conditioned Landmark
+Localisation), a framework for adapting pretrained vision foundation
+models to fetal landmark localisation. For each measurement-specific
+model, QCLand incorporates two learned landmark query tokens into a
+pretrained vision foundation model, allowing the queries to interact
+with image tokens and form landmark-specific representations through
+the transformer's self-attention. A new spatial decoding head,
+DeconvHeadV2, then converts these query-conditioned representations
+into spatial landmark heatmaps for precise localisation. The framework
+is instantiated with two self-supervised backbones, DINOv2 and DINOv3,
+yielding QCLand-DINOv2 and QCLand-DINOv3.
+
+QCLand is evaluated on five fetal biometric measurements across the
+UCL and Multicentre datasets using permutation-invariant normalised
+mean error (PI-NME), and is compared with reproduced HRNet-W18 and
+RTMPose-s baselines. QCLand-DINOv3 achieves the lowest five-seed mean
+PI-NME on all five UCL measurements. Across the two datasets and five
+measurements, a QCLand variant records the lowest mean error in eight
+of the ten comparisons. On Multicentre, a QCLand variant records the
+lowest mean PI-NME on both abdominal measurements and femur length,
+while HRNet-W18 records the lowest mean on the two head measurements.
+The BPD development experiments further show that introducing
+DeconvHeadV2 produces the largest observed reduction in localisation
+error among the evaluated architectural modifications.
+
+These results provide evidence that vision foundation models can be
+effectively adapted for precise fetal landmark localisation when
+combined with landmark-query conditioning and an appropriate spatial
+decoder. QCLand emerges as a competitive alternative to purpose-built
+convolutional landmark-localisation architectures, supporting
+query-conditioned foundation-model adaptation as a viable route to
+precise anatomical landmark localisation.
+
+\end{spacing}

@@ -1,0 +1,290 @@
+\chapter{Background and Related Work}
+\label{chap:background}
+
+Building on the clinical motivation established in Chapter 1, this
+chapter reviews the technical foundations and related work needed to
+motivate QCLand. It focuses on landmark localisation paradigms,
+self-supervised vision foundation models, and query-based visual
+prediction.
+
+
+% =================================================================
+% 2.1 Fetal Biometry as a Landmark Localisation Task
+% =================================================================
+
+\section{Fetal Biometry as a Landmark Localisation Task}
+\label{sec:bg-task}
+
+For the purposes of this thesis, fetal biometry is formulated as a
+two-landmark localisation problem: given a single 2D ultrasound image
+of a standard plane, the task is to predict the two landmark
+coordinates that define a specific measurement. This is a direct
+localisation task rather than a segmentation task: the required output
+is a pair of precise coordinates rather than a delineated anatomical
+region or contour.
+
+A characteristic of this formulation is landmark-ordering ambiguity.
+The two landmarks defining a diameter measurement have no intrinsic
+anatomical first/second identity: the same clinical measurement is
+obtained regardless of which landmark is labelled first. Different
+datasets may therefore adopt different ordering conventions, and a
+model that correctly localises both landmarks but reports them in the
+reversed order could be penalised under an order-sensitive evaluation.
+This ambiguity must therefore be addressed at training time,
+evaluation time, or both \parencite{divece2025multicentre}.
+
+
+% =================================================================
+% 2.2 Deep Learning for Landmark Localisation
+% =================================================================
+
+\section{Deep Learning for Landmark Localisation}
+\label{sec:bg-landmark-methods}
+
+Common formulations for learning-based 2D landmark localisation
+include direct coordinate regression, heatmap regression, and
+coordinate classification. Direct coordinate regression collapses
+spatial features before predicting numeric $(x,y)$ coordinates;
+DeepPose is an early deep-learning example of this formulation
+\parencite{toshev2014deeppose}. Although conceptually simple, direct
+regression provides less explicit spatial supervision than methods
+that retain a structured spatial output, motivating the widespread
+use of heatmap- and classification-based formulations.
+
+
+\subsection{Heatmap Regression}
+\label{sec:bg-heatmap}
+
+In heatmap regression, a model produces a dense spatial response map
+for each landmark, typically trained to approximate a Gaussian centred
+on the ground-truth location
+\parencite{tompson2014joint}. A coordinate can then be recovered from
+the response map through a discrete maximum with optional local
+refinement, or through a differentiable spatial expectation
+\parencite{sun2018integral}. The key advantage of this formulation is
+that it preserves an explicit correspondence between output locations
+and image regions.
+
+Heatmap regression has been developed through progressively refined
+convolutional architectures. Stacked hourglass networks
+\parencite{newell2016hourglass} introduced repeated
+downsampling--upsampling stages with skip connections to combine local
+and contextual information. SimpleBaseline
+\parencite{xiao2018simple} later showed that a comparatively simple
+deconvolutional head on top of a ResNet backbone
+\parencite{he2016resnet} can achieve strong keypoint-localisation
+performance. HRNet \parencite{sun2019hrnet} took a different approach
+by maintaining high-resolution representations throughout the network.
+Parallel convolutional streams at multiple resolutions repeatedly
+exchange information, allowing the final landmark heatmaps to be
+predicted from a high-resolution representation rather than
+reconstructed only after a low-resolution bottleneck.
+
+Beyond general pose estimation, heatmap-based localisation has also
+been adopted in medical imaging, where explicit spatial modelling can
+improve landmark localisation when annotated data are limited
+\parencite{payer2019spatial}.
+
+
+\subsection{HRNet and Landmark Ordering for Fetal Biometry}
+\label{sec:bg-hrnet}
+
+The HRNet-W18-based fetal biometry pipeline reported in the
+Multicentre Fetal Biometry study
+\parencite{divece2025multicentre} adapts high-resolution heatmap
+regression to paired fetal landmarks. In addition to the underlying
+HRNet architecture, the method incorporates Dynamic Orientation
+Determination (DOD) to address landmark-ordering ambiguity. DOD
+estimates a measurement-specific direction from the training data and
+uses it to impose a consistent ordering on the two landmarks, reducing
+errors caused solely by inconsistent annotation conventions.
+
+Related fetal-biometry work has explored direct landmark prediction
+using geometric and attention-based constraints
+\parencite{gao2023endpoints}.
+
+Together, these studies show how purpose-built landmark architectures
+can accommodate the geometric structure of fetal biometry. Their
+representations, however, are still learned primarily through
+task-specific supervised adaptation, providing a useful contrast to
+the large-scale self-supervised representations considered later in
+this chapter.
+
+
+\subsection{Coordinate Classification}
+\label{sec:bg-simcc}
+
+Coordinate classification avoids constructing a full two-dimensional
+heatmap by discretising the horizontal and vertical axes into
+classification bins and predicting a probability distribution over
+each coordinate axis. SimCC \parencite{li2022simcc} formulates
+keypoint localisation as two independent one-dimensional
+classification problems, reducing the quadratic spatial cost of a
+full 2D heatmap while permitting fine per-axis discretisation.
+
+RTMPose \parencite{jiang2023rtmpose} builds on this formulation by
+combining a CSPNeXt backbone with an RTMCC head based on SimCC
+coordinate representations. RTMPose therefore provides a useful
+counterpoint to heatmap regression: precise keypoint localisation can
+be achieved without maintaining a dense two-dimensional output map.
+
+
+\subsection{Task-Specific Supervision and Representation Learning}
+
+The distinction between heatmap regression and coordinate
+classification lies primarily in their output representations; both
+still learn the downstream task through supervised adaptation, even
+when initialised from ImageNet-pretrained weights. Their feature
+representations are therefore shaped primarily by the labelled
+downstream task.
+
+Self-supervised vision foundation models offer a different starting
+point. Rather than learning visual representations predominantly from
+the downstream annotations, they first acquire general-purpose
+representations through large-scale pretraining and are subsequently
+adapted to the target task. This shift motivates the central question
+for QCLand: whether such representations can be adapted without
+sacrificing the spatial precision required for landmark localisation.
+
+
+% =================================================================
+% 2.3 Vision Foundation Models and Query-Based Prediction
+% =================================================================
+
+\section{Vision Foundation Models and Query-Based Prediction}
+\label{sec:bg-vfm-query}
+
+Two developments are particularly relevant to QCLand:
+self-supervised vision transformers, which provide transferable
+patch-level visual representations, and query-based prediction
+mechanisms, which provide a way to form output-specific
+representations through interaction with image features.
+
+
+\subsection{Vision Transformers}
+\label{sec:bg-vit}
+
+A Vision Transformer (ViT, \textcite{dosovitskiy2021vit}) represents
+an image as a sequence of fixed-size patches. Each patch is projected
+into a token embedding and processed by a stack of transformer encoder
+blocks using self-attention. Unlike conventional convolutional
+hierarchies, a plain ViT generally maintains a single patch-token
+resolution through its encoder, while self-attention allows
+information to be exchanged globally across spatial locations.
+
+This property is useful for landmark localisation because each patch
+token retains an association with a spatial region while also
+incorporating global image context. Features from different
+transformer depths therefore share the same spatial grid while
+encoding different stages of visual processing, a property that
+downstream architectures can exploit.
+
+
+\subsection{DINOv2 and DINOv3}
+\label{sec:bg-dino}
+
+DINOv2 \parencite{oquab2023dinov2} is a self-supervised vision
+transformer trained using a teacher--student framework in which the
+student is encouraged to produce representations consistent with a
+momentum-updated teacher across different augmented views. The
+pretraining objective does not require manual semantic annotations.
+Earlier work on DINO showed that self-distilled ViTs develop both
+strong recognition features and emergent spatial structure
+\parencite{caron2021dino}. DINOv2 scales this approach to large,
+curated image collections, producing general-purpose visual
+representations that transfer effectively to downstream tasks such as
+classification, segmentation, and depth estimation.
+
+Of particular relevance to landmark localisation are DINOv2's dense
+patch-level representations. Individual patch tokens remain spatially
+associated with image regions while encoding increasingly contextual
+visual information through the transformer layers. Such
+representations provide a richer pretrained starting point for
+spatial prediction than learning all visual features solely from a
+small task-specific labelled dataset.
+
+DINOv3 \parencite{simeoni2025dinov3} further scales the DINO family
+and introduces changes intended to preserve the quality of dense
+representations during large-scale training. Gram anchoring
+regularises patch-level feature relationships during training, while
+rotary position embeddings replace the learned absolute position
+embeddings used by DINOv2. DINOv2 and DINOv3 therefore represent two
+successive generations of self-supervised vision foundation models
+that provide strong dense visual representations for downstream
+adaptation.
+
+
+\subsection{Query-Based Prediction: From DETR to EoMT}
+\label{sec:bg-eomt}
+
+Learned query representations have become an established mechanism for
+structured visual prediction. DETR \parencite{carion2020detr}
+introduced learned object queries that interact with image features
+through a transformer decoder, with bipartite Hungarian matching used
+to associate predictions with ground-truth objects. Mask2Former
+\parencite{cheng2022mask2former} extended the query-based formulation
+to segmentation, where each query predicts both a semantic category
+and a spatial mask.
+
+The Encoder-only Mask Transformer (EoMT,
+\textcite{kerssies2025eomt}) simplifies this architecture by removing
+the separate transformer decoder. Instead, learned mask-query tokens
+are inserted directly into the ViT patch-token sequence partway
+through the encoder. Subsequent transformer blocks allow queries and
+image tokens to interact through the backbone's own self-attention,
+so the ViT itself performs the query--image information exchange.
+
+For spatial prediction, each EoMT query is transformed and compared
+with transformed dense patch features through a per-location dot
+product,
+
+\begin{equation}
+    \label{eq:bg-einsum}
+    M_q(x,y)
+    =
+    f(q)^\top g\bigl(z(x,y)\bigr),
+\end{equation}
+
+where $q$ denotes a query representation, $z(x,y)$ is the visual
+feature at spatial position $(x,y)$, and $f$ and $g$ are learned
+transformations. This formulation is well matched to region-mask
+prediction, but segmentation performance alone does not establish
+its suitability for sharply localised landmark targets.
+
+EoMT also applies supervision at multiple transformer depths. The
+predicted masks can influence subsequent query-to-image attention,
+while Hungarian matching associates a variable number of
+segmentation instances with the available queries. These mechanisms
+reflect the setting for which EoMT was designed:
+variable-cardinality region segmentation rather than fixed-count
+landmark localisation.
+
+
+% =================================================================
+% 2.4 Summary and Research Gap
+% =================================================================
+
+\section{Summary and Research Gap}
+\label{sec:bg-summary}
+
+The literature reviewed above brings together three complementary
+lines of work. Purpose-built landmark architectures such as HRNet
+provide high-resolution spatial localisation and have already been
+adapted to fetal biometry, but rely primarily on task-specific
+supervised training. Self-supervised vision foundation models such as
+DINOv2 and DINOv3 provide general-purpose, spatially grounded patch
+representations learned through large-scale pretraining, but do not
+themselves produce landmark coordinates. Query-based architectures
+such as EoMT allow learned queries to form output-specific
+representations through interaction with ViT image tokens, but were
+developed for variable-cardinality segmentation rather than precise
+paired-landmark prediction.
+
+Fetal biometry combines these requirements in a different way: each
+measurement is defined by a fixed pair of landmarks, their ordering
+may be ambiguous, and accurate measurement depends on spatially
+precise coordinate recovery. The resulting adaptation problem is
+therefore to combine query-conditioned foundation-model
+representations with a spatial readout suited to precise landmark
+localisation. \Cref{chap:method} introduces QCLand to address this
+gap.

@@ -1,0 +1,25 @@
+{
+  "metric": "original-image-space permutation-invariant NME (%)",
+  "seeds": [
+    42,
+    0,
+    123,
+    2024,
+    3407
+  ],
+  "methods": [
+    "Proposed-DINOv2",
+    "Proposed-DINOv3",
+    "HRNet-W18",
+    "RTMPose-s"
+  ],
+  "bootstrap_replicates": 20000,
+  "bootstrap_seed": 20260812,
+  "holm_families": [
+    "six comparisons within each dataset-task cell",
+    "all 60 comparisons"
+  ],
+  "n_cells": 10,
+  "n_main_rows": 40,
+  "n_pairwise_rows": 60
+}

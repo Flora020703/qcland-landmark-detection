@@ -1,0 +1,195 @@
+% =============================================================
+% QCLand: Query-Conditioned Landmark Localisation — MSc Thesis
+% UCL Department of Computer Science
+%
+% MODIFIED: skeleton only, per module requirements:
+%   - dissertation text (excl. title/ToC/references/appendices): 30-100pp
+%   - total length (text + appendices): <= 120pp
+%   - 12pt, 1.5x or double spacing
+%   - code repository link required (see \CodeRepoURL below)
+% Structure is a first pass based on the UCL PG Project Assessment
+% Form's four marking areas (Background/Aims/Organisation,
+% Difficulty/Achievement, Clarity, Analysis/Testing) and this
+% project's actual experimental content. TODO once the previous-
+% years' thesis template is available: align chapter/section
+% granularity with department convention.
+%
+% MASTER PAGE BUDGET (set/revised 2026-07-22 -- per-section detail
+% lives in each chapter file's own header comment, this is the
+% single-source-of-truth summary):
+%   Ch1 Introduction              5pp
+%   Ch2 Background                12pp  (raised from 10pp)
+%   Ch3 Method                    15pp
+%   Ch4 Experimental Setup        7pp   (cut from 8pp)
+%   Ch5 Results and Discussion    30pp
+%   Ch6 Conclusion                3pp   (cut from 4pp)
+%   ---------------------------------
+%   Chapters total                ~73pp   (target band: 60-75pp)
+%   Appendix A (reproducibility)  ~5pp    (a full per-seed results
+%                                          appendix was planned but
+%                                          dropped, 2026-08-13: individual
+%                                          seeds are retained as
+%                                          experimental replicates, while
+%                                          the thesis reports their
+%                                          pre-specified five-seed mean
+%                                          and sample SD rather than
+%                                          tabulating each run separately,
+%                                          \Cref{sec:setup-multiseed})
+%   Front matter (title/abstract/ack/abbrevs, ToC/LoF/LoT auto-gen)  ~3.5pp
+%   ---------------------------------
+%   Book total estimate           ~81.5pp  (hard cap: 120pp)
+% Chapters 3 and 5 are the most likely to overrun (most subsections,
+% most tables) -- watch those first if the total starts creeping up.
+% =============================================================
+
+\documentclass[12pt,a4paper]{report}
+
+% -----------------------------------------------------------
+% Packages
+% -----------------------------------------------------------
+\usepackage{iftex}
+\ifPDFTeX
+  % inputenc/fontenc are pdfTeX-engine-specific; XeLaTeX/LuaLaTeX
+  % handle UTF-8 and font encoding natively and do not need them.
+  % Confirm which engine your Overleaf project is set to (Menu ->
+  % Compiler) before compiling -- this guard makes it work either way.
+  \usepackage[utf8]{inputenc}
+  \usepackage[T1]{fontenc}
+\fi
+\usepackage{setspace}          % line spacing control
+\usepackage{float}             % fixed [H] placement for selected large floats
+\usepackage[a4paper,margin=2.5cm]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb}
+\usepackage{booktabs}          % clean tables (\toprule/\midrule/\bottomrule)
+\usepackage{tabularx}          % auto-wrapping table columns (X) -- required
+\usepackage{longtable}         % tables that may span more than one page
+                                % for any table with long free-text cells;
+                                % plain l/c/r columns do NOT wrap and force
+                                % fragile hand-inserted \\ mid-cell, which
+                                % has already once broken a \Cref argument
+                                % split across a manual linebreak -- always
+                                % prefer X columns over hand-wrapping.
+\usepackage{multirow}
+\usepackage{siunitx}           % consistent number/unit formatting, e.g. \qty{9.54}{\percent} (siunitx v3+; \SI is the deprecated v2 name)
+\usepackage[table]{xcolor}
+\usepackage{hyperref}
+\usepackage{cleveref}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{seqsplit}          % break long unhyphenatable \texttt identifiers (paths, config names) instead of overflowing the margin
+\usepackage{listings}          % code snippets (e.g. config excerpts)
+\usepackage{algorithm}
+\usepackage{algpseudocode}
+\usepackage{xspace}
+\usepackage{microtype}         % better justification/kerning -- free page-count savings
+\usepackage[
+  backend=biber,
+  style=numeric,
+  sorting=none
+]{biblatex}
+\addbibresource{references.bib}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=black,
+  citecolor=black,
+  urlcolor=blue,
+  pdftitle={QCLand: Query-Conditioned Landmark Localisation with Vision Foundation Models for Fetal Biometry},
+  pdfauthor={Nan Xu},
+}
+
+% -----------------------------------------------------------
+% Formatting per module requirements
+% -----------------------------------------------------------
+\onehalfspacing                % switch to \doublespacing if required instead
+\captionsetup{font=small}      % 1.5x-spaced captions on every table/figure
+                                % look oversized otherwise -- this project
+                                % has many tables, worth fixing once here.
+% For any individual table that still looks cramped under 1.5x spacing,
+% wrap it in \begin{singlespace}...\end{singlespace} (setspace) locally
+% rather than changing the global spacing.
+
+% -----------------------------------------------------------
+% Project-specific macros — keep terminology consistent everywhere
+% -----------------------------------------------------------
+\newcommand{\EoMT}{EoMT\xspace}
+\newcommand{\BPD}{BPD\xspace}
+\newcommand{\OFD}{OFD\xspace}
+\newcommand{\APAD}{APAD\xspace}
+\newcommand{\TAD}{TAD\xspace}
+\newcommand{\FL}{FL\xspace}
+\newcommand{\NME}{NME\xspace}
+\newcommand{\CodeRepoURL}{https://github.com/Flora020703/eomt-landmark-detection}
+
+% NOTE (confirmed 2026-07-22 against the actual reference thesis title
+% page the student supplied -- Bilal Sidiqi, 2023): that page prints
+% BOTH the author's name AND a Candidate Number, so marking is not
+% strictly anonymous at the title-page level. Settled -- no longer
+% under-evidenced.
+\newcommand{\StudentName}{Nan Xu}
+\newcommand{\CandidateNumber}{25094226}
+% NOTE (corrected 2026-07-22): the title should not foreground "EoMT"
+% -- the actual contribution is a systematic empirical study/adaptation
+% of a segmentation architecture, not a novel lightweight architecture
+% (that was the original proposal's aim, not what was delivered).
+% NOTE (revised 2026-08-13): the 2026-07-22 placeholder above still
+% centred "adapting a segmentation architecture" as the subject, the
+% same framing this thesis's own Ch1 Motivation was rewritten away from
+% (the thesis's own query-conditioned landmark-localisation framework
+% should be the subject, not the prior segmentation architecture it is
+% informed by). Retitled accordingly.
+% NOTE (updated 2026-08-21): student confirmed this as the formal
+% dissertation title. The PDF metadata above is kept in sync.
+\newcommand{\ThesisTitle}{QCLand: Query-Conditioned Landmark Localisation with Vision Foundation Models for Fetal Biometry}
+% Format matches the reference title page exactly ("Supervisors: X \& Y",
+% no "Dr." prefix).
+\newcommand{\Supervisors}{Zhehua Mao \& Sophia Bano}
+\newcommand{\Programme}{MSc Machine Learning}
+\newcommand{\SubmissionDate}{7 September 2026}
+% NOTE (corrected 2026-07-22): removed \WordCount -- the module
+% requirements this project has actually seen specify a PAGE limit
+% (dissertation text 30-100pp, total incl. appendices <=120pp), not a
+% word count. Do not reintroduce a word-count declaration without a
+% verified source requiring one.
+
+\begin{document}
+
+% -----------------------------------------------------------
+% Front matter
+% -----------------------------------------------------------
+\pagenumbering{roman}
+
+\input{titlepage}
+\input{abstract}
+\input{acknowledgements}
+
+\tableofcontents
+\listoffigures
+\listoftables
+\input{abbreviations}
+
+\clearpage
+\pagenumbering{arabic}
+
+% -----------------------------------------------------------
+% Main matter
+% -----------------------------------------------------------
+\input{chapters/01_introduction}
+\input{chapters/02_background}
+\input{chapters/03_method}
+\input{chapters/04_experimental_setup}
+\input{chapters/05_results}
+\input{chapters/07_conclusion}
+
+% -----------------------------------------------------------
+% Back matter
+% -----------------------------------------------------------
+\printbibliography[heading=bibintoc,title={References}]
+
+\appendix
+\crefname{chapter}{Appendix}{Appendices}
+\Crefname{chapter}{Appendix}{Appendices}
+\input{chapters/appendix_a_reproducibility}
+
+\end{document}

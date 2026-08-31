@@ -170,3 +170,20 @@ predates any such interface) -- confirm the installed mmengine version
 actually seeds CUDA/DataLoader-worker RNGs from this single field before
 trusting "seed 42" to mean the same thing it does for EoMT/HRNet; if it
 does not, an equivalent explicit patch will be needed here too.
+# Runtime compatibility pin discovered by the first real Runner smoke test
+
+The dedicated RTMPose environment must retain `setuptools==80.9.0`.
+`torch==2.1.0` imports `pkg_resources` from `torch.utils.cpp_extension`
+while MMEngine collects the runtime environment. Newer setuptools releases
+used during initial setup (`83.0.0`) no longer provided that module, causing
+Runner construction to fail before training. The deprecation warning emitted
+by setuptools 80.9.0 is expected; do not upgrade this environment past 80.x
+without first verifying that the pinned PyTorch no longer needs
+`pkg_resources`.
+
+Both training entry points export `CUBLAS_WORKSPACE_CONFIG=:4096:8` before
+launching Python. This is required when `randomness.deterministic=True`
+enables deterministic PyTorch algorithms: CUDA >=10.2 CuBLAS matrix
+multiplication otherwise raises at the first RTMCCHead linear layer. Do not
+remove this variable or disable deterministic mode merely to bypass that
+error.

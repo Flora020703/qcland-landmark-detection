@@ -77,6 +77,11 @@ excluded_log_paths_for() {
 #       - $work_dir/last_checkpoint exists and its content points at that
 #         same file (cheap extra corroboration, not a substitute for the
 #         two checks above since last_checkpoint could itself be stale).
+#       - the checkpoint is a structurally valid PyTorch ZIP archive, every
+#         member passes CRC validation, and a data.pkl payload is present.
+#     This checks structural integrity, not whether the tensors are
+#     semantically correct for a particular architecture; subsequent real
+#     inference provides that stronger end-to-end evidence.
 #     Prints the verified checkpoint path on success (stdout only -- safe
 #     to capture via $(...)); exits 1 with a stderr explanation otherwise. -
 verify_final_checkpoint() {
@@ -112,6 +117,24 @@ verify_final_checkpoint() {
     echo "ERROR: $pointer points at $pointed_name, not $expected_name" >&2
     exit 1
   fi
+
+  local checkpoint_python="${PY:-python3}"
+  "$checkpoint_python" - "$expected_path" <<'PY'
+from pathlib import Path
+import sys
+import zipfile
+
+path = Path(sys.argv[1])
+if not zipfile.is_zipfile(path):
+    raise SystemExit(f"ERROR: {path} is not a structurally valid PyTorch ZIP checkpoint")
+with zipfile.ZipFile(path) as archive:
+    bad_member = archive.testzip()
+    members = archive.namelist()
+if bad_member is not None:
+    raise SystemExit(f"ERROR: {path} has corrupt ZIP member {bad_member}")
+if not any(name == "data.pkl" or name.endswith("/data.pkl") for name in members):
+    raise SystemExit(f"ERROR: {path} has no PyTorch data.pkl payload")
+PY
 
   echo "$expected_path"
 }

@@ -1,0 +1,11 @@
+dataset	task	n_union	n_common	canonical_sets_equal	rtmpose_seed_sets_equal	four_model_sets_exactly_equal	rtmpose_seed_count	status
+UCL	BPD	49	49	True	True	True	5	PASS
+UCL	OFD	49	49	True	True	True	5	PASS
+UCL	APAD	36	36	True	True	True	5	PASS
+UCL	TAD	36	36	True	True	True	5	PASS
+UCL	FL	39	39	True	True	True	5	PASS
+MULTICENTRE	BPD	1180	1180	True	True	True	5	PASS
+MULTICENTRE	OFD	1189	1189	True	True	True	5	PASS
+MULTICENTRE	APAD	161	161	True	True	True	5	PASS
+MULTICENTRE	TAD	161	161	True	True	True	5	PASS
+MULTICENTRE	FL	362	362	True	True	True	5	PASS

@@ -29,6 +29,12 @@
 
 set -euo pipefail
 
+# `randomness.deterministic=True` enables PyTorch deterministic algorithms.
+# CuBLAS on CUDA >= 10.2 additionally requires this workspace contract to
+# be set before Python starts; keep it in the formal entry point so a new
+# shell/session cannot accidentally omit it.
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PY:?set PY to the RTMPose venv python interpreter}"
 DATA_ROOT="${DATA_ROOT:-/root/autodl-tmp}"

@@ -1,3 +1,13 @@
+# SUPERSEDED — DO NOT IMPLEMENT
+
+This candidate protocol was superseded by the supervisor's written decision on
+3 August 2026. The final additional landmark baseline is RTMPose-s, not
+YOLO-Pose. No YOLO training or data conversion should be started from this
+file. The active protocol is documented in
+`rtmpose_reproduction/PROTOCOL_LOCKED.md`.
+
+The remainder of this file is retained only as decision history.
+
 # YOLO protocol decision required before implementation
 
 No YOLO source, dependency, checkpoint, configuration, or dataset converter is present in this repository, and the chronological project record does not identify a specific YOLO release. The final experiment must therefore not silently choose one.

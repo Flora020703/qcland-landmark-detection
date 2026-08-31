@@ -1,0 +1,3 @@
+figure	data_source	source_sha256	statistics
+final_four_model_comparison	final_comparison/four_model_freeze_20260812_v1/four_model_main_table.tsv	f038070c030a412090c8ad3f9883ed67cff3e306d63b85cf1518ccda668ca562	unrounded frozen five-seed means and seed-level sample SDs
+bpd_staged_development	exact frozen values embedded in generate_results_bar_charts.py	72165f0c4e93dac73f9b7a790245ffe0b9333cd198deb01c4fe3f033e07e3074	provided five-seed means and seed-level sample SDs; no recomputation

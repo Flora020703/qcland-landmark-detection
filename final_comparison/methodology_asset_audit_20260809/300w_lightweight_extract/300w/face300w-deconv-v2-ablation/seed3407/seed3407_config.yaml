@@ -1,0 +1,89 @@
+seed_everything: 3407
+trainer:
+  max_epochs: 100
+  check_val_every_n_epoch: 2
+  log_every_n_steps: 10
+  callbacks:
+  - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+    init_args:
+      monitor: metrics/val_nme
+      mode: min
+      save_top_k: 1
+      save_last: true
+      dirpath: checkpoints/face300w-deconv-v2-ablation/seed3407
+      filename: seed3407_best
+  - class_path: lightning.pytorch.callbacks.EarlyStopping
+    init_args:
+      monitor: metrics/val_nme
+      mode: min
+      patience: 15
+      min_delta: 0.001
+  - class_path: lightning.pytorch.callbacks.LearningRateMonitor
+    init_args:
+      logging_interval: step
+  logger:
+    class_path: lightning.pytorch.loggers.WandbLogger
+    init_args:
+      project: eomt-landmark
+      name: face300w-deconv-v2-ablation-seed3407
+      save_dir: logs
+      log_model: false
+model:
+  class_path: training.landmark_detection.LandmarkDetection
+  init_args:
+    num_landmarks: 68
+    nme_norm_pair:
+    - 36
+    - 45
+    loss_type: hybrid
+    alpha: 5.0
+    temperature: 10.0
+    lambda_coord: 0.1
+    attn_mask_annealing_enabled: false
+    attn_mask_annealing_start_steps: null
+    attn_mask_annealing_end_steps: null
+    lr: 0.0001
+    llrd: 0.8
+    llrd_l2_enabled: true
+    lr_mult: 1.0
+    weight_decay: 0.05
+    poly_power: 0.9
+    warmup_steps:
+    - 15
+    - 30
+    network:
+      class_path: models.eomt.EoMT
+      init_args:
+        num_classes: 1
+        num_q: 68
+        num_blocks: 6
+        masked_attn_enabled: true
+        freeze_backbone: false
+        upsample_bilinear: false
+        use_refinement_head: false
+        heatmap_head: deconv_v2
+        heatmap_size:
+        - 64
+        - 64
+        encoder:
+          class_path: models.vit.ViT
+          init_args:
+            backbone_name: vit_small_patch14_reg4_dinov2
+data:
+  class_path: datasets.face300w_dataset.Face300WDataModule
+  init_args:
+    data_root: /root/autodl-tmp/300W/300w
+    img_size:
+    - 256
+    - 256
+    heatmap_size:
+    - 64
+    - 64
+    sigma: 1.5
+    val_fraction: 0.1
+    val_split_seed: 42
+    test_subset: full
+    batch_size: 4
+    num_workers: 4
+    augment: false
+    loader_seed: 3407

@@ -1,0 +1,38 @@
+Seed set to 0
+'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f8cfc0b7500>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: eeb59990-3038-49b9-a251-4b751e28fe55)')' thrown while requesting HEAD https://huggingface.co/timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors
+Retrying in 1s [Retry 1/5].
+'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f8cfb796960>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 01330d6e-aaed-496d-9718-e9a41ff32a98)')' thrown while requesting HEAD https://huggingface.co/timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors
+Retrying in 2s [Retry 2/5].
+'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f8cfb796c60>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 5f3c1c57-49b6-4be7-bc62-6265c692f12c)')' thrown while requesting HEAD https://huggingface.co/timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors
+Retrying in 4s [Retry 3/5].
+'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f8cfb7940e0>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 47141552-478a-4d3f-8a6f-d9781abe1ff9)')' thrown while requesting HEAD https://huggingface.co/timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors
+Retrying in 8s [Retry 4/5].
+'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f8cfb797170>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: 8fef950d-1a66-44e6-b12a-b6607c75603c)')' thrown while requesting HEAD https://huggingface.co/timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors
+Retrying in 8s [Retry 5/5].
+'(MaxRetryError("HTTPSConnectionPool(host='huggingface.co', port=443): Max retries exceeded with url: /timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors (Caused by NewConnectionError('<urllib3.connection.HTTPSConnection object at 0x7f8cfb797350>: Failed to establish a new connection: [Errno 101] Network is unreachable'))"), '(Request ID: a16fc27b-5405-42d9-a8a9-b86af99db129)')' thrown while requesting HEAD https://huggingface.co/timm/vit_small_patch14_reg4_dinov2.lvd142m/resolve/main/model.safetensors
+GPU available: True (cuda), used: True
+TPU available: False, using: 0 TPU cores
+HPU available: False, using: 0 HPUs
+wandb: WARNING The anonymous setting has no effect and will be removed in a future version.
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from /root/.netrc.
+wandb: Currently logged in as: ucabnx1 (ucabnx1-ucl) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: setting up run qapeyrbt
+wandb: Tracking run with wandb version 0.28.0
+wandb: Run data is saved locally in logs/wandb/run-20260716_083936-qapeyrbt
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run face300w-deconv-v2-ablation-seed0
+wandb: ⭐️ View project at https://wandb.ai/ucabnx1-ucl/eomt-landmark
+wandb: 🚀 View run at https://wandb.ai/ucabnx1-ucl/eomt-landmark/runs/qapeyrbt
+Restoring states from the checkpoint path at checkpoints/face300w-deconv-v2-ablation/seed0/seed0_best.ckpt
+LOCAL_RANK: 0 - CUDA_VISIBLE_DEVICES: [0]
+Loaded model weights from the checkpoint at checkpoints/face300w-deconv-v2-ablation/seed0/seed0_best.ckpt
+Testing: |          | 0/? [00:00<?, ?it/s]Testing:   0%|          | 0/34 [00:00<?, ?it/s]Testing DataLoader 0:   0%|          | 0/34 [00:00<?, ?it/s]Testing DataLoader 0:   3%|▎         | 1/34 [00:00<00:25,  1.30it/s]Testing DataLoader 0:   6%|▌         | 2/34 [00:00<00:12,  2.46it/s]Testing DataLoader 0:   9%|▉         | 3/34 [00:00<00:08,  3.53it/s]Testing DataLoader 0:  12%|█▏        | 4/34 [00:00<00:06,  4.50it/s]Testing DataLoader 0:  15%|█▍        | 5/34 [00:00<00:05,  5.40it/s]Testing DataLoader 0:  18%|█▊        | 6/34 [00:00<00:04,  6.22it/s]Testing DataLoader 0:  21%|██        | 7/34 [00:01<00:03,  6.99it/s]Testing DataLoader 0:  24%|██▎       | 8/34 [00:01<00:03,  7.71it/s]Testing DataLoader 0:  26%|██▋       | 9/34 [00:01<00:02,  8.37it/s]Testing DataLoader 0:  29%|██▉       | 10/34 [00:01<00:02,  8.99it/s]Testing DataLoader 0:  32%|███▏      | 11/34 [00:01<00:02,  9.57it/s]Testing DataLoader 0:  35%|███▌      | 12/34 [00:01<00:02, 10.10it/s]Testing DataLoader 0:  38%|███▊      | 13/34 [00:01<00:01, 10.61it/s]Testing DataLoader 0:  41%|████      | 14/34 [00:01<00:01, 11.09it/s]Testing DataLoader 0:  44%|████▍     | 15/34 [00:01<00:01, 11.54it/s]Testing DataLoader 0:  47%|████▋     | 16/34 [00:01<00:01, 11.95it/s]Testing DataLoader 0:  50%|█████     | 17/34 [00:01<00:01, 12.34it/s]Testing DataLoader 0:  53%|█████▎    | 18/34 [00:01<00:01, 12.71it/s]Testing DataLoader 0:  56%|█████▌    | 19/34 [00:01<00:01, 13.07it/s]Testing DataLoader 0:  59%|█████▉    | 20/34 [00:01<00:01, 13.41it/s]Testing DataLoader 0:  62%|██████▏   | 21/34 [00:01<00:00, 13.74it/s]Testing DataLoader 0:  65%|██████▍   | 22/34 [00:01<00:00, 14.04it/s]Testing DataLoader 0:  68%|██████▊   | 23/34 [00:01<00:00, 14.32it/s]Testing DataLoader 0:  71%|███████   | 24/34 [00:01<00:00, 14.57it/s]Testing DataLoader 0:  74%|███████▎  | 25/34 [00:01<00:00, 14.80it/s]Testing DataLoader 0:  76%|███████▋  | 26/34 [00:01<00:00, 15.06it/s]Testing DataLoader 0:  79%|███████▉  | 27/34 [00:01<00:00, 15.32it/s]Testing DataLoader 0:  82%|████████▏ | 28/34 [00:01<00:00, 15.54it/s]Testing DataLoader 0:  85%|████████▌ | 29/34 [00:01<00:00, 15.77it/s]Testing DataLoader 0:  88%|████████▊ | 30/34 [00:01<00:00, 15.99it/s]Testing DataLoader 0:  91%|█████████ | 31/34 [00:01<00:00, 16.20it/s]Testing DataLoader 0:  94%|█████████▍| 32/34 [00:01<00:00, 16.41it/s]Testing DataLoader 0:  97%|█████████▋| 33/34 [00:01<00:00, 16.61it/s]Testing DataLoader 0: 100%|██████████| 34/34 [00:02<00:00, 16.82it/s][1;32mTest NME: 7.98%[0m
+Testing DataLoader 0: 100%|██████████| 34/34 [00:02<00:00, 16.76it/s]
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+       Test metric             DataLoader 0
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+    metrics/test_nme        0.07984402030706406
+        test/mse           0.0022752631921321154
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mface300w-deconv-v2-ablation-seed0[0m at: [34mhttps://wandb.ai/ucabnx1-ucl/eomt-landmark/runs/qapeyrbt[0m

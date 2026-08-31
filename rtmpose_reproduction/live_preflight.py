@@ -152,15 +152,20 @@ def check_geometric_round_trip(cfg, tmp_dir: Path) -> None:
     keypoints_512 = np.asarray(sample["data_samples"].gt_instances.keypoints).reshape(-1, 2)
     assert keypoints_512.shape[0] >= 2, f"expected >=2 keypoints, got shape {keypoints_512.shape}"
 
-    codec = cfg.codec
-    from mmpose.codecs import build_codec  # type: ignore
-    built_codec = build_codec(codec)
+    codec = dict(cfg.codec)
+    # MMPose 1.3.2 does not expose `mmpose.codecs.build_codec`.  Codecs are
+    # constructed through the project's registry, just like datasets and
+    # models.  This was confirmed by the first live preflight against the
+    # pinned server environment; keep this version-locked API explicit so a
+    # missing registration remains a hard preflight failure.
+    from mmpose.registry import KEYPOINT_CODECS
+    built_codec = KEYPOINT_CODECS.build(codec)
     encoded = built_codec.encode(keypoints_512.reshape(1, -1, 2),
                                   keypoints_visible=np.ones((1, keypoints_512.shape[0])))
-    # NOTE (needs live confirmation): exact encode()/decode() dict keys
-    # (e.g. 'keypoint_x_labels'/'keypoint_y_labels') are inferred from
-    # SimCCLabel's documented interface, not run against a live install --
-    # if this fails here, that is exactly the point of this preflight step.
+    # The exact encode()/decode() keys and tensor shapes are deliberately
+    # exercised below against the live pinned MMPose installation.  Any API
+    # mismatch remains a blocking preflight failure rather than being
+    # hidden behind an adapter fallback.
     decoded_coords, _ = built_codec.decode(encoded["keypoint_x_labels"],
                                             encoded["keypoint_y_labels"])
     decoded_coords = np.asarray(decoded_coords).reshape(-1, 2)

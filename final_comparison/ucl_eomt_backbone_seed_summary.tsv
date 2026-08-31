@@ -1,0 +1,9 @@
+task	backbone	n_images	n_seeds	fixed_nme_mean_pct	fixed_nme_sd_pct
+ofd	dinov2	49	5	4.3103	0.6786
+ofd	dinov3	49	5	4.0940	0.1203
+apad	dinov2	36	5	7.5284	1.4066
+apad	dinov3	36	5	6.0919	0.8377
+tad	dinov2	36	5	12.6070	2.8291
+tad	dinov3	36	5	6.4396	0.8923
+fl	dinov2	39	5	1.8342	0.1101
+fl	dinov3	39	5	1.7312	0.1607

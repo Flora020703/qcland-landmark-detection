@@ -1,0 +1,171 @@
+\chapter{Conclusion}
+\label{chap:conclusion}
+
+
+% =================================================================
+% 6.1 Conclusions
+% =================================================================
+
+\section{Conclusions}
+\label{sec:conclusion-summary}
+
+This thesis investigated whether self-supervised vision foundation
+models can be adapted for precise fetal biometry landmark
+localisation. To bridge the gap between general-purpose visual
+representations and the spatially precise, measurement-specific
+predictions required for fetal biometry, it introduced QCLand, a
+query-conditioned landmark-localisation framework that combines
+learned landmark queries with pretrained DINOv2 and DINOv3 backbones
+and a new spatial decoding head, DeconvHeadV2.
+
+The final comparison provides evidence that QCLand can be adapted
+effectively to this task. A QCLand variant records the lowest mean
+PI-NME in eight of the ten dataset--measurement settings, with
+QCLand-DINOv3 achieving the lowest mean on all five UCL
+measurements. These results support query-conditioned
+foundation-model adaptation as a viable approach to precise fetal
+landmark localisation within the evaluated benchmark settings.
+
+The BPD ablation study further clarifies where the observed
+performance gains arise. DeconvHeadV2 produces the largest reduction
+in localisation error among the evaluated architectural
+modifications. Rotation-and-scale augmentation is associated with a
+further substantial reduction in mean error and lower run-to-run
+variability. By contrast, the independent contributions of
+multi-depth feature fusion and pixel-centre alignment remain
+unresolved by the sequential experimental design.
+
+Performance nevertheless varies across anatomy, backbone, and dataset
+setting. DINOv3 is descriptively stronger than DINOv2 in most
+comparisons, but paired statistical support is confined to two
+Multicentre measurements. The QCLand--HRNet-W18 ranking is similarly
+anatomy-dependent: QCLand shows its clearest confirmed advantage on
+Multicentre APAD, whereas HRNet-W18 retains a clear advantage on the
+Multicentre head measurements. RTMPose-s is consistently weaker on
+UCL but remains competitive in several Multicentre settings.
+
+QCLand is therefore competitive across the evaluated fetal
+landmark-localisation tasks, but its advantages are conditional rather
+than universal. The results support the effectiveness of
+landmark-query conditioning and spatial decoding while also showing
+that architecture, backbone, anatomy, and dataset characteristics
+remain important determinants of performance.
+
+
+% =================================================================
+% 6.2 Contributions
+% =================================================================
+
+\section{Contributions}
+\label{sec:conclusion-contributions}
+
+The principal methodological contribution of this thesis is QCLand,
+a framework for adapting pretrained vision foundation models to
+precise fetal landmark localisation. QCLand introduces learned
+landmark queries into the pretrained transformer, allowing
+landmark-specific representations to emerge through direct
+query--image interaction, and couples these representations with
+DeconvHeadV2 for explicit spatial decoding. This provides a route
+from general-purpose transformer representations to precise
+landmark-level predictions.
+
+A second contribution is the systematic development of this
+adaptation strategy. The BPD ablation study traces the transition
+from the inherited dot-product readout to the adopted QCLand
+configuration and identifies DeconvHeadV2 as the architectural change
+associated with the largest observed improvement. The experiments
+also characterise the effects and remaining uncertainty associated
+with the training objective, multi-depth feature fusion,
+pixel-centre alignment, geometric augmentation, and input resolution.
+
+The empirical contribution is a controlled comparison across five
+fetal measurements, two dataset settings, two foundation-model
+backbones, and two established landmark-localisation baselines.
+QCLand-DINOv2 and QCLand-DINOv3 are evaluated against locally
+reproduced HRNet-W18 and RTMPose-s models under harmonised external
+conditions using five training seeds, common evaluation subsets,
+original-image-space PI-NME, and paired statistical analysis. This
+evaluation shows both where QCLand is competitive and where
+purpose-built alternatives retain an advantage.
+
+
+% =================================================================
+% 6.3 Limitations and Future Work
+% =================================================================
+
+\section{Limitations and Future Work}
+\label{sec:conclusion-future}
+
+Several limitations constrain the conclusions that can be drawn from
+the present experiments. The Multicentre evaluation uses the released
+pooled benchmark rather than a centre-held-out design, so it does not
+directly test transfer to an unseen clinical site. UCL is also one of
+the constituent sources of the Multicentre release, meaning that the
+two dataset settings should not be interpreted as fully independent
+replications.
+
+The compared methods retain different training procedures despite the
+harmonised external evaluation protocol. QCLand uses
+validation-based termination, HRNet-W18 follows its upstream training
+procedure, and RTMPose-s trains for a fixed number of epochs.
+Consequently, the comparison evaluates complete methods under matched
+external conditions rather than isolating architecture alone.
+
+The BPD ablation study is staged rather than factorial. The observed
+effect of each modification therefore depends on the configuration
+that precedes it, and multi-depth fusion and pixel-centre alignment
+are varied together in the augmented follow-up. Their independent
+contributions cannot be established from the present evidence.
+Furthermore, the full ablation sequence was conducted only on BPD,
+while the remaining measurements evaluate the adopted configuration
+as a complete pipeline.
+
+Training-time landmark assignment provides another direction for
+further investigation. QCLand assigns the two landmarks from left to
+right, and this convention can become unstable when their horizontal
+separation is small. PI-NME removes the corresponding ordering
+ambiguity during evaluation, but it does not alter the query-specific
+supervision used during training. A per-image analysis relating
+landmark orientation to localisation error would test whether this
+mechanism contributes to the observed anatomy-dependent performance.
+If supported, orientation-aware canonicalisation or
+permutation-aware training objectives would provide natural
+extensions.
+
+Further experiments could also clarify the effects of dataset scale
+and anatomical variation. A controlled subsampling analysis on
+Multicentre would help distinguish the influence of training-set size
+from source and device diversity, while extending the ablation study
+to a non-head measurement would test whether the strong
+DeconvHeadV2 result and the less conclusive fusion/alignment effects
+generalise beyond BPD.
+
+The implementation and reproduction scripts will be made publicly
+available at
+\url{https://github.com/Flora020703/eomt-landmark-detection}
+upon submission.
+
+
+% =================================================================
+% 6.4 Final Perspective
+% =================================================================
+
+\section{Final Perspective}
+\label{sec:conclusion-closing}
+
+The results of this thesis suggest that strong pretrained visual
+representations alone are not sufficient for precise structured
+localisation. Effective adaptation also requires mechanisms that
+preserve spatial precision while allowing the representation to
+specialise to the structure of the prediction task. QCLand addresses
+this requirement by combining landmark-query interaction with
+query-conditioned spatial decoding.
+
+Across the evaluated fetal biometry tasks, this design is competitive
+with established convolutional and coordinate-classification
+approaches while exhibiting clear anatomy- and dataset-dependent
+behaviour. The broader implication is therefore not that foundation
+models universally replace purpose-built localisation architectures,
+but that their representations can become effective for precise
+anatomical landmark localisation when paired with an appropriate
+task-specific adaptation mechanism.

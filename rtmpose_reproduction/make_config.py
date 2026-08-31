@@ -499,12 +499,11 @@ assert warmup_end_iters == 0 or warmup_end_iters < cosine_begin_epoch * {iters_p
     "LinearLR warmup would still be running when CosineAnnealingLR begins -- "
     "recompute warmup_end_iters/cosine_begin_epoch for this dataset size."
 )
-param_scheduler = [
-    dict(type="LinearLR", start_factor=1e-5, by_epoch=False, begin=0, end=warmup_end_iters),
-    dict(type="CosineAnnealingLR", eta_min={scaled_lr!r} * 0.05, begin=cosine_begin_epoch,
-         end={max_epochs}, T_max={max_epochs} - cosine_begin_epoch,
-         by_epoch=True, convert_to_iter_based=True),
-]
+# Generated as a literal after make_config.py has decided whether a warmup
+# phase actually exists.  In particular, an engineering smoke test with
+# warmup_end_iters=0 must OMIT LinearLR entirely: MMEngine correctly rejects
+# a zero-length scheduler with begin=0,end=0.
+param_scheduler = {param_schedulers!r}
 
 # Round 5 fix: a reviewer's own recorded training-recipe fields, as a real
 # top-level config value (not just local Python variables computed at
@@ -659,6 +658,32 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
                 f"revisit this formula, do not generate an overlapping schedule."
             )
 
+    # Build the scheduler list here, rather than emitting a LinearLR with an
+    # `end` variable and hoping MMEngine treats end=0 as disabled.  MMEngine
+    # 0.10.7 requires end > begin for every scheduler, as the first real
+    # one-epoch Runner smoke test correctly exposed.
+    param_schedulers = []
+    if warmup_end_iters > 0:
+        param_schedulers.append(dict(
+            type="LinearLR", start_factor=1e-5, by_epoch=False,
+            begin=0, end=warmup_end_iters,
+        ))
+    cosine_begin_epoch = max_epochs // 2
+    param_schedulers.append(dict(
+        type="CosineAnnealingLR",
+        eta_min=scaled_lr * 0.05,
+        begin=cosine_begin_epoch,
+        end=max_epochs,
+        T_max=max_epochs - cosine_begin_epoch,
+        by_epoch=True,
+        convert_to_iter_based=True,
+    ))
+
+    assert all(scheduler["end"] > scheduler["begin"]
+               for scheduler in param_schedulers), (
+        f"invalid zero/negative-length scheduler generated: {param_schedulers}"
+    )
+
     text = TEMPLATE.format(
         dataset=dataset, task=task, seed=seed,
         repo_root=repo_root or str(Path(__file__).resolve().parent),
@@ -669,6 +694,7 @@ def make_config(dataset: str, task: str, seed: int, data_root: str,
         batch_size=batch_size, max_epochs=max_epochs, val_interval=val_interval,
         scaled_lr=scaled_lr, iters_per_epoch=iters_per_epoch,
         warmup_end_iters=warmup_end_iters, n_train_images=n_train_images,
+        param_schedulers=param_schedulers,
         work_dir=work_dir,
         d_vect=d_vect_value, fetal_dataset_info=FETAL_DATASET_INFO,
     )

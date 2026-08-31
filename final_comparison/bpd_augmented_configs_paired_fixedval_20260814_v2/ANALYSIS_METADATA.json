@@ -1,0 +1,18 @@
+{
+  "analysis": "paired image-level comparison after five-seed averaging",
+  "deconv_v2_augmentation_training_validation_metric": "fixed-channel NME",
+  "deconv_v2_augmentation_condition": "deconv_v2_rotate_scale_fixedval",
+  "superseded_deconv_v2_augmentation_mean_rejected_pct": 6.9877969,
+  "input_sha256": {
+    "deconv_v2_augmentation_per_image_csv": "655b0a60c66d54dcd7002f3de4a81c241c45a5deaf0638f22c2fb07c42799c40",
+    "frozen_fpn_udp_augmentation_per_image_csv": "fee7240a2252acfc3dda42f6389db76745d93da640b462613ccac3f526824b07"
+  },
+  "input_filenames": {
+    "deconv_v2_augmentation": "ucl_bpd_deconv_v2_rotate_scale_fixedval_per_image.csv",
+    "fpn_udp_augmentation": "ucl_bpd_four_model.csv"
+  },
+  "outputs": [
+    "bpd_augmented_configs_paired_per_image.csv",
+    "bpd_augmented_configs_paired_statistics.tsv"
+  ]
+}

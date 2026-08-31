@@ -1,6 +1,14 @@
 # RTMPose-s final-comparison protocol
 
-Status: **locked by supervisor correspondence, 3 August 2026**.
+Status: **architecture/training protocol locked by supervisor correspondence,
+3 August 2026; external evaluation metric updated by supervisor decision,
+7 August 2026**.
+
+> **Evaluation update (authoritative):** the final primary metric is now
+> permutation-invariant NME for the unordered endpoint pair, applied identically
+> to EoMT, reproduced HRNet, and RTMPose. Historical fixed-channel and endpoint-
+> ordering diagnostics remain audit material only. RTMPose is one method/config
+> family per dataset/task; it is not duplicated into DINOv2/DINOv3 variants.
 
 ## Why RTMPose replaces YOLO-Pose
 
@@ -28,12 +36,17 @@ region without adding a box-prediction task.
 - Primary checkpoint convention: final/last model state, consistent with the
   locked cross-method table.  Any validation metric is diagnostic and must not
   silently change this convention.
-- Primary external metric: per-image **fixed-channel NME**, using exactly the
-  same endpoint distance normalization and reporting code as EoMT/HRNet.
-- Diagnostic metric: swap-min NME from the same predictions.
+- Primary external metric: per-image **permutation-invariant NME** for the
+  unordered endpoint pair: compute direct and crossed assignments and use the
+  lower summed endpoint error, with exactly the same inter-endpoint-distance
+  normalization and aggregation for EoMT, HRNet, and RTMPose.
+- Historical/audit metrics: fixed-channel NME and endpoint-ordering sensitivity
+  diagnostics may still be retained, but are not the final cross-method ranking
+  metric and must not be mixed into the main table.
 - Required outputs: original filename, both predicted endpoint coordinates,
-  both ground-truth endpoint coordinates, fixed-channel NME, swap-min NME,
-  run-level aggregate, configuration, environment audit and checkpoint.
+  both ground-truth endpoint coordinates, permutation-invariant NME (plus any
+  retained audit metrics), run-level aggregate, configuration, environment
+  audit and checkpoint.
 
 RTMPose keeps its native RTMCC/SimCC keypoint objective.  Matching input size,
 split, seeds and external NME does not mean replacing the method's native loss

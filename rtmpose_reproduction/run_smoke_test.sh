@@ -49,6 +49,12 @@
 
 set -euo pipefail
 
+# Required by PyTorch deterministic algorithms for CuBLAS operations on
+# CUDA >= 10.2.  This must be present before the Python training process is
+# launched; otherwise the first RTMCCHead linear layer fails rather than
+# silently using a nondeterministic kernel.
+export CUBLAS_WORKSPACE_CONFIG=:4096:8
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PY="${PY:?set PY to the RTMPose venv python interpreter}"
 DATA_ROOT="${DATA_ROOT:-/root/autodl-tmp}"
@@ -161,18 +167,48 @@ if ! grep -q "InternalFixedChannelNMEHook" "$LOG_FILE"; then
 fi
 echo "  [OK] InternalFixedChannelNMEHook logged at least one line in $LOG_FILE"
 
-# (c) loss is finite -- no nan/inf anywhere in the log's own loss lines, and
-# at least one parseable "loss: <value>" line exists to confirm training
-# actually stepped forward/backward for real.
-if grep -oE "loss[a-zA-Z_]*: [0-9eE.+-]+" "$LOG_FILE" | grep -qiE "nan|inf"; then
-  echo "SMOKE TEST FAILED: a non-finite (nan/inf) loss value appears in $LOG_FILE" >&2
-  exit 1
-fi
-LAST_LOSS="$(grep -oE "loss: [0-9eE.+-]+" "$LOG_FILE" | tail -n1)"
-if [ -z "$LAST_LOSS" ]; then
-  echo "SMOKE TEST FAILED: could not find any 'loss: <value>' line in $LOG_FILE to confirm training actually ran" >&2
-  exit 1
-fi
+# (c) Every logged loss is finite, and at least one aggregate `loss` value
+# exists to prove that a real optimisation step was logged.  Do this in
+# Python rather than a grep pipeline: the old numeric-only grep discarded
+# the strings `nan`/`inf` before attempting to detect them, so its
+# non-finite check could never fire.
+LAST_LOSS="$("$PY" - "$LOG_FILE" <<'PY'
+import math
+import re
+import sys
+from pathlib import Path
+
+log_path = Path(sys.argv[1])
+text = log_path.read_text(encoding="utf-8", errors="replace")
+number = r"[+-]?(?:nan|inf(?:inity)?|(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?)"
+pattern = re.compile(
+    rf"\b(loss(?:_[A-Za-z0-9_]+)?)\s*:\s*({number})\b",
+    flags=re.IGNORECASE,
+)
+matches = [(name, raw, float(raw)) for name, raw in pattern.findall(text)]
+
+if not matches:
+    raise SystemExit(
+        f"SMOKE TEST FAILED: no parseable loss fields were found in {log_path}"
+    )
+
+non_finite = [(name, raw) for name, raw, value in matches if not math.isfinite(value)]
+if non_finite:
+    details = ", ".join(f"{name}: {raw}" for name, raw in non_finite[:10])
+    raise SystemExit(
+        f"SMOKE TEST FAILED: non-finite loss value(s) in {log_path}: {details}"
+    )
+
+aggregate = [(raw, value) for name, raw, value in matches if name.lower() == "loss"]
+if not aggregate:
+    raise SystemExit(
+        f"SMOKE TEST FAILED: component losses were present but no aggregate "
+        f"'loss: <value>' field was found in {log_path}"
+    )
+
+print(f"loss: {aggregate[-1][0]}")
+PY
+)"
 echo "  [OK] last logged '$LAST_LOSS' (finite)"
 
 echo ""

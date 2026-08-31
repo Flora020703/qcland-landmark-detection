@@ -1,199 +1,222 @@
-# Your ViT is Secretly an Image Segmentation Model  
-[![Papers with Code: SOTA on BRAVO (OOD)](https://paperswithcode.co/api/v1/papers/2503.19108/leaderboard-badge.svg?eval=640&live=1)](https://paperswithcode.co/benchmark/bravo-ood?task=image-segmentation&eval=640)
-[![Papers with Code: SOTA on COCO 2017 Panoptic Segmentation](https://paperswithcode.co/api/v1/papers/2503.19108/leaderboard-badge.svg?eval=6260&live=1)](https://paperswithcode.co/benchmark/coco-2017-panoptic-segmentation?task=image-segmentation&eval=6260)
+# QCLand: Query-Conditioned Landmark Localisation
 
+Adapting self-supervised vision foundation models (DINOv2 / DINOv3) to precise
+anatomical landmark localisation in fetal ultrasound biometry, via learned
+landmark-query tokens and a dedicated spatial decoding head, **DeconvHeadV2**.
 
-**CVPR 2025 ✨ Highlight** · [📄 Paper](https://arxiv.org/abs/2503.19108)
-
-**[Tommie Kerssies](https://tommiekerssies.com)<sup>1</sup>, [Niccolò Cavagnero](https://scholar.google.com/citations?user=Pr4XHRAAAAAJ)<sup>2,*</sup>, [Alexander Hermans](https://scholar.google.de/citations?user=V0iMeYsAAAAJ)<sup>3</sup>, [Narges Norouzi](https://scholar.google.com/citations?user=q7sm490AAAAJ)<sup>1</sup>, [Giuseppe Averta](https://www.giuseppeaverta.me/)<sup>2</sup>, [Bastian Leibe](https://scholar.google.com/citations?user=ZcULDB0AAAAJ)<sup>3</sup>, [Gijs Dubbelman](https://scholar.google.nl/citations?user=wy57br8AAAAJ)<sup>1</sup>, [Daan de Geus](https://ddegeus.github.io)<sup>1,3</sup>**
-
-¹ Eindhoven University of Technology  
-² Polytechnic of Turin  
-³ RWTH Aachen University  
-\* Work done while visiting RWTH Aachen University
+This repository contains the implementation, training/evaluation configs, and
+experiment-reproduction scripts for the MSc thesis *"QCLand: Query-Conditioned
+Landmark Localisation with Vision Foundation Models for Fetal Biometry"*
+(UCL Department of Computer Science). The full dissertation, including the
+complete methodology, experimental protocol, and reproducibility appendix, is
+in [`thesis/`](thesis/).
 
 ## Overview
 
-We present the **Encoder-only Mask Transformer (EoMT)**, a minimalist image segmentation model that repurposes a plain Vision Transformer (ViT) to jointly encode image patches and segmentation queries as tokens. No adapters. No decoders. Just the ViT.
+Fetal biometry (e.g. biparietal diameter, occipito-frontal diameter, abdominal
+diameters, femur length) is measured clinically from a pair of anatomical
+landmarks placed by a sonographer on a standard ultrasound plane. Manual
+placement is subject to inter-observer variability, motivating automated
+landmark localisation. Existing automated approaches are largely built on
+task-specific convolutional architectures (e.g. HRNet-based heatmap
+regression, SimCC-based coordinate classification), while self-supervised
+vision foundation models offer general-purpose visual representations learned
+at scale — but adapting them to precise, per-landmark spatial predictions
+without losing localisation accuracy is not straightforward.
 
-Leveraging large-scale pre-trained ViTs, EoMT achieves accuracy similar to state-of-the-art methods that rely on complex, task-specific components. At the same time, it is significantly faster thanks to its simplicity, for example up to 4× faster with ViT-L.  
+**QCLand** (Query-Conditioned Landmark Localisation) addresses this by:
 
-Turns out, *your ViT is secretly an image segmentation model*. EoMT shows that architectural complexity isn't necessary. For segmentation, a plain Transformer is all you need.
+1. Inserting a small number of **learned landmark-query tokens** into a
+   pretrained ViT backbone's token sequence, so each query forms a
+   landmark-specific representation directly through self-attention with the
+   image tokens (no Hungarian matching — landmark identity is fixed, unlike
+   the variable-cardinality instance segmentation setting this mechanism is
+   adapted from).
+2. Decoding each query's representation into a landmark heatmap with a new
+   spatial decoding head, **DeconvHeadV2** — a FiLM-conditioned convolutional
+   decoder that replaces the inherited per-pixel query–feature dot product
+   with an explicit local spatial-processing path.
+3. Instantiating the framework with two self-supervised backbone generations,
+   **DINOv2** and **DINOv3** (`QCLand-DINOv2`, `QCLand-DINOv3`), trained
+   end-to-end (no frozen backbone) with layer-wise learning-rate decay.
 
-## 🚀 NEW: PMT 
+The query-in-encoder mechanism is adapted from the Encoder-only Mask
+Transformer (EoMT — Kerssies et al., CVPR 2025), a semantic/instance/panoptic
+segmentation architecture; this repository builds on the
+[official EoMT implementation](https://github.com/tue-mps/eomt) and
+re-purposes its encoder-query mechanism for fixed-cardinality landmark
+detection instead of variable-cardinality segmentation.
 
-Presenting our latest model, [PMT: Plain Mask Transformer for Image and Video Segmentation with Frozen Vision Encoders](https://arxiv.org/abs/2603.25398).
+## Key results
 
-PMT reconciles EoMT minimal philosophy with the need of preserving the features of frozen Foundation Models, by mimicking the last layers of EoMT and VidEoMT with a simple and fast decoder.
+QCLand is evaluated on five fetal biometric measurements — biparietal
+diameter (BPD), occipito-frontal diameter (OFD), transverse and
+anteroposterior abdominal diameter (TAD, APAD), and femur length (FL) —
+across the UCL and pooled Multicentre datasets, against locally reproduced
+HRNet-W18 and RTMPose-s baselines, under a common evaluation protocol
+(matched input resolution, five training seeds, common image subsets,
+original-image-space permutation-invariant NME, paired bootstrap + Wilcoxon
+statistical testing with Holm correction).
 
-Take a [look](https://github.com/tue-mps/pmt)!
+| Dataset | Task | QCLand-DINOv2 | QCLand-DINOv3 | HRNet-W18 | RTMPose-s |
+|---|---|---|---|---|---|
+| UCL | BPD | 5.92 ± 0.66 | **5.14 ± 0.61** | 5.51 ± 0.46 | 11.31 ± 0.86 |
+| UCL | OFD | 3.94 ± 0.55 | **3.75 ± 0.09** | 4.59 ± 0.49 | 9.12 ± 1.60 |
+| UCL | APAD | 6.50 ± 1.15 | **5.34 ± 0.66** | 7.33 ± 1.30 | 16.56 ± 0.91 |
+| UCL | TAD | 9.32 ± 1.33 | **6.47 ± 0.86** | 6.74 ± 0.98 | 18.98 ± 1.76 |
+| UCL | FL | 1.61 ± 0.11 | **1.53 ± 0.15** | 1.99 ± 0.41 | 17.83 ± 1.53 |
+| Multicentre | BPD | 6.90 ± 0.17 | 6.09 ± 0.19 | **4.68 ± 0.17** | 6.15 ± 0.15 |
+| Multicentre | OFD | 6.13 ± 0.45 | 5.73 ± 0.68 | **4.78 ± 0.17** | 5.66 ± 0.10 |
+| Multicentre | APAD | **6.99 ± 0.23** | 7.11 ± 0.21 | 8.89 ± 0.19 | 8.89 ± 0.37 |
+| Multicentre | TAD | 8.82 ± 0.90 | **8.71 ± 0.54** | 8.75 ± 0.33 | 9.22 ± 0.32 |
+| Multicentre | FL | 2.78 ± 0.11 | **2.71 ± 0.13** | 2.93 ± 0.32 | 4.95 ± 0.49 |
 
-## 🚀 NEW: VidEoMT 
+*Five-seed mean ± sample SD, permutation-invariant NME (%), lower is better,
+bold = lowest mean per row. Full paired significance results (bootstrap CIs,
+Wilcoxon, Holm-60) are in
+[`final_comparison/four_model_freeze_20260812_v1/`](final_comparison/four_model_freeze_20260812_v1/)
+and `thesis/chapters/05_results.tex`.*
 
-🔥 We're pleased to present our latest CVPR 2026 paper, [VidEoMT: Your ViT is Secretly Also a Video Segmentation Model](https://arxiv.org/abs/2602.17807).
+A QCLand variant records the lowest mean PI-NME in 8 of the 10
+dataset–measurement settings, with QCLand-DINOv3 lowest on all five UCL
+measurements. HRNet-W18 retains a clear advantage on the two Multicentre head
+measurements (BPD, OFD). A staged ablation on BPD further shows that
+replacing the inherited dot-product decoder with DeconvHeadV2 produces the
+largest single reduction in localisation error among the evaluated
+architectural changes. See `thesis/chapters/05_results.tex` and the
+conclusion (`thesis/chapters/07_conclusion.tex`) for the full, appropriately
+qualified findings — the advantages above are task- and dataset-dependent,
+not universal.
 
-VidEoMT extends EoMT philosophy to the temporal domain, introducing an encoder-only video segmentation model that is up to 10x faster than competitors.
+## Repository structure
 
-Go check it [out](https://github.com/tue-mps/videomt)! 
+```
+models/                    QCLand / EoMT-derived model definitions (ViT backbone,
+                           query-conditioned architecture, DeconvHeadV2, ScaleBlock)
+training/                  Lightning modules, losses, LR schedules, EMA
+datasets/                  Dataset classes (UCL/Multicentre landmark data,
+                           300W, ADE20K/COCO/Cityscapes from the base EoMT repo)
+configs/landmark/          YAML configs for every landmark-detection run
+                           (per measurement, backbone, and ablation condition)
+main_landmark.py           CLI entry point for landmark training/testing
+                           (python main_landmark.py fit|test --config ...)
+main.py                    Original EoMT segmentation entry point (inherited)
 
+ablation/scripts/          Driver scripts for the BPD development ablation
+                           chain, five-seed reruns, and cross-anatomy sweeps
+baseline_reproduction/     Locally reproduced HRNet-W18 baseline: patches,
+                           configs, and provenance for running the upstream
+                           BiometryNet training code on this project's data
+rtmpose_reproduction/      Locally reproduced RTMPose-s baseline: locked
+                           protocol, generated MMEngine configs, provenance
+endpoint_ordering_analysis/  Endpoint-canonicalisation / correspondence checks
+final_comparison/          Frozen four-model comparison: paired statistics,
+                           per-image results, SHA-256-manifested evidence
 
-## 🚀 NEW: DINOv3 Support
-
-🔥 We're excited to announce support for **DINOv3** backbones! Our new DINOv3-based EoMT models deliver improved performance across all segmentation tasks:
-
-- **Panoptic Segmentation**: Up to 58.9 PQ on COCO with EoMT-L at 1280×1280
-- **Instance Segmentation**: Up to 49.9 mAP on COCO with EoMT-L at 1280×1280  
-- **Semantic Segmentation**: Up to 59.5 mIoU on ADE20K with EoMT-L at 512×512
-
-All of this, at the impressive speed of EoMT!
-
-Check out our [DINOv3 Model Zoo](model_zoo/dinov3.md) for all available EoMT configurations and performance benchmarks.
-
-Thanks to the [DINOv3](https://github.com/facebookresearch/dinov3) team for providing these powerful foundation models!
-
-## 🤗 Transformers
-
-EoMT with DINOv2 is also available on [Hugging Face Transformers](https://huggingface.co/docs/transformers/main/model_doc/eomt). See available models [here](https://huggingface.co/models?library=transformers&other=eomt&sort=trending).
-
-## Installation
-
-If you don't have Conda installed, install Miniconda and restart your shell:
-
-```bash
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh
+thesis/                    Full LaTeX thesis source (chapters, figures,
+                           bibliography) and the reproducibility appendix
 ```
 
-Then create the environment, activate it, and install the dependencies:
+## Setup
 
 ```bash
-conda create -n eomt python==3.13.2
-conda activate eomt
-python3 -m pip install -r requirements.txt
+git clone https://github.com/Flora020703/qcland.git
+cd qcland
+pip install -r requirements.txt
 ```
 
-[Weights & Biases](https://wandb.ai/) (wandb) is used for experiment logging and visualization. To enable wandb, log in to your account:
-
-```bash
-wandb login
-```
-
-## Data preparation
-
-Download the datasets below depending on which datasets you plan to use.  
-You do **not** need to unzip any of the downloaded files.  
-Simply place them in a directory of your choice and provide that path via the `--data.path` argument.  
-The code will read the `.zip` files directly.
-
-**COCO**
-```bash
-wget http://images.cocodataset.org/zips/train2017.zip
-wget http://images.cocodataset.org/zips/val2017.zip
-wget http://images.cocodataset.org/annotations/annotations_trainval2017.zip
-wget http://images.cocodataset.org/annotations/panoptic_annotations_trainval2017.zip
-```
-
-**ADE20K**
-```bash
-wget http://data.csail.mit.edu/places/ADEchallenge/ADEChallengeData2016.zip
-wget http://sceneparsing.csail.mit.edu/data/ChallengeData2017/annotations_instance.tar
-tar -xf annotations_instance.tar
-zip -r -0 annotations_instance.zip annotations_instance/
-rm -rf annotations_instance.tar
-rm -rf annotations_instance
-```
-
-**Cityscapes**
-```bash
-wget --keep-session-cookies --save-cookies=cookies.txt --post-data 'username=<your_username>&password=<your_password>&submit=Login' https://www.cityscapes-dataset.com/login/
-wget --load-cookies cookies.txt --content-disposition https://www.cityscapes-dataset.com/file-handling/?packageID=1
-wget --load-cookies cookies.txt --content-disposition https://www.cityscapes-dataset.com/file-handling/?packageID=3
-```
-
-🔧 Replace `<your_username>` and `<your_password>` with your actual [Cityscapes](https://www.cityscapes-dataset.com/) login credentials.  
+Training was run on an AutoDL-hosted NVIDIA RTX 4090 (PyTorch 2.7,
+CUDA 12.6); local CPU/WSL2 was used only for data-loading and pipeline
+debugging. The HRNet-W18 and RTMPose-s baselines each require their own
+separate environment — see
+[`baseline_reproduction/`](baseline_reproduction/) and
+[`rtmpose_reproduction/`](rtmpose_reproduction/) respectively for exact
+pinned versions and setup steps.
 
 ## Usage
 
-### Training
-
-To train EoMT from scratch, run:
+Train a QCLand configuration:
 
 ```bash
-python3 main.py fit \
-  -c configs/dinov2/coco/panoptic/eomt_large_640.yaml \
-  --trainer.devices 4 \
-  --data.batch_size 4 \
-  --data.path /path/to/dataset
+python main_landmark.py fit --config configs/landmark/bpd_deconv_v2_fpn_udp.yaml
 ```
 
-This command trains the `EoMT-L` model with a 640×640 input size on COCO panoptic segmentation using 4 GPUs. Each GPU processes a batch of 4 images, for a total batch size of 16. Switch to ```dinov3``` in the configuration path to enable the corresponding DINOv3 model.
-
-✅ Make sure the total batch size is `devices × batch_size = 16`  
-🔧 Replace `/path/to/dataset` with the directory containing the dataset zip files.
-
-> This configuration takes ~6 hours on 4×NVIDIA H100 GPUs, each using ~26GB VRAM.
-
-To fine-tune a pre-trained EoMT model, add:
+Evaluate a trained checkpoint:
 
 ```bash
-  --model.ckpt_path /path/to/pytorch_model.bin \
-  --model.load_ckpt_class_head False
+python main_landmark.py test \
+  --config configs/landmark/bpd_deconv_v2_fpn_udp.yaml \
+  --ckpt_path path/to/checkpoint.ckpt
 ```
 
-🔧 Replace `/path/to/pytorch_model.bin` with the path to the checkpoint to fine-tune.  
-> `--model.load_ckpt_class_head False` skips loading the classification head when fine-tuning on a dataset with different classes.
+Every reported result in the thesis has a corresponding config under
+`configs/landmark/` and, for the five-seed/ablation results, a driver script
+under `ablation/scripts/` that trains, evaluates, and aggregates across the
+five fixed seeds (42, 0, 123, 2024, 3407) used throughout this thesis.
 
-> **DINOv3 Models**: When using DINOv3-based configurations, the code expects delta weights relative to DINOv3 weights by default. To disable this behavior and use absolute weights instead, add `--model.delta_weights False`. 
+## Data
 
-### Evaluating
+This project uses the pooled Multicentre fetal-biometry benchmark (UCL, FP,
+and HC18 cohorts) released by Di Vece et al., licensed under
+CC BY-NC-SA 4.0. **No dataset images or annotations are redistributed in this
+repository** — see `thesis/chapters/04_experimental_setup.tex` (Section on
+data sources, ethics, and licensing) for the data access procedure, and
+`thesis/chapters/appendix_a_reproducibility.tex` for full licensing and
+provenance detail.
 
-To evaluate a pre-trained EoMT model, run:
+## Reproducibility
 
-```bash
-python3 main.py validate \
-  -c configs/dinov2/coco/panoptic/eomt_large_640.yaml \
-  --model.network.masked_attn_enabled False \
-  --trainer.devices 4 \
-  --data.batch_size 4 \
-  --data.path /path/to/dataset \
-  --model.ckpt_path /path/to/pytorch_model.bin
-```
+Every formally reported result in the thesis is backed by an evidence trail
+in this repository:
 
-This command evaluates the same `EoMT-L` model using 4 GPUs with a batch size of 4 per GPU.
-
-🔧 Replace `/path/to/dataset` with the directory containing the dataset zip files.  
-🔧 Replace `/path/to/pytorch_model.bin` with the path to the checkpoint to evaluate.
-
-A [notebook](inference.ipynb) is available for quick inference and visualization with auto-downloaded pre-trained models.
-
-> **DINOv3 Models**: When using DINOv3-based configurations, the code expects delta weights relative to DINOv3 weights by default. To disable this behavior and use absolute weights instead, add `--model.delta_weights False`. 
-
-## Model Zoo
-
-We provide pre-trained weights for both DINOv2- and DINOv3-based EoMT models.
-
-- **[DINOv2 Models](model_zoo/dinov2.md)** - Original published results and pre-trained weights.
-- **[DINOv3 Models](model_zoo/dinov3.md)** - New DINOv3-based models and pre-trained weights.
+- **[`final_comparison/`](final_comparison/)** — the frozen four-model
+  comparison (checksummed TSVs, per-image scores, bootstrap/Wilcoxon/Holm
+  statistics) and the BPD development-chain evidence matrix.
+- **[`configs/landmark/`](configs/landmark/)** and
+  **[`ablation/scripts/`](ablation/scripts/)** — the exact configuration and
+  driver script behind every reported checkpoint.
+- **[`baseline_reproduction/`](baseline_reproduction/)** and
+  **[`rtmpose_reproduction/`](rtmpose_reproduction/)** — audited,
+  version-pinned reproductions of the HRNet-W18 and RTMPose-s baselines.
+- **`thesis/chapters/appendix_a_reproducibility.tex`** — software/hardware
+  environments, seeding methodology, and the authoritative per-run
+  configuration convention for all three trained model families.
 
 ## Citation
-If you find this work useful in your research, please cite it using the BibTeX entry below:
 
-```BibTeX
+If you use this code, please cite the thesis:
+
+```bibtex
+@mastersthesis{xu2026qcland,
+  title  = {QCLand: Query-Conditioned Landmark Localisation with Vision Foundation Models for Fetal Biometry},
+  author = {Xu, Nan},
+  school = {University College London},
+  year   = {2026}
+}
+```
+
+This work adapts the query-in-encoder mechanism from:
+
+```bibtex
 @inproceedings{kerssies2025eomt,
-  author    = {Kerssies, Tommie and Cavagnero, Niccol\`{o} and Hermans, Alexander and Norouzi, Narges and Averta, Giuseppe and Leibe, Bastian and Dubbelman, Gijs and {de Geus}, Daan},
-  title     = {{Your ViT is Secretly an Image Segmentation Model}},
-  booktitle = {Proceedings of the IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR)},
-  year      = {2025},
+  title     = {Your ViT is Secretly an Image Segmentation Model},
+  author    = {Kerssies, Tommie and Cavagnero, Niccol{\`o} and Hermans, Alexander and Norouzi, Narges and Averta, Giuseppe and Leibe, Bastian and Dubbelman, Gijs and de Geus, Daan},
+  booktitle = {CVPR},
+  year      = {2025}
 }
 ```
 
 ## Acknowledgements
 
-This project builds upon code from the following libraries and repositories:
+Supervised by Dr. Zhehua Mao and Dr. Sophia Bano (SRV Group, UCL). Built on
+the official [EoMT](https://github.com/tue-mps/eomt) implementation (MIT
+licensed, Mobile Perception Systems Lab, TU Eindhoven); the HRNet-W18
+baseline is reproduced from the original
+[BiometryNet / Multicentre-Fetal-Biometry](https://github.com/surgical-vision/Multicentre-Fetal-Biometry)
+release by Di Vece et al.; the RTMPose-s baseline is reproduced from
+[OpenMMLab MMPose](https://github.com/open-mmlab/mmpose).
 
-- [Hugging Face Transformers](https://github.com/huggingface/transformers) (Apache-2.0 License)  
-- [PyTorch Image Models (timm)](https://github.com/huggingface/pytorch-image-models) (Apache-2.0 License)  
-- [PyTorch Lightning](https://github.com/Lightning-AI/pytorch-lightning) (Apache-2.0 License)  
-- [TorchMetrics](https://github.com/Lightning-AI/torchmetrics) (Apache-2.0 License)  
-- [Mask2Former](https://github.com/facebookresearch/Mask2Former) (Apache-2.0 License)
-- [Detectron2](https://github.com/facebookresearch/detectron2) (Apache-2.0 License)
+## License
+
+MIT — see [`LICENSE`](LICENSE). This project retains the original license and
+copyright notice from the upstream EoMT repository it is built on.

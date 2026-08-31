@@ -1,5 +1,13 @@
 # RTMPose-s adapter (UCL + Multicentre, two-endpoint fetal measurements)
 
+> **Current evaluation decision (supervisor, 2026-08-07):** RTMPose produces
+> one measurement-specific model family per dataset/task, not DINOv2/DINOv3
+> variants. Its final result uses the same permutation-invariant NME as EoMT
+> and reproduced HRNet, treating the two endpoints as an unordered pair.
+> Fixed-channel, x-sort and DOD outputs below are retained only as engineering
+> or historical diagnostics where useful; older passages describing the final
+> endpoint convention as awaiting confirmation are superseded.
+
 Implements `PROTOCOL_LOCKED.md`, confirmed by the supervisor's email (RTMPose-s,
 backbone-only pretrained init, `sigma=(8.0,8.0)` extrapolation, direct
 non-aspect-preserving 512x512 resize with the pixel-centre convention,
@@ -74,10 +82,11 @@ trusting canary output:
   anisotropic 512x512 resize (this project's own first, incorrect design)
   would silently diverge from HRNet's real behaviour for non-square source
   images. See `PROTOCOL_AUDIT.md` for the full derivation.
-- **Evaluator**: identical fixed-channel/swap-min formula as
-  `baseline_reproduction/evaluate_hrnet_fixed.py`, so RTMPose and HRNet
-  numbers are computed by the same code, not parallel reimplementations
-  that could quietly diverge.
+- **Evaluator**: the final cross-method metric is permutation-invariant NME,
+  i.e. the lower-error direct/crossed assignment for the unordered endpoint
+  pair, with identical normalization and aggregation for RTMPose, EoMT and
+  reproduced HRNet. Existing fixed-channel/swap-min tests remain useful
+  engineering checks, but fixed-channel is no longer the main result.
 - **Train-only internal validation split** (`make_internal_val_split.py`),
   reusing EoMT's own exact algorithm -- the released Test set is never read
   during training, only once, after training, by `run_inference.py`.
@@ -86,19 +95,17 @@ trusting canary output:
   to endpoint-order instability for near-vertical diameters. Enabling
   RTMPose's own `flip_test` would reintroduce exactly that failure mode.
 
-## Still genuinely open (not resolved by this session, needs the supervisor)
+## Historical endpoint-ordering issue (resolved for final evaluation)
 
 **EoMT does not share RTMPose/HRNet's endpoint-ordering convention.**
 RTMPose and HRNet both use a learned, per-(dataset,task) direction vector
 (`d_vect`); EoMT uses a per-sample x-coordinate sort. These are
 mathematically different rules that disagree on 0-100% of images depending
-on the task (quantified in `PROTOCOL_AUDIT.md`). This cannot be resolved
-by retraining EoMT (its 5-seed results are already locked/reported) without
-a separate decision from the supervisor about which of two paths to take
-(method-native training + common external evaluator, vs. a new offline
-re-canonicalisation of all three methods' raw predictions). Do not describe
-the three methods as sharing one ordering convention in any canary report
-or thesis text until this is explicitly settled.
+on the task (quantified in `PROTOCOL_AUDIT.md`). The methods therefore must
+not be described as sharing one training-channel convention. This no longer
+blocks the final comparison: the supervisor defined the reported endpoint
+pair as unordered and selected one common permutation-invariant evaluator
+for all methods. Ordering analyses remain audit/history, not the main metric.
 
 ## Usage
 
@@ -113,5 +120,5 @@ bash rtmpose_reproduction/run_rtmpose_canary.sh
 Stops after the canary. Do not write a 50-run driver or start the five-seed
 sweep until the canary's numbers have been reviewed and shared with the
 supervisor, per `PROTOCOL_LOCKED.md` and the supervisor's own email -- and
-until the still-open endpoint-ordering-convention question above has been
-raised and answered.
+only after the seed-42 result and retained per-image predictions have been
+reviewed.

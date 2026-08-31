@@ -47,13 +47,15 @@ def decode_batch_low_level(model, data: dict, device: str):
     inverse -- callers needing original-image coordinates should follow
     this with `to_original_image_space()` below.
 
-    ASSUMPTIONS (same as run_inference.py's own docstring, repeated here
-    since this is the shared implementation both files depend on):
+    LIVE-VERIFIED CONTRACT (same as run_inference.py's own path, repeated
+    here since this is the shared implementation both files depend on):
       1. `model.data_preprocessor({"inputs": [...], "data_samples": [...]}, False)`
          is the correct call contract for a single manually-collated sample.
-      2. `model.head.decode(head_output)` (or the codec's own `.decode()`)
-         returns coordinates in the codec's `input_size` (512x512) space,
-         not already bbox-inverse-transformed.
+      2. In MMPose 1.3.2, `model.head.decode(head_output)` returns one
+         prediction InstanceData object per batch element, rather than a
+         `(coordinates, scores)` tuple.  Its `keypoints` remain in codec
+         input space because this low-level path never calls the estimator's
+         bbox-aware `predict()` post-processing.
     """
     data_sample = data["data_samples"]
     batch = model.data_preprocessor(
@@ -64,13 +66,36 @@ def decode_batch_low_level(model, data: dict, device: str):
     feats = model.extract_feat(inputs)
     head_output = model.head.forward(feats)
 
-    if hasattr(model.head, "decode"):
-        model_space_coords, _scores = model.head.decode(head_output)
-    else:
-        from mmpose.codecs import build_codec  # type: ignore
-        model_space_coords, _scores = build_codec(model.head.decoder).decode(*head_output)
+    predictions = model.head.decode(head_output)
+    if not isinstance(predictions, (list, tuple)) or len(predictions) != 1:
+        raise RuntimeError(
+            "expected RTMCCHead.decode() to return exactly one prediction "
+            f"for the manually constructed one-sample batch, got "
+            f"{type(predictions).__name__} with length "
+            f"{len(predictions) if hasattr(predictions, '__len__') else 'unknown'}"
+        )
 
-    return np.asarray(model_space_coords).reshape(2, 2)
+    prediction = predictions[0]
+    if not hasattr(prediction, "keypoints"):
+        raise RuntimeError(
+            "RTMCCHead.decode() prediction has no `keypoints` field; the "
+            "installed MMPose decode contract differs from the pinned "
+            "MMPose 1.3.2 contract"
+        )
+
+    model_space_coords = prediction.keypoints
+    if hasattr(model_space_coords, "detach"):
+        model_space_coords = model_space_coords.detach().cpu().numpy()
+    model_space_coords = np.asarray(model_space_coords)
+    if model_space_coords.size != 4:
+        raise RuntimeError(
+            "expected exactly two decoded 2-D keypoints, got array shape "
+            f"{model_space_coords.shape}"
+        )
+    model_space_coords = model_space_coords.reshape(2, 2)
+    if not np.isfinite(model_space_coords).all():
+        raise RuntimeError("decoded model-space keypoints contain NaN or Inf")
+    return model_space_coords
 
 
 def to_original_image_space(model_space_coords, width: float, height: float,

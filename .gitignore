@@ -135,6 +135,7 @@ celerybeat.pid
 
 # Environments
 .env
+outputs/
 .venv
 env/
 venv/
@@ -185,3 +186,28 @@ annotations/
 *.csv
 *.pth
 data/
+
+# --- Repo hygiene: this repo publishes source code and reproducibility
+# evidence (scripts, configs, small TSV/JSON summaries) only. Personal
+# working notes, reference PDFs, generated archives, and secrets never
+# get pushed. ---
+/docs/
+/CLAUDE.md
+/EoMT_Landmark_Detection_Full_Chronological_Summary_2026-07-21.md
+/2512.16710v2.pdf
+/MSc_project-Bilal Sidiqi.pdf
+/generate_image.py
+/.env.example
+/.env.save
+/.env.save.*
+/thesis.zip
+/thesis_overleaf_upload.zip
+/thesis 初稿*.zip
+*.tar
+*.tar.gz
+final_comparison/eomt_reuse_audit.md
+final_comparison/FOUR_MODEL_FINAL_RESULTS_20260812.md
+final_comparison/rtmpose_seed42_overlay_review/
+.claude/
+.agents/
+.venv-eomt/
