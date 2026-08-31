@@ -6,6 +6,7 @@ Run from the eomt/ directory:
     python scripts/test_dataload.py ade20k    # segmentation only
     python scripts/test_dataload.py landmark  # landmark only
 """
+import os
 import sys
 from pathlib import Path
 
@@ -84,9 +85,11 @@ def test_landmark():
     """Smoke-test HeadLandmarkDataModule + LandmarkDataset."""
     from datasets.landmark_dataset import HeadLandmarkDataModule, generate_heatmap
 
-    _win = Path("d:/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
-    _wsl = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
-    DATA_BASE = _win if _win.exists() else _wsl
+    # Set QCLAND_UCL_DATA_ROOT to your local copy of the Multicentre
+    # Fetal Biometry dataset to run this smoke test outside the training server.
+    DATA_BASE = Path(os.environ.get(
+        "QCLAND_UCL_DATA_ROOT", "<LOCAL_DATA_ROOT>/MultiCentre-Fetal-Biometry-2025"
+    ))
     IMAGES_DIR    = DATA_BASE / "images" / "UCL" / "Head"
     TRAIN_CSV     = DATA_BASE / "annotations" / "UCL" / "Head_Train.csv"
     TEST_CSV      = DATA_BASE / "annotations" / "UCL" / "Head_Test.csv"
@@ -327,10 +330,12 @@ def test_face300w():
         Face300WDataModule, FLIP_PAIRS_68, INTER_OCULAR_PAIR, _load_pts,
     )
 
-    _win    = Path("D:/download/Project coding/msc/300w")
-    _wsl    = Path("/mnt/d/download/Project coding/msc/300w")
+    # Set QCLAND_300W_DATA_ROOT to your local copy of 300W to run this
+    # smoke test outside the training server.
+    _local  = os.environ.get("QCLAND_300W_DATA_ROOT")
     _server = Path("/root/autodl-tmp/300W/300w")
-    DATA_ROOT = next((p for p in (_win, _wsl, _server) if p.exists()), _server)
+    _candidates = ([Path(_local)] if _local else []) + [_server]
+    DATA_ROOT = next((p for p in _candidates if p.exists()), _server)
 
     print("\n" + "=" * 60)
     print("300W SMOKE-TEST")
@@ -492,17 +497,20 @@ def test_multicentre():
     import re as _re
     from datasets.multicentre_dataset import MulticentreLandmarkDataModule
 
-    _win    = Path("D:/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
-    _wsl    = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025")
-    # MODIFIED: was "/root/autodl-tmp/MultiCentre-Fetal-Biometry-2025" -- did
-    # not match how the config/ablation script actually reference the data
-    # (images_dir=/root/autodl-tmp/images/MULTICENTRE/<Anatomy>, no
+    # Set QCLAND_UCL_DATA_ROOT to your local copy of the Multicentre
+    # Fetal Biometry dataset to run this smoke test outside the training
+    # server.
+    # MODIFIED: server default was "/root/autodl-tmp/MultiCentre-Fetal-Biometry-2025"
+    # -- did not match how the config/ablation script actually reference the
+    # data (images_dir=/root/autodl-tmp/images/MULTICENTRE/<Anatomy>, no
     # intermediate "MultiCentre-Fetal-Biometry-2025" directory on the
     # server), so this check would have silently looked in the wrong place
     # after following the deployment instructions literally (caught in
     # review, 2026-07-24, before ever running on the server).
+    _local  = os.environ.get("QCLAND_UCL_DATA_ROOT")
     _server = Path("/root/autodl-tmp")
-    DATA_ROOT = next((p for p in (_win, _wsl, _server) if p.exists()), _server)
+    _candidates = ([Path(_local)] if _local else []) + [_server]
+    DATA_ROOT = next((p for p in _candidates if p.exists()), _server)
 
     print("\n" + "=" * 60)
     print("MULTICENTRE SMOKE-TEST")

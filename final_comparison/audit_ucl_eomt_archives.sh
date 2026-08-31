@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BACKUP_DIR="${1:-/mnt/d/download/Project coding/EOMT/checkpoint_backups}"
+# Pass the backup directory as $1, or set it below for your own machine.
+BACKUP_DIR="${1:-<LOCAL_DATA_ROOT>/checkpoint_backups}"
 
 if [[ ! -d "$BACKUP_DIR" ]]; then
   echo "ERROR: backup directory not found: $BACKUP_DIR" >&2

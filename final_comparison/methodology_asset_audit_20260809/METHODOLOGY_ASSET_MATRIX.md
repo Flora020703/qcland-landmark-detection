@@ -39,8 +39,8 @@ The evaluator must read the saved YAML for every run. Pre-UDP einsum/Deconv/FPN 
 
 Two unarchived local checkpoints were inspected:
 
-- `/mnt/d/download/Project coding/EOMT/epoch=4-step=125.ckpt` is a 150-class semantic-segmentation checkpoint (`num_classes=150`, segmentation mask/class heads), not a fetal-landmark methodology asset. Its neighbouring `metrics.csv` is likewise a segmentation log and must be excluded from this audit.
-- `/mnt/d/download/Project coding/EOMT/run2_best.ckpt` is confirmed by its datamodule metadata as UCL BPD (`Head_Train.csv`/`Head_Test.csv`), 512-to-64, sigma 4, validation split seed 42, and by its state dict as the original class/mask-head (einsum-style) landmark model with no Deconv/FPN keys. It is a validation-best checkpoint at epoch 109 (`val_nme=0.1768`), not a final checkpoint. The embedded metadata still does not establish the training seed, full loss configuration, or a final-checkpoint counterpart. It is useful historical provenance but cannot serve as the five-seed final-checkpoint core rung.
+- `<LOCAL_DATA_ROOT>/epoch=4-step=125.ckpt` is a 150-class semantic-segmentation checkpoint (`num_classes=150`, segmentation mask/class heads), not a fetal-landmark methodology asset. Its neighbouring `metrics.csv` is likewise a segmentation log and must be excluded from this audit.
+- `<LOCAL_DATA_ROOT>/run2_best.ckpt` is confirmed by its datamodule metadata as UCL BPD (`Head_Train.csv`/`Head_Test.csv`), 512-to-64, sigma 4, validation split seed 42, and by its state dict as the original class/mask-head (einsum-style) landmark model with no Deconv/FPN keys. It is a validation-best checkpoint at epoch 109 (`val_nme=0.1768`), not a final checkpoint. The embedded metadata still does not establish the training seed, full loss configuration, or a final-checkpoint counterpart. It is useful historical provenance but cannot serve as the five-seed final-checkpoint core rung.
 
 The second checkpoint no longer blocks the asset identification audit, but it does not remove the need for a controlled five-seed final-checkpoint einsum rung if that rung is retained in the formal core table.
 

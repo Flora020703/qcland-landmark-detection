@@ -15,6 +15,7 @@
 #   python3 scripts/verify_rotation_augment_pipeline.py
 # ---------------------------------------------------------------
 
+import os
 import sys
 from pathlib import Path
 
@@ -26,10 +27,12 @@ from PIL import Image, ImageDraw
 
 from datasets.landmark_dataset import HeadLandmarkDataModule
 
-# MODIFIED: local Windows/WSL data paths (see CLAUDE.md) — override if run elsewhere.
-IMAGES_DIR = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025/images/UCL/Head")
-ANN_TRAIN_CSV = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025/annotations/UCL/Head_Train.csv")
-ANN_TEST_CSV = Path("/mnt/d/download/Project coding/msc/Muti/MultiCentre-Fetal-Biometry-2025/annotations/UCL/Head_Test.csv")
+# Set QCLAND_UCL_DATA_ROOT to your local copy of the Multicentre Fetal
+# Biometry dataset to run this script.
+_DATA_ROOT = Path(os.environ.get("QCLAND_UCL_DATA_ROOT", "<LOCAL_DATA_ROOT>/MultiCentre-Fetal-Biometry-2025"))
+IMAGES_DIR = _DATA_ROOT / "images" / "UCL" / "Head"
+ANN_TRAIN_CSV = _DATA_ROOT / "annotations" / "UCL" / "Head_Train.csv"
+ANN_TEST_CSV = _DATA_ROOT / "annotations" / "UCL" / "Head_Test.csv"
 OUT_DIR = Path("docs/static")
 
 
