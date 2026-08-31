@@ -197,7 +197,7 @@ if [[ "${CANARY_ONLY:-0}" == "1" ]]; then
 fi
 
 [[ ! -e "$AGG_ROOT" ]] || { echo "[ERROR] aggregation output already exists: $AGG_ROOT"; exit 1; }
-"$PYTHON_BIN" endpoint_ordering_analysis/aggregate_bpd_deconv_v2_rotate_scale.py \
+"$PYTHON_BIN" landmark_ordering_analysis/aggregate_bpd_deconv_v2_rotate_scale.py \
   --run-root "$RUN_ROOT" --images-root /root/autodl-tmp/images/UCL \
   --condition-name "$CONDITION_NAME" --output-root "$AGG_ROOT"
 

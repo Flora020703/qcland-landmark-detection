@@ -109,7 +109,7 @@ baseline_reproduction/     Locally reproduced HRNet-W18 baseline: patches,
                            BiometryNet training code on this project's data
 rtmpose_reproduction/      Locally reproduced RTMPose-s baseline: locked
                            protocol, generated MMEngine configs, provenance
-endpoint_ordering_analysis/  Endpoint-canonicalisation / correspondence checks
+landmark_ordering_analysis/  Landmark-canonicalisation / correspondence checks
 final_comparison/          Frozen four-model comparison: paired statistics,
                            per-image results, SHA-256-manifested evidence
 

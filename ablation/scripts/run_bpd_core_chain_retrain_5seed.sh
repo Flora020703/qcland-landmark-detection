@@ -34,7 +34,7 @@
 #
 # All 3 rungs use pixel_center_align=False (unset, defaults False in
 # datasets/landmark_dataset.py) -- this predates the UDP fix. Score with
-# endpoint_ordering_analysis/rescore_endpoint_conventions.py's
+# landmark_ordering_analysis/rescore_landmark_conventions.py's
 # load_eomt_per_image(..., pixel_center_align=False), NOT the module
 # default (True), or every recovered coordinate will be silently wrong by
 # a constant offset (see that function's own 2026-08-09 docstring finding).
@@ -296,13 +296,13 @@ echo "Per-run native (fixed-channel, model's own reported) NME in ${RESULTS_TSV}
 echo "This is NOT the number to report -- re-score every rung with the SAME"
 echo "permutation-invariant evaluator as the official comparison:"
 echo ""
-echo "  python3 endpoint_ordering_analysis/aggregate_bpd_core_chain.py \\"
+echo "  python3 landmark_ordering_analysis/aggregate_bpd_core_chain.py \\"
 echo "      --eomt-root ${BACKUP_ROOT} \\"
 echo "      --images-root /root/autodl-tmp/images/UCL \\"
-echo "      --output-root endpoint_ordering_analysis/results/bpd_core_chain"
+echo "      --output-root landmark_ordering_analysis/results/bpd_core_chain"
 echo ""
 echo "(script to be added -- reuses load_eomt_per_image(pixel_center_align=False)"
-echo "+ rescore_cell()/summarize_and_write() from rescore_endpoint_conventions.py,"
+echo "+ rescore_cell()/summarize_and_write() from rescore_landmark_conventions.py,"
 echo "the exact same tested pipeline as the main EoMT/HRNet comparison, so no new"
 echo "unreviewed scoring logic is introduced for this table)."
 echo ""

@@ -28,7 +28,7 @@
 # batch_size=16, max_epochs=200. pixel_center_align is NOT set here
 # (defaults to False in datasets/landmark_dataset.py) -- this rung predates
 # the UDP fix, and must be scored with
-# `endpoint_ordering_analysis/rescore_endpoint_conventions.py`'s
+# `landmark_ordering_analysis/rescore_landmark_conventions.py`'s
 # `load_eomt_per_image(..., pixel_center_align=False)`, NOT the default
 # True used for the final +FPN+UDP model (see that function's own
 # docstring, 2026-08-09 finding).

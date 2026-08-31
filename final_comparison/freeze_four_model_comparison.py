@@ -4,7 +4,7 @@
 Inputs are deliberately lightweight:
 
 * ``--canonical-root`` is the already audited ``common_subset`` directory
-  produced by ``rescore_endpoint_conventions.py``.  It contains one
+  produced by ``rescore_landmark_conventions.py``.  It contains one
   five-seed-mean per-image CSV for Proposed-DINOv2, Proposed-DINOv3 and
   HRNet-W18, plus ``endpoint_ordering_summary.tsv`` with seed-level SDs.
 * ``--rtmpose-root`` contains the extracted lightweight RTMPose run files

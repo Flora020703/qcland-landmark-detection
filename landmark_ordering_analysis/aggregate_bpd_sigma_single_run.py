@@ -17,7 +17,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "rtmpose_reproduction"))
 from dod_vectors import get_d_vect  # noqa: E402
-import rescore_endpoint_conventions as scoring  # noqa: E402
+import rescore_landmark_conventions as scoring  # noqa: E402
 
 
 CASES = [

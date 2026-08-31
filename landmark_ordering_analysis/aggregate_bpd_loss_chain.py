@@ -18,7 +18,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "rtmpose_reproduction"))
 from dod_vectors import get_d_vect  # noqa: E402
-from rescore_endpoint_conventions import (  # noqa: E402
+from rescore_landmark_conventions import (  # noqa: E402
     LoadError,
     _ImageSizeCache,
     load_eomt_per_image,

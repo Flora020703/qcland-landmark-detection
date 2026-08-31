@@ -239,14 +239,14 @@ live -- server or a mounted copy; this script has no dependency on
 rtmpose_reproduction's own MMPose-only code, only its pure-Python
 dod_vectors.py/endpoint_order.py/geometry.py):
 
-    python endpoint_ordering_analysis/rescore_endpoint_conventions.py \
+    python landmark_ordering_analysis/rescore_landmark_conventions.py \
         --ucl-eomt-root /root/autodl-tmp/ucl_eomt_per_image \
         --ucl-hrnet-root /root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL \
         --ucl-images-root /root/autodl-tmp/images/UCL \
         --multicentre-eomt-root /root/autodl-tmp/saved_checkpoints/multicentre_5seed \
         --multicentre-hrnet-root /root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL \
         --multicentre-images-root /root/autodl-tmp/images/MULTICENTRE \
-        --output-root endpoint_ordering_analysis/results
+        --output-root landmark_ordering_analysis/results
 """
 
 from __future__ import annotations
@@ -1426,7 +1426,7 @@ def main():
                          default=Path("/root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL"))
     parser.add_argument("--multicentre-images-root", type=Path, required=True,
                          help="directory containing MULTICENTRE/{Head,Abdomen,Femur}/<filename>")
-    parser.add_argument("--output-root", type=Path, default=Path("endpoint_ordering_analysis/results"))
+    parser.add_argument("--output-root", type=Path, default=Path("landmark_ordering_analysis/results"))
     parser.add_argument("--bootstrap-replicates", type=int, default=20000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260806)
     args = parser.parse_args()
@@ -1698,7 +1698,7 @@ def main():
     if unexpectedly_recovered:
         print(f"\n*** REMINDER: {len(unexpectedly_recovered)} cell(s) previously in "
               f"EXPECTED_MISSING loaded successfully this run -- update EXPECTED_MISSING in "
-              f"rescore_endpoint_conventions.py so the allowlist reflects reality: "
+              f"rescore_landmark_conventions.py so the allowlist reflects reality: "
               f"{sorted(unexpectedly_recovered)} ***")
     if unexpected_missing:
         print(f"\n*** HARD FAILURE: {len(unexpected_missing)} cell(s) failed to load that are "

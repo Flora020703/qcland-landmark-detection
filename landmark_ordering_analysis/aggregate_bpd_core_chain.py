@@ -4,7 +4,7 @@ head, DeconvHeadV2, +FPN -- see docs/supervisor_meeting_report_2026-08-08.md
 section 0.6.1 and ablation/scripts/run_bpd_core_chain_retrain_5seed.sh)
 under the SAME permutation-invariant evaluator as the official EoMT/HRNet
 comparison table, by directly reusing load_eomt_per_image()/rescore_cell()/
-summarize_and_write() from rescore_endpoint_conventions.py -- no new,
+summarize_and_write() from rescore_landmark_conventions.py -- no new,
 unreviewed scoring logic for this table; it goes through the exact same
 coordinate-space-conversion, native-sanity-check, and permutation-invariant
 machinery already used (and repeatedly reviewed) for the main comparison.
@@ -27,23 +27,23 @@ actually is once its real layout is confirmed. A missing/wrong
 --fpn-udp-root does NOT fail the run: the 3 required rungs are the ones
 this run exists to produce, and are reported regardless. Its official
 number, if not supplied here, already exists under
-endpoint_ordering_analysis/results/ from the main comparison and can be
+landmark_ordering_analysis/results/ from the main comparison and can be
 combined with this script's 3-row output by hand.
 
 Usage (3 required rungs only):
-    python endpoint_ordering_analysis/aggregate_bpd_core_chain.py \
+    python landmark_ordering_analysis/aggregate_bpd_core_chain.py \
         --eomt-root /root/autodl-tmp/saved_checkpoints/bpd_core_chain_retrain_5seed \
         --images-root /root/autodl-tmp/images/UCL \
-        --output-root endpoint_ordering_analysis/results/bpd_core_chain
+        --output-root landmark_ordering_analysis/results/bpd_core_chain
 
 Usage (also including the already-archived +FPN+UDP rung, once its real
 extracted path is known):
-    python endpoint_ordering_analysis/aggregate_bpd_core_chain.py \
+    python landmark_ordering_analysis/aggregate_bpd_core_chain.py \
         --eomt-root /root/autodl-tmp/saved_checkpoints/bpd_core_chain_retrain_5seed \
         --images-root /root/autodl-tmp/images/UCL \
         --fpn-udp-root /root/autodl-tmp/saved_checkpoints/fpn_udp_loaderseed_ablation \
         --fpn-udp-backbone-dir fpn-udp-loaderseed \
-        --output-root endpoint_ordering_analysis/results/bpd_core_chain
+        --output-root landmark_ordering_analysis/results/bpd_core_chain
 """
 from __future__ import annotations
 
@@ -57,7 +57,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "rtmpose_reproduction"))
 from dod_vectors import get_d_vect  # noqa: E402
-from rescore_endpoint_conventions import (  # noqa: E402
+from rescore_landmark_conventions import (  # noqa: E402
     LoadError,
     _ImageSizeCache,
     load_eomt_per_image,
@@ -94,13 +94,13 @@ def main() -> None:
                               "naming, not confirmed to match bpd_<rung>/seed{seed}/. "
                               "If omitted, this rung is skipped entirely (not attempted, "
                               "not counted as a failure) -- its official number already "
-                              "exists under endpoint_ordering_analysis/results/.")
+                              "exists under landmark_ordering_analysis/results/.")
     parser.add_argument("--fpn-udp-backbone-dir", default="fpn_udp",
                          help="backbone-dir name under --fpn-udp-root, i.e. "
                               "<fpn-udp-root>/bpd_<this>/seed{seed}/ -- adjust to match "
                               "the archive's REAL extracted layout once confirmed")
     parser.add_argument("--output-root", type=Path,
-                         default=Path("endpoint_ordering_analysis/results/bpd_core_chain"))
+                         default=Path("landmark_ordering_analysis/results/bpd_core_chain"))
     parser.add_argument("--bootstrap-replicates", type=int, default=20000)
     parser.add_argument("--bootstrap-seed", type=int, default=20260809)
     args = parser.parse_args()
@@ -176,7 +176,7 @@ def main() -> None:
         print(f"  {row['method']:12s} n={row['n_images']:>3}  {float(mean):.2f}±{float(sd):.2f}%")
     if args.fpn_udp_root is None:
         print("\n(Optional +FPN+UDP rung not attempted -- pass --fpn-udp-root to include it. "
-              "Its official number already exists under endpoint_ordering_analysis/results/ "
+              "Its official number already exists under landmark_ordering_analysis/results/ "
               "and can be combined with the table above by hand.)")
     elif optional_excluded:
         print(f"\n[NOTE] optional +FPN+UDP rung could not be scored ({optional_excluded[0]['reason']}) "

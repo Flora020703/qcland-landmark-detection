@@ -33,7 +33,7 @@ correspondence-matching evaluation, to decide which GT point counts as
 matched to which predicted point for an unordered pair.
 
 **The metric** (`permutation_invariant_nme()` in
-`rescore_endpoint_conventions.py`): for each image,
+`rescore_landmark_conventions.py`): for each image,
 
 ```
 E_direct  = ||p0 - g0|| + ||p1 - g1||
@@ -283,14 +283,14 @@ path, never silently approximated (e.g. by assuming a square image).
 ## Usage
 
 ```bash
-python endpoint_ordering_analysis/rescore_endpoint_conventions.py \
+python landmark_ordering_analysis/rescore_landmark_conventions.py \
     --ucl-eomt-root /root/autodl-tmp/ucl_eomt_per_image \
     --ucl-hrnet-root /root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL \
     --ucl-images-root /root/autodl-tmp/images/UCL \
     --multicentre-eomt-root /root/autodl-tmp/saved_checkpoints/multicentre_5seed \
     --multicentre-hrnet-root /root/autodl-tmp/hrnet_512_fixed_5seed/output/FETAL \
     --multicentre-images-root /root/autodl-tmp/images/MULTICENTRE \
-    --output-root endpoint_ordering_analysis/results
+    --output-root landmark_ordering_analysis/results
 ```
 
 The `--*-eomt-root`/`--*-hrnet-root` defaults already match the real paths
@@ -304,13 +304,13 @@ the loading/canonicalisation/bootstrap code against synthetic files
 matching the real CSV schemas exactly):
 
 ```bash
-python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
+python landmark_ordering_analysis/test_rescore_landmark_conventions.py
 ```
 
 ## Outputs
 
 ```
-endpoint_ordering_analysis/results/
+landmark_ordering_analysis/results/
   permutation_invariant_nme_final_table.md    *** THE OFFICIAL RESULT ***. Ready-to-paste
                                                Markdown table, permutation-invariant NME (%)
                                                +-5-seed sample SD, WITH n SHOWN EXPLICITLY per

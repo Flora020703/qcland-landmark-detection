@@ -1,4 +1,4 @@
-"""End-to-end test of rescore_endpoint_conventions.py against SYNTHETIC
+"""End-to-end test of rescore_landmark_conventions.py against SYNTHETIC
 per-image files matching the real HRNet/EoMT CSV schemas exactly (HRNet:
 baseline_reproduction/evaluate_hrnet_fixed.py's own writer; EoMT:
 training/landmark_detection.py's test_nme_dump_path writer) -- since no
@@ -33,7 +33,7 @@ by line, not assumed) so these tests fail if `load_eomt_per_image` ever
 used a naive `to_model_space()`-only (no heatmap round-trip) recovery
 instead of `_heatmap_dump_to_model_input_space()` + `to_image_space()`.
 
-Run directly: python endpoint_ordering_analysis/test_rescore_endpoint_conventions.py
+Run directly: python landmark_ordering_analysis/test_rescore_landmark_conventions.py
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "rtmpose_reproduction"))
 from geometry import to_image_space, to_model_space  # noqa: E402
 
-from rescore_endpoint_conventions import (
+from rescore_landmark_conventions import (
     EOMT_HEATMAP_SIZE,
     EOMT_MODEL_INPUT_SIZE,
     EXPECTED_MISSING,
